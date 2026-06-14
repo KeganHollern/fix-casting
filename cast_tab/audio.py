@@ -1,158 +1,244 @@
-"""Capture system audio for tab casting on macOS via BlackHole."""
+"""Capture audio from specific Chrome processes on macOS via AudioTee."""
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
-
-@dataclass(frozen=True)
-class AudioDevice:
-    index: int
-    name: str
-
-
-@dataclass(frozen=True)
-class AudioSetup:
-    device: AudioDevice
-    previous_output: str | None
+ROOT = Path(__file__).resolve().parents[1]
+AUDIOTEE_CANDIDATES = (
+    ROOT / "bin" / "audiotee",
+    ROOT / "vendor" / "audiotee" / ".build" / "release" / "audiotee",
+    ROOT / "vendor" / "audiotee" / ".build" / "arm64-apple-macosx" / "release" / "audiotee",
+)
 
 
 class AudioCaptureError(RuntimeError):
     """Raised when tab audio cannot be captured."""
 
 
-def _run(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        check=check,
-    )
+@dataclass(frozen=True)
+class AudioCapture:
+    process: subprocess.Popen[bytes]
+    read_fd: int
+    pids: tuple[int, ...]
 
 
-def list_avfoundation_audio_devices() -> list[AudioDevice]:
-    """Return audio input devices visible to ffmpeg avfoundation."""
-    if shutil.which("ffmpeg") is None:
-        return []
-
-    result = _run(
-        ["ffmpeg", "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
-        check=False,
-    )
-    output = result.stderr
-
-    devices: list[AudioDevice] = []
-    in_audio = False
-    for line in output.splitlines():
-        if "AVFoundation audio devices" in line:
-            in_audio = True
-            continue
-        if in_audio and "AVFoundation video devices" in line:
-            break
-        if not in_audio:
-            continue
-
-        match = re.search(r"\[(\d+)\]\s+(.+)$", line)
-        if match:
-            devices.append(AudioDevice(index=int(match.group(1)), name=match.group(2).strip()))
-
-    return devices
-
-
-def find_blackhole_device() -> AudioDevice | None:
-    for device in list_avfoundation_audio_devices():
-        if "blackhole" in device.name.lower():
-            return device
-    return None
-
-
-def blackhole_installed() -> bool:
-    return find_blackhole_device() is not None
-
-
-def switchaudio_source_path() -> str | None:
-    path = shutil.which("SwitchAudioSource")
-    if path:
-        return path
-
-    for candidate in (
-        "/opt/homebrew/bin/SwitchAudioSource",
-        "/usr/local/bin/SwitchAudioSource",
-    ):
-        if shutil.which(candidate) or _path_exists(candidate):
+def audiotee_path() -> Path | None:
+    for candidate in AUDIOTEE_CANDIDATES:
+        if candidate.exists():
             return candidate
-    return None
+    return shutil.which("audiotee") and Path(shutil.which("audiotee"))  # type: ignore[arg-type]
 
 
-def _path_exists(path: str) -> bool:
-    from pathlib import Path
-
-    return Path(path).exists()
+def audiotee_available() -> bool:
+    return audiotee_path() is not None
 
 
-def current_output_device() -> str | None:
-    switchaudio = switchaudio_source_path()
-    if not switchaudio:
-        return None
-    result = _run([switchaudio, "-c", "output"], check=False)
-    if result.returncode != 0:
-        return None
-    name = result.stdout.strip()
-    return name or None
+def _profile_process_lines(user_data_dir: Path) -> list[tuple[int, str]]:
+    marker = f"--user-data-dir={user_data_dir}"
+    result = subprocess.run(["ps", "ax", "-o", "pid=,command="], capture_output=True, text=True)
+    matches: list[tuple[int, str]] = []
+    for line in result.stdout.splitlines():
+        if "Google Chrome" not in line and "Chromium" not in line:
+            continue
+        if marker not in line:
+            continue
+        match = re.match(r"\s*(\d+)", line)
+        if match:
+            matches.append((int(match.group(1)), line))
+    return matches
 
 
-def set_output_device(name: str) -> None:
-    switchaudio = switchaudio_source_path()
-    if not switchaudio:
+def chrome_pids_for_profile(user_data_dir: Path) -> list[int]:
+    """Find Chrome processes launched for a dedicated cast profile."""
+    return sorted({pid for pid, _ in _profile_process_lines(user_data_dir)})
+
+
+def chrome_audio_pid_candidates(user_data_dir: Path) -> list[list[int]]:
+    """Return PID sets to try, smallest/most likely first."""
+    lines = _profile_process_lines(user_data_dir)
+    candidates: list[list[int]] = []
+
+    audio_service = sorted(
+        pid for pid, command in lines if "audio.mojom.AudioService" in command
+    )
+    if audio_service:
+        candidates.append(audio_service[:1])
+
+    browser = sorted(pid for pid, command in lines if "--type=" not in command)
+    if browser:
+        candidates.append(browser[:1])
+
+    renderers = sorted(pid for pid, command in lines if "--type=renderer" in command)
+    for pid in renderers[:3]:
+        candidates.append([pid])
+    if renderers:
+        candidates.append(renderers)
+
+    all_pids = sorted({pid for pid, _ in lines})
+    if all_pids:
+        candidates.append(all_pids)
+
+    deduped: list[list[int]] = []
+    seen: set[tuple[int, ...]] = set()
+    for candidate in candidates:
+        key = tuple(candidate)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(candidate)
+    return deduped
+
+
+def chrome_audio_pids_for_profile(user_data_dir: Path) -> list[int]:
+    candidates = chrome_audio_pid_candidates(user_data_dir)
+    return candidates[0] if candidates else []
+
+
+def try_start_chrome_audio_capture(
+    user_data_dir: Path,
+    *,
+    timeout: float = 30.0,
+    retry_interval: float = 2.0,
+    on_retry: Callable[[], None] | None = None,
+) -> AudioCapture:
+    """Retry audio tap until Chrome is actively outputting audio."""
+    deadline = time.monotonic() + timeout
+    last_error = "unknown error"
+
+    while time.monotonic() < deadline:
+        if on_retry is not None:
+            on_retry()
+
+        for pids in chrome_audio_pid_candidates(user_data_dir):
+            if not pids:
+                continue
+            try:
+                return start_chrome_audio_capture(pids)
+            except AudioCaptureError as exc:
+                last_error = str(exc)
+                if "Failed to translate" in last_error or "exited early" in last_error:
+                    continue
+                raise
+
+        time.sleep(retry_interval)
+
+    raise AudioCaptureError(
+        "Could not attach to cast browser audio. "
+        f"Make sure the page is playing sound. Last error: {last_error}"
+    )
+
+
+def start_chrome_audio_capture(
+    pids: list[int],
+    *,
+    sample_rate: int = 44100,
+    chunk_duration: float = 0.1,
+    ready_timeout: float = 3.0,
+) -> AudioCapture:
+    """Capture audio from specific Chrome PIDs without touching other apps."""
+    binary = audiotee_path()
+    if binary is None:
         raise AudioCaptureError(
-            "SwitchAudioSource is required to route tab audio. "
-            "Install with: brew install switchaudio-osx"
+            "AudioTee is not installed. Build it with:\n"
+            "  git clone https://github.com/makeusabrew/audiotee.git vendor/audiotee\n"
+            "  cd vendor/audiotee && swift build -c release"
         )
-    result = _run([switchaudio, "-s", name, "-t", "output"], check=False)
-    if result.returncode != 0:
-        raise AudioCaptureError(
-            f"Failed to switch audio output to {name}: {result.stderr.strip()}"
-        )
+    if not pids:
+        raise AudioCaptureError("No Chrome process IDs found for tab audio capture.")
+
+    tap_read, tap_write = os.pipe()
+    relay_read, relay_write = os.pipe()
+    command = [
+        str(binary),
+        "--include-processes",
+        *[str(pid) for pid in pids],
+        "--mute",
+        "--stereo",
+        "--sample-rate",
+        str(sample_rate),
+        "--chunk-duration",
+        str(chunk_duration),
+    ]
+    process = subprocess.Popen(
+        command,
+        stdout=tap_write,
+        stderr=subprocess.PIPE,
+    )
+    os.close(tap_write)
+
+    if process.poll() is not None:
+        stderr = process.stderr.read().decode(errors="replace") if process.stderr else ""
+        os.close(tap_read)
+        os.close(relay_read)
+        os.close(relay_write)
+        raise AudioCaptureError(f"AudioTee failed to start: {stderr.strip()}")
+
+    ready = threading.Event()
+
+    def relay_audio() -> None:
+        try:
+            while True:
+                chunk = os.read(tap_read, 65_536)
+                if not chunk:
+                    break
+                os.write(relay_write, chunk)
+                ready.set()
+        except OSError:
+            pass
+        finally:
+            try:
+                os.close(relay_write)
+            except OSError:
+                pass
+            try:
+                os.close(tap_read)
+            except OSError:
+                pass
+
+    relay_thread = threading.Thread(target=relay_audio, name="audio-relay", daemon=True)
+    relay_thread.start()
+
+    deadline = time.monotonic() + ready_timeout
+    while not ready.wait(timeout=0.2):
+        if process.poll() is not None:
+            stderr = process.stderr.read().decode(errors="replace") if process.stderr else ""
+            os.close(relay_read)
+            raise AudioCaptureError(f"AudioTee exited early: {stderr.strip()}")
+        if time.monotonic() > deadline:
+            break
+
+    return AudioCapture(process=process, read_fd=relay_read, pids=tuple(pids))
 
 
-def ffmpeg_audio_input(device: AudioDevice) -> str:
-    """avfoundation audio-only input string for ffmpeg."""
-    return f"none:{device.name}"
-
-
-def setup_tab_audio() -> AudioSetup:
-    """Route system audio into BlackHole so ffmpeg can capture browser tab sound."""
-    device = find_blackhole_device()
-    if device is None:
-        raise AudioCaptureError(
-            "BlackHole is not installed. Tab audio capture requires a virtual audio device.\n"
-            "Install with: brew install blackhole-2ch\n"
-            "Then restart `cast` — audio from Chrome will be routed through BlackHole."
-        )
-
-    previous_output = current_output_device()
-    if previous_output and "blackhole" in previous_output.lower():
-        previous_output = None
-
-    set_output_device(device.name)
-    return AudioSetup(device=device, previous_output=previous_output)
-
-
-def restore_audio_output(setup: AudioSetup | None) -> None:
-    if setup is None or not setup.previous_output:
+def stop_audio_capture(capture: AudioCapture | None) -> None:
+    if capture is None:
         return
     try:
-        set_output_device(setup.previous_output)
-    except AudioCaptureError:
+        os.close(capture.read_fd)
+    except OSError:
         pass
+    if capture.process.poll() is None:
+        capture.process.terminate()
+        try:
+            capture.process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            capture.process.kill()
+    if capture.process.stderr:
+        capture.process.stderr.close()
 
 
 def install_hint() -> str:
     return (
-        "To enable TV audio:\n"
-        "  brew install blackhole-2ch switchaudio-osx\n"
-        "Then run `cast` again (omit --no-audio)."
+        "Tab audio uses AudioTee (macOS 14.2+) to capture only the cast browser.\n"
+        "Other Mac audio is left untouched.\n"
+        "Build with:\n"
+        "  cd vendor/audiotee && swift build -c release"
     )

@@ -52,7 +52,7 @@ class TabCaster:
             return
 
         mc = self._chromecast.media_controller
-        for _ in range(10):
+        for _ in range(20):
             mc.update_status()
             status = mc.status
             if status and status.player_state == "PLAYING":

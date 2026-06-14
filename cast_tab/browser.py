@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import base64
+import tempfile
 import threading
 import time
+from pathlib import Path
 from typing import Callable
 
 from playwright.sync_api import sync_playwright
+
+from cast_tab.audio import chrome_pids_for_profile
 
 
 class TabScreencaster:
@@ -30,26 +34,51 @@ class TabScreencaster:
         self.height = height
         self.fps = fps
         self.jpeg_quality = jpeg_quality
-        self.on_frame = on_frame
+        self._on_frame = on_frame
         self.headless = headless
         self.capture_audio = capture_audio
 
+        self.user_data_dir = Path(tempfile.mkdtemp(prefix="cast-tab-chrome-"))
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._capture_enabled = threading.Event()
+        self._nudge_playback = threading.Event()
         self._last_publish_at = 0.0
+        self.chrome_pids: list[int] = []
+
+    @property
+    def on_frame(self) -> Callable[[bytes], None]:
+        return self._on_frame
+
+    @on_frame.setter
+    def on_frame(self, callback: Callable[[bytes], None]) -> None:
+        self._on_frame = callback
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="tab-screencast", daemon=True)
         self._thread.start()
 
+    def wait_until_ready(self, timeout: float = 120.0) -> None:
+        if not self._ready.wait(timeout):
+            raise TimeoutError("Timed out waiting for the browser tab to load.")
+
+    def enable_capture(self) -> None:
+        self._capture_enabled.set()
+
+    def nudge_playback(self) -> None:
+        """Ask the browser thread to retry autoplay (helps audio tap attach)."""
+        self._nudge_playback.set()
+
     def stop(self) -> None:
         self._stop.set()
+        self._capture_enabled.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=10)
 
     def _publish(self, frame: bytes) -> None:
         self._last_publish_at = time.monotonic()
-        self.on_frame(frame)
+        self._on_frame(frame)
 
     def _run(self) -> None:
         with sync_playwright() as playwright:
@@ -57,31 +86,40 @@ class TabScreencaster:
                 "--autoplay-policy=no-user-gesture-required",
                 "--disable-features=MediaRouter",
                 "--disable-cast-streaming-hw-encoding",
+                "--no-first-run",
+                "--no-default-browser-check",
             ]
 
             try:
-                browser = playwright.chromium.launch(
+                context = playwright.chromium.launch_persistent_context(
+                    str(self.user_data_dir),
                     channel="chrome",
                     headless=self.headless,
                     args=launch_args,
+                    viewport={"width": self.width, "height": self.height},
+                    device_scale_factor=1,
+                    ignore_https_errors=True,
                 )
             except Exception:
-                browser = playwright.chromium.launch(
+                context = playwright.chromium.launch_persistent_context(
+                    str(self.user_data_dir),
                     headless=self.headless,
                     args=launch_args,
+                    viewport={"width": self.width, "height": self.height},
+                    device_scale_factor=1,
+                    ignore_https_errors=True,
                 )
 
-            context = browser.new_context(
-                viewport={"width": self.width, "height": self.height},
-                device_scale_factor=1,
-                ignore_https_errors=True,
-            )
             context.grant_permissions(["notifications", "geolocation"])
-            page = context.new_page()
+            page = context.pages[0] if context.pages else context.new_page()
             print(f"Loading {self.url} ...")
             page.goto(self.url, wait_until="load", timeout=120_000)
             self._try_start_playback(page)
+            page.wait_for_timeout(1_500)
+            self.chrome_pids = chrome_pids_for_profile(self.user_data_dir)
             print("Page loaded, starting capture.")
+            self._ready.set()
+            self._capture_enabled.wait()
 
             cdp = context.new_cdp_session(page)
 
@@ -108,6 +146,10 @@ class TabScreencaster:
 
             min_frame_interval = 1.0 / (self.fps * 2)
             while not self._stop.is_set():
+                if self._nudge_playback.is_set():
+                    self._nudge_playback.clear()
+                    self._try_start_playback(page)
+                    self.chrome_pids = chrome_pids_for_profile(self.user_data_dir)
                 stale_for = time.monotonic() - self._last_publish_at
                 if stale_for >= min_frame_interval:
                     try:
@@ -128,7 +170,6 @@ class TabScreencaster:
             except Exception:
                 pass
             context.close()
-            browser.close()
 
     def _try_start_playback(self, page) -> None:
         """Click common play buttons so the user doesn't have to."""

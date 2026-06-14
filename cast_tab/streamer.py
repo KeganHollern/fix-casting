@@ -41,10 +41,10 @@ def _target_bitrate(width: int, height: int) -> tuple[str, str, str]:
     """Pick a steady bitrate for the stream resolution."""
     pixels = width * height
     if pixels >= 1920 * 1080:
-        return "4.5M", "5M", "10M"
+        return "4.5M", "5M", "5M"
     if pixels >= 1280 * 720:
-        return "2.5M", "3M", "6M"
-    return "1.5M", "2M", "4M"
+        return "2.5M", "3M", "3M"
+    return "1.5M", "2M", "2M"
 
 
 def _video_encoder_args(fps: int, width: int, height: int) -> list[str]:
@@ -128,14 +128,14 @@ class HLSStreamer:
         width: int = 1920,
         height: int = 1080,
         fps: int = 24,
-        audio_input: str | None = None,
+        audio_fd: int | None = None,
         port: int = 0,
         work_dir: Path | None = None,
     ) -> None:
         self.width = width
         self.height = height
         self.fps = fps
-        self.audio_input = audio_input
+        self.audio_fd = audio_fd
         self.work_dir = work_dir or Path("/tmp/cast-tab-stream")
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -208,8 +208,19 @@ class HLSStreamer:
             self._http_thread.join(timeout=3)
 
     def _audio_input_args(self) -> list[str]:
-        if self.audio_input:
-            return ["-f", "avfoundation", "-i", self.audio_input]
+        if self.audio_fd is not None:
+            return [
+                "-thread_queue_size",
+                "512",
+                "-f",
+                "s16le",
+                "-ar",
+                "44100",
+                "-ac",
+                "2",
+                "-i",
+                f"/dev/fd/{self.audio_fd}",
+            ]
         return [
             "-f",
             "lavfi",
@@ -265,15 +276,20 @@ class HLSStreamer:
             "mpegts",
             "-hls_segment_filename",
             segment_pattern,
+            "-max_muxing_queue_size",
+            "1024",
             str(playlist),
         ]
 
-        self._ffmpeg = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
+        popen_kwargs: dict = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.PIPE,
+        }
+        if self.audio_fd is not None:
+            popen_kwargs["pass_fds"] = (self.audio_fd,)
+            popen_kwargs["close_fds"] = False
+        self._ffmpeg = subprocess.Popen(cmd, **popen_kwargs)
 
     def _start_encoder_thread(self) -> None:
         def run() -> None:

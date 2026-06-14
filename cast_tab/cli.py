@@ -8,12 +8,12 @@ import sys
 import time
 
 from cast_tab.audio import (
+    AudioCapture,
     AudioCaptureError,
-    AudioSetup,
-    ffmpeg_audio_input,
+    audiotee_available,
     install_hint,
-    restore_audio_output,
-    setup_tab_audio,
+    try_start_chrome_audio_capture,
+    stop_audio_capture,
 )
 from cast_tab.browser import TabScreencaster
 from cast_tab.caster import TabCaster
@@ -81,47 +81,20 @@ def main(argv: list[str] | None = None) -> int:
 
     fps = args.fps or default_fps_for_resolution(args.width, args.height)
     jpeg_quality = default_jpeg_quality(args.width, args.height)
-
-    audio_setup: AudioSetup | None = None
-    audio_input: str | None = None
     capture_audio = not args.no_audio
 
-    if capture_audio:
-        try:
-            audio_setup = setup_tab_audio()
-            audio_input = ffmpeg_audio_input(audio_setup.device)
-            print(f"Routing system audio through {audio_setup.device.name}.")
-        except AudioCaptureError as exc:
-            print(f"Audio unavailable: {exc}")
-            print(install_hint())
-            capture_audio = False
-
-    streamer = HLSStreamer(
-        width=args.width,
-        height=args.height,
-        fps=fps,
-        audio_input=audio_input,
-    )
     screencaster = TabScreencaster(
         args.url,
         width=args.width,
         height=args.height,
         fps=fps,
         jpeg_quality=jpeg_quality,
-        on_frame=streamer.publish_frame,
+        on_frame=lambda _frame: None,
         headless=args.headless,
         capture_audio=capture_audio,
     )
-    encoder = (
-        "hardware (VideoToolbox)"
-        if _ffmpeg_supports_encoder("h264_videotoolbox")
-        else "software (x264)"
-    )
-    audio_mode = "with audio" if capture_audio else "video only"
-    print(
-        f"Streaming at {args.width}x{args.height} {fps} fps "
-        f"(jpeg q={jpeg_quality}) {audio_mode} using {encoder}."
-    )
+    streamer: HLSStreamer | None = None
+    audio_capture: AudioCapture | None = None
     caster = TabCaster(device)
 
     shutting_down = False
@@ -133,17 +106,61 @@ def main(argv: list[str] | None = None) -> int:
         shutting_down = True
         print("\nStopping cast...")
         screencaster.stop()
-        streamer.stop()
+        if streamer is not None:
+            streamer.stop()
+        stop_audio_capture(audio_capture)
         caster.stop()
-        restore_audio_output(audio_setup)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
     try:
-        streamer.start()
         screencaster.start()
+        screencaster.wait_until_ready()
+        screencaster.enable_capture()
+
+        if capture_audio:
+            if not audiotee_available():
+                print(f"Audio unavailable: AudioTee not found.\n{install_hint()}")
+                capture_audio = False
+            else:
+                print("Waiting for cast browser audio...")
+                try:
+                    audio_capture = try_start_chrome_audio_capture(
+                        screencaster.user_data_dir,
+                        on_retry=screencaster.nudge_playback,
+                    )
+                    print(
+                        "Capturing audio from cast browser only "
+                        f"(PIDs: {', '.join(str(pid) for pid in audio_capture.pids)})."
+                    )
+                    print("Other Mac apps keep their normal audio output.")
+                except AudioCaptureError as exc:
+                    print(f"Audio unavailable: {exc}")
+                    print(install_hint())
+                    capture_audio = False
+
+        streamer = HLSStreamer(
+            width=args.width,
+            height=args.height,
+            fps=fps,
+            audio_fd=audio_capture.read_fd if audio_capture else None,
+        )
+        screencaster.on_frame = streamer.publish_frame
+
+        encoder = (
+            "hardware (VideoToolbox)"
+            if _ffmpeg_supports_encoder("h264_videotoolbox")
+            else "software (x264)"
+        )
+        audio_mode = "with tab audio" if capture_audio else "video only"
+        print(
+            f"Streaming at {args.width}x{args.height} {fps} fps "
+            f"(jpeg q={jpeg_quality}) {audio_mode} using {encoder}."
+        )
+
+        streamer.start()
         streamer.wait_until_ready()
 
         caster.connect()
@@ -154,7 +171,7 @@ def main(argv: list[str] | None = None) -> int:
         if not args.headless:
             print("A browser window is rendering the page locally.")
         if capture_audio:
-            print("Audio is being sent to your TV (laptop speakers are muted during cast).")
+            print("Cast browser audio plays on your TV only; other Mac audio is unchanged.")
 
         while not shutting_down:
             time.sleep(1)
