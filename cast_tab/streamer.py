@@ -128,12 +128,14 @@ class HLSStreamer:
         width: int = 1920,
         height: int = 1080,
         fps: int = 24,
+        audio_input: str | None = None,
         port: int = 0,
         work_dir: Path | None = None,
     ) -> None:
         self.width = width
         self.height = height
         self.fps = fps
+        self.audio_input = audio_input
         self.work_dir = work_dir or Path("/tmp/cast-tab-stream")
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -205,6 +207,16 @@ class HLSStreamer:
         if self._http_thread and self._http_thread.is_alive():
             self._http_thread.join(timeout=3)
 
+    def _audio_input_args(self) -> list[str]:
+        if self.audio_input:
+            return ["-f", "avfoundation", "-i", self.audio_input]
+        return [
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=channel_layout=stereo:sample_rate=44100",
+        ]
+
     def _start_ffmpeg(self) -> None:
         playlist = self.work_dir / "stream.m3u8"
         segment_pattern = str(self.work_dir / "seg%03d.ts")
@@ -222,10 +234,7 @@ class HLSStreamer:
             str(self.fps),
             "-i",
             "pipe:0",
-            "-f",
-            "lavfi",
-            "-i",
-            "anullsrc=channel_layout=stereo:sample_rate=44100",
+            *self._audio_input_args(),
             "-filter:v",
             f"scale={self.width}:{self.height}:force_original_aspect_ratio=decrease,"
             f"pad={self.width}:{self.height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
@@ -242,6 +251,8 @@ class HLSStreamer:
             "44100",
             "-ac",
             "2",
+            "-async",
+            "1",
             "-f",
             "hls",
             "-hls_time",

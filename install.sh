@@ -10,6 +10,14 @@ python3 -m venv "$VENV"
 "$VENV/bin/pip" install -e "$ROOT"
 "$VENV/bin/playwright" install chromium
 
+if command -v brew >/dev/null 2>&1; then
+  if ! ffmpeg -hide_banner -f avfoundation -list_devices true -i "" 2>&1 | grep -qi blackhole; then
+    echo "Installing BlackHole + SwitchAudioSource for tab audio capture..."
+    brew install switchaudio-osx || true
+    brew install --cask blackhole-2ch || true
+  fi
+fi
+
 mkdir -p "$BIN_DIR"
 cat > "$BIN_DIR/cast" <<EOF
 #!/usr/bin/env bash

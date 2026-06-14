@@ -23,6 +23,7 @@ class TabScreencaster:
         jpeg_quality: int = 75,
         on_frame: Callable[[bytes], None],
         headless: bool = False,
+        capture_audio: bool = False,
     ) -> None:
         self.url = url
         self.width = width
@@ -31,6 +32,7 @@ class TabScreencaster:
         self.jpeg_quality = jpeg_quality
         self.on_frame = on_frame
         self.headless = headless
+        self.capture_audio = capture_audio
 
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -147,12 +149,12 @@ class TabScreencaster:
 
         try:
             page.evaluate(
-                """() => {
-                    for (const video of document.querySelectorAll('video')) {
-                        video.muted = true;
+                f"""() => {{
+                    for (const video of document.querySelectorAll('video')) {{
+                        video.muted = {str(not self.capture_audio).lower()};
                         void video.play();
-                    }
-                }"""
+                    }}
+                }}"""
             )
         except Exception:
             pass
