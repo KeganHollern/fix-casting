@@ -75,8 +75,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("auto", "h264", "hevc", "av1"),
         default="auto",
         help=(
-            "Video codec (default: auto = HEVC if available). "
-            "HEVC gives better quality per bitrate; AV1 is experimental."
+            "Video codec (default: auto = H.264). "
+            "HEVC/AV1 may not play on older Chromecasts."
         ),
     )
     parser.add_argument(

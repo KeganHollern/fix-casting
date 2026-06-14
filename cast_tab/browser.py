@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import tempfile
 import threading
 import time
@@ -15,7 +14,7 @@ from cast_tab.audio import chrome_pids_for_profile
 
 
 class TabScreencaster:
-    """Mirror a browser tab by capturing frames as fast as the page updates."""
+    """Mirror a browser tab by capturing frames at a steady pace."""
 
     def __init__(
         self,
@@ -44,7 +43,6 @@ class TabScreencaster:
         self._ready = threading.Event()
         self._capture_enabled = threading.Event()
         self._nudge_playback = threading.Event()
-        self._last_publish_at = 0.0
         self.chrome_pids: list[int] = []
 
     @property
@@ -75,10 +73,6 @@ class TabScreencaster:
         self._capture_enabled.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=10)
-
-    def _publish(self, frame: bytes) -> None:
-        self._last_publish_at = time.monotonic()
-        self._on_frame(frame)
 
     def _run(self) -> None:
         with sync_playwright() as playwright:
@@ -125,40 +119,38 @@ class TabScreencaster:
             self._ready.set()
             self._capture_enabled.wait()
 
-            cdp = context.new_cdp_session(page)
-
-            def on_screencast_frame(params: dict) -> None:
-                if self._stop.is_set():
-                    return
-                self._publish(base64.b64decode(params["data"]))
-                cdp.send(
-                    "Page.screencastFrameAck",
-                    {"sessionId": params["sessionId"]},
-                )
-
-            cdp.on("Page.screencastFrame", on_screencast_frame)
-            cdp.send(
-                "Page.startScreencast",
-                {
-                    "format": "jpeg",
-                    "quality": self.jpeg_quality,
-                    "maxWidth": self.width,
-                    "maxHeight": self.height,
-                    "everyNthFrame": 1,
-                },
-            )
+            # CDP screencast stops updating once video plays (HW layer). Paced
+            # screenshots reliably capture playing video at the target frame rate.
+            frame_period = 1.0 / self.fps
+            next_tick = time.monotonic()
 
             while not self._stop.is_set():
                 if self._nudge_playback.is_set():
                     self._nudge_playback.clear()
                     self._try_start_playback(page)
                     self.chrome_pids = chrome_pids_for_profile(self.user_data_dir)
-                self._stop.wait(timeout=0.25)
 
-            try:
-                cdp.send("Page.stopScreencast")
-            except Exception:
-                pass
+                now = time.monotonic()
+                if now >= next_tick:
+                    try:
+                        self._on_frame(
+                            page.screenshot(
+                                type="jpeg",
+                                quality=self.jpeg_quality,
+                                animations="disabled",
+                                caret="hide",
+                                timeout=5_000,
+                            )
+                        )
+                    except Exception:
+                        if self._stop.is_set():
+                            break
+                    next_tick += frame_period
+                    if next_tick < now - frame_period:
+                        next_tick = now + frame_period
+
+                self._stop.wait(timeout=0.005)
+
             context.close()
 
     def _try_start_playback(self, page) -> None:
