@@ -67,6 +67,12 @@ def chrome_audio_pid_candidates(user_data_dir: Path) -> list[list[int]]:
     lines = _profile_process_lines(user_data_dir)
     candidates: list[list[int]] = []
 
+    renderers = sorted(pid for pid, command in lines if "--type=renderer" in command)
+    if renderers:
+        candidates.append(renderers)
+    for pid in renderers[:3]:
+        candidates.append([pid])
+
     audio_service = sorted(
         pid for pid, command in lines if "audio.mojom.AudioService" in command
     )
@@ -76,12 +82,6 @@ def chrome_audio_pid_candidates(user_data_dir: Path) -> list[list[int]]:
     browser = sorted(pid for pid, command in lines if "--type=" not in command)
     if browser:
         candidates.append(browser[:1])
-
-    renderers = sorted(pid for pid, command in lines if "--type=renderer" in command)
-    for pid in renderers[:3]:
-        candidates.append([pid])
-    if renderers:
-        candidates.append(renderers)
 
     all_pids = sorted({pid for pid, _ in lines})
     if all_pids:
@@ -141,7 +141,7 @@ def start_chrome_audio_capture(
     *,
     sample_rate: int = 44100,
     chunk_duration: float = 0.1,
-    ready_timeout: float = 3.0,
+    ready_timeout: float = 5.0,
 ) -> AudioCapture:
     """Capture audio from specific Chrome PIDs without touching other apps."""
     binary = audiotee_path()
@@ -213,7 +213,11 @@ def start_chrome_audio_capture(
             os.close(relay_read)
             raise AudioCaptureError(f"AudioTee exited early: {stderr.strip()}")
         if time.monotonic() > deadline:
-            break
+            os.close(relay_read)
+            process.terminate()
+            raise AudioCaptureError(
+                "No audio data received from cast browser tap."
+            )
 
     return AudioCapture(process=process, read_fd=relay_read, pids=tuple(pids))
 

@@ -86,6 +86,7 @@ class TabScreencaster:
                 "--autoplay-policy=no-user-gesture-required",
                 "--disable-features=MediaRouter",
                 "--disable-cast-streaming-hw-encoding",
+                "--hide-scrollbars",
                 "--no-first-run",
                 "--no-default-browser-check",
             ]
@@ -114,6 +115,9 @@ class TabScreencaster:
             page = context.pages[0] if context.pages else context.new_page()
             print(f"Loading {self.url} ...")
             page.goto(self.url, wait_until="load", timeout=120_000)
+            page.add_style_tag(
+                content="html,body{overflow:hidden!important;margin:0!important;}"
+            )
             self._try_start_playback(page)
             page.wait_for_timeout(1_500)
             self.chrome_pids = chrome_pids_for_profile(self.user_data_dir)
@@ -144,26 +148,12 @@ class TabScreencaster:
                 },
             )
 
-            min_frame_interval = 1.0 / (self.fps * 2)
             while not self._stop.is_set():
                 if self._nudge_playback.is_set():
                     self._nudge_playback.clear()
                     self._try_start_playback(page)
                     self.chrome_pids = chrome_pids_for_profile(self.user_data_dir)
-                stale_for = time.monotonic() - self._last_publish_at
-                if stale_for >= min_frame_interval:
-                    try:
-                        self._publish(
-                            page.screenshot(
-                                type="jpeg",
-                                quality=self.jpeg_quality,
-                                timeout=5_000,
-                            )
-                        )
-                    except Exception:
-                        if self._stop.is_set():
-                            break
-                page.wait_for_timeout(16)
+                self._stop.wait(timeout=0.25)
 
             try:
                 cdp.send("Page.stopScreencast")

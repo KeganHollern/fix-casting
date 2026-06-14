@@ -44,7 +44,7 @@ class TabCaster:
             title="Cast Tab",
             autoplay=True,
         )
-        mc.block_until_active(timeout=15)
+        mc.block_until_active(timeout=30)
         self._verify_playback()
 
     def _verify_playback(self) -> None:

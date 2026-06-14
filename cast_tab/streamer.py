@@ -25,10 +25,43 @@ def _ffmpeg_supports_encoder(encoder: str) -> bool:
     return encoder in result.stdout
 
 
-def default_fps_for_resolution(width: int, height: int) -> int:
+def default_fps_for_resolution(width: int, height: int, *, buffered: bool = False) -> int:
+    if buffered:
+        return 30
     if width * height >= 1920 * 1080:
         return 23
     return 24
+
+
+def resolve_codec(requested: str) -> str:
+    """Pick a Chromecast-compatible video codec."""
+    if requested == "auto":
+        # H.264 is universally supported on Chromecast; HEVC/AV1 need newer models.
+        return "h264"
+
+    if requested == "hevc":
+        if not _ffmpeg_supports_encoder("hevc_videotoolbox"):
+            raise RuntimeError("HEVC encoding is not available (hevc_videotoolbox).")
+        return "hevc"
+
+    if requested == "av1":
+        if not _ffmpeg_supports_encoder("libsvtav1"):
+            raise RuntimeError("AV1 encoding is not available (libsvtav1).")
+        return "av1"
+
+    if requested == "h264":
+        return "h264"
+
+    raise RuntimeError(f"Unknown codec: {requested}")
+
+
+def codec_label(codec: str) -> str:
+    labels = {
+        "h264": "H.264 (VideoToolbox)" if _ffmpeg_supports_encoder("h264_videotoolbox") else "H.264",
+        "hevc": "HEVC/H.265 (VideoToolbox)",
+        "av1": "AV1 (SVT, software)",
+    }
+    return labels.get(codec, codec)
 
 
 def default_jpeg_quality(width: int, height: int) -> int:
@@ -37,19 +70,75 @@ def default_jpeg_quality(width: int, height: int) -> int:
     return 80
 
 
-def _target_bitrate(width: int, height: int) -> tuple[str, str, str]:
-    """Pick a steady bitrate for the stream resolution."""
+def _target_bitrate(codec: str, width: int, height: int, *, buffered: bool) -> tuple[str, str, str]:
+    """Pick bitrate targets. Efficient codecs use lower bitrate for similar quality."""
     pixels = width * height
     if pixels >= 1920 * 1080:
-        return "4.5M", "5M", "5M"
+        if codec == "hevc":
+            return ("3M", "3.5M", "12M") if buffered else ("2.5M", "3M", "6M")
+        if codec == "av1":
+            return ("2.5M", "3M", "12M") if buffered else ("2M", "2.5M", "6M")
+        return ("5M", "6M", "12M") if buffered else ("4.5M", "5M", "5M")
     if pixels >= 1280 * 720:
-        return "2.5M", "3M", "3M"
-    return "1.5M", "2M", "2M"
+        if codec in ("hevc", "av1"):
+            return ("1.8M", "2.2M", "8M") if buffered else ("1.5M", "2M", "4M")
+        return ("3M", "3.5M", "8M") if buffered else ("2.5M", "3M", "3M")
+    if codec in ("hevc", "av1"):
+        return ("1M", "1.2M", "4M") if buffered else ("900k", "1.1M", "2M")
+    return ("1.5M", "2M", "4M") if buffered else ("1.5M", "2M", "2M")
 
 
-def _video_encoder_args(fps: int, width: int, height: int) -> list[str]:
-    """Prefer macOS hardware encoding for lower latency and less CPU load."""
-    bitrate, maxrate, bufsize = _target_bitrate(width, height)
+def _video_encoder_args(
+    codec: str,
+    fps: int,
+    width: int,
+    height: int,
+    *,
+    buffered: bool,
+) -> list[str]:
+    bitrate, maxrate, bufsize = _target_bitrate(codec, width, height, buffered=buffered)
+    gop = fps * (2 if buffered else 1)
+
+    if codec == "hevc" and _ffmpeg_supports_encoder("hevc_videotoolbox"):
+        return [
+            "-c:v",
+            "hevc_videotoolbox",
+            "-profile:v",
+            "main",
+            "-b:v",
+            bitrate,
+            "-maxrate",
+            maxrate,
+            "-bufsize",
+            bufsize,
+            "-g",
+            str(gop),
+            "-keyint_min",
+            str(fps),
+        ]
+
+    if codec == "av1" and _ffmpeg_supports_encoder("libsvtav1"):
+        return [
+            "-c:v",
+            "libsvtav1",
+            "-preset",
+            "6" if buffered else "10",
+            "-crf",
+            "32",
+            "-b:v",
+            bitrate,
+            "-maxrate",
+            maxrate,
+            "-bufsize",
+            bufsize,
+            "-g",
+            str(gop),
+            "-keyint_min",
+            str(fps),
+            "-pix_fmt",
+            "yuv420p",
+        ]
+
     if _ffmpeg_supports_encoder("h264_videotoolbox"):
         return [
             "-c:v",
@@ -63,7 +152,7 @@ def _video_encoder_args(fps: int, width: int, height: int) -> list[str]:
             "-bufsize",
             bufsize,
             "-g",
-            str(fps),
+            str(gop),
             "-keyint_min",
             str(fps),
         ]
@@ -76,9 +165,9 @@ def _video_encoder_args(fps: int, width: int, height: int) -> list[str]:
         "-level",
         "3.1",
         "-preset",
-        "veryfast",
+        "medium" if buffered else "veryfast",
         "-tune",
-        "zerolatency",
+        "film" if buffered else "zerolatency",
         "-pix_fmt",
         "yuv420p",
         "-b:v",
@@ -88,11 +177,39 @@ def _video_encoder_args(fps: int, width: int, height: int) -> list[str]:
         "-bufsize",
         bufsize,
         "-g",
-        str(fps * 2),
+        str(gop),
         "-keyint_min",
         str(fps),
         "-sc_threshold",
         "0",
+    ]
+
+
+def _hls_args(*, buffered: bool) -> list[str]:
+    if buffered:
+        return [
+            "-f",
+            "hls",
+            "-hls_time",
+            "4",
+            "-hls_list_size",
+            "12",
+            "-hls_flags",
+            "delete_segments+append_list+omit_endlist+independent_segments",
+            "-hls_segment_type",
+            "mpegts",
+        ]
+    return [
+        "-f",
+        "hls",
+        "-hls_time",
+        "1",
+        "-hls_list_size",
+        "4",
+        "-hls_flags",
+        "delete_segments+append_list+omit_endlist+independent_segments",
+        "-hls_segment_type",
+        "mpegts",
     ]
 
 
@@ -128,6 +245,8 @@ class HLSStreamer:
         width: int = 1920,
         height: int = 1080,
         fps: int = 24,
+        codec: str = "hevc",
+        buffered: bool = True,
         audio_fd: int | None = None,
         port: int = 0,
         work_dir: Path | None = None,
@@ -135,6 +254,8 @@ class HLSStreamer:
         self.width = width
         self.height = height
         self.fps = fps
+        self.codec = codec
+        self.buffered = buffered
         self.audio_fd = audio_fd
         self.work_dir = work_dir or Path("/tmp/cast-tab-stream")
         self.work_dir.mkdir(parents=True, exist_ok=True)
@@ -170,7 +291,9 @@ class HLSStreamer:
         if not self._stopped.is_set():
             self._latest.publish(jpeg_data)
 
-    def wait_until_ready(self, timeout: float = 30.0) -> None:
+    def wait_until_ready(self, timeout: float | None = None) -> None:
+        if timeout is None:
+            timeout = 60.0 if self.buffered else 30.0
         """Block until the HLS playlist and first segment exist."""
         playlist = self.work_dir / "stream.m3u8"
         deadline = time.time() + timeout
@@ -247,33 +370,29 @@ class HLSStreamer:
             "pipe:0",
             *self._audio_input_args(),
             "-filter:v",
-            f"scale={self.width}:{self.height}:force_original_aspect_ratio=decrease,"
-            f"pad={self.width}:{self.height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+            f"scale={self.width}:{self.height}:force_original_aspect_ratio=increase,"
+            f"crop={self.width}:{self.height},format=yuv420p",
             "-map",
             "0:v",
             "-map",
             "1:a",
-            *_video_encoder_args(self.fps, self.width, self.height),
+            *_video_encoder_args(
+                self.codec,
+                self.fps,
+                self.width,
+                self.height,
+                buffered=self.buffered,
+            ),
             "-c:a",
             "aac",
             "-b:a",
-            "128k",
+            "160k" if self.buffered else "128k",
             "-ar",
             "44100",
             "-ac",
             "2",
-            "-async",
-            "1",
-            "-f",
-            "hls",
-            "-hls_time",
-            "1",
-            "-hls_list_size",
-            "4",
-            "-hls_flags",
-            "delete_segments+append_list+omit_endlist+independent_segments",
-            "-hls_segment_type",
-            "mpegts",
+            *([] if self.buffered else ["-async", "1"]),
+            *_hls_args(buffered=self.buffered),
             "-hls_segment_filename",
             segment_pattern,
             "-max_muxing_queue_size",

@@ -20,9 +20,10 @@ from cast_tab.caster import TabCaster
 from cast_tab.devices import discover_devices, select_device
 from cast_tab.streamer import (
     HLSStreamer,
-    _ffmpeg_supports_encoder,
+    codec_label,
     default_fps_for_resolution,
     default_jpeg_quality,
+    resolve_codec,
 )
 
 
@@ -69,6 +70,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Disable tab audio capture (video only)",
     )
+    parser.add_argument(
+        "--codec",
+        choices=("auto", "h264", "hevc", "av1"),
+        default="auto",
+        help=(
+            "Video codec (default: auto = HEVC if available). "
+            "HEVC gives better quality per bitrate; AV1 is experimental."
+        ),
+    )
+    parser.add_argument(
+        "--buffered",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Buffer ~45s on the TV for higher quality and smoother playback "
+            "(default: on). Use --no-buffered for lower latency."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -79,7 +98,10 @@ def main(argv: list[str] | None = None) -> int:
     devices = discover_devices(timeout=args.discovery_timeout)
     device = select_device(devices)
 
-    fps = args.fps or default_fps_for_resolution(args.width, args.height)
+    codec = resolve_codec(args.codec)
+    fps = args.fps or default_fps_for_resolution(
+        args.width, args.height, buffered=args.buffered
+    )
     jpeg_quality = default_jpeg_quality(args.width, args.height)
     capture_audio = not args.no_audio
 
@@ -145,20 +167,23 @@ def main(argv: list[str] | None = None) -> int:
             width=args.width,
             height=args.height,
             fps=fps,
+            codec=codec,
+            buffered=args.buffered,
             audio_fd=audio_capture.read_fd if audio_capture else None,
         )
         screencaster.on_frame = streamer.publish_frame
 
-        encoder = (
-            "hardware (VideoToolbox)"
-            if _ffmpeg_supports_encoder("h264_videotoolbox")
-            else "software (x264)"
-        )
         audio_mode = "with tab audio" if capture_audio else "video only"
+        latency_mode = "buffered (~45s TV delay)" if args.buffered else "low-latency"
         print(
             f"Streaming at {args.width}x{args.height} {fps} fps "
-            f"(jpeg q={jpeg_quality}) {audio_mode} using {encoder}."
+            f"(jpeg q={jpeg_quality}) {audio_mode} using {codec_label(codec)}, "
+            f"{latency_mode}."
         )
+        if codec == "av1":
+            print("AV1 uses software encoding and may not play on older Chromecasts.")
+        elif codec == "hevc":
+            print("If the TV shows an error, retry with --codec h264.")
 
         streamer.start()
         streamer.wait_until_ready()
