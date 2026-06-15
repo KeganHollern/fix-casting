@@ -11,10 +11,16 @@ from collections import deque
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from cast_tab.audio import _pipe_bytes_available
 from cast_tab.stats import PipelineStats
 
 FFMPEG_BACKPRESSURE_WRITE_S = 0.050
 FFMPEG_BACKPRESSURE_DURATION_S = 60.0
+
+# Raw tab audio is 44.1kHz, 16-bit, stereo: 4 bytes per sample frame.
+AUDIO_BYTES_PER_SECOND = 44_100 * 2 * 2
+# Never trust a measurement beyond this; a sane capture pre-roll is well under.
+MAX_AUTO_AV_OFFSET_S = 1.5
 
 
 def _ffmpeg_supports_encoder(encoder: str) -> bool:
@@ -380,6 +386,7 @@ class HLSStreamer:
     def _audio_input_args(self) -> list[str]:
         if self.audio_fd is not None:
             return [
+                *self._auto_av_offset_args(),
                 "-thread_queue_size",
                 "512",
                 "-f",
@@ -397,6 +404,34 @@ class HLSStreamer:
             "-i",
             "anullsrc=channel_layout=stereo:sample_rate=44100",
         ]
+
+    def _auto_av_offset_args(self) -> list[str]:
+        """Auto-correct the constant A/V skew from startup audio pre-roll.
+
+        The tap fills the audio pipe before ffmpeg starts reading, so ffmpeg
+        stamps that already-buffered audio with the same PTS 0 as the first
+        (current) video frame, leaving audio lagging by the pre-roll duration.
+        Measure exactly how much is queued right now and advance audio by that
+        much with -itsoffset. Re-measured on every (re)start, no manual knob.
+        """
+        if self.audio_fd is None:
+            return []
+        try:
+            buffered = _pipe_bytes_available(self.audio_fd)
+        except OSError:
+            return []
+        offset_s = buffered / AUDIO_BYTES_PER_SECOND
+        offset_s = max(0.0, min(offset_s, MAX_AUTO_AV_OFFSET_S))
+        if offset_s < 0.005:
+            return []
+        print(
+            f"Auto A/V sync: advancing audio {offset_s * 1000:.0f}ms "
+            f"({buffered}-byte capture pre-roll).",
+            flush=True,
+        )
+        # Negative itsoffset shifts the audio input earlier (the leading
+        # pre-roll samples get negative PTS and are dropped by the muxer).
+        return ["-itsoffset", f"-{offset_s:.3f}"]
 
     def _kill_ffmpeg(self) -> None:
         if self._ffmpeg is None:
