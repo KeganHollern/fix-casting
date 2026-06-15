@@ -18,6 +18,7 @@ from cast_tab.audio import (
 from cast_tab.browser import TabScreencaster
 from cast_tab.caster import TabCaster
 from cast_tab.devices import discover_devices, select_device
+from cast_tab.stats import PipelineStats
 from cast_tab.streamer import (
     HLSStreamer,
     codec_label,
@@ -61,6 +62,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Seconds to search for Chromecast devices (default: 5)",
     )
     parser.add_argument(
+        "--capture",
+        choices=("cdp", "playwright"),
+        default="cdp",
+        help=(
+            "Tab frame capture backend (default: cdp). "
+            "Use playwright for the legacy Playwright screenshot path."
+        ),
+    )
+    parser.add_argument(
         "--headless",
         action="store_true",
         help="Run browser without a visible window (may break some players)",
@@ -88,6 +98,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "(default: on). Use --no-buffered for lower latency."
         ),
     )
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="Print pipeline timing stats every 10s to diagnose lag",
+    )
+    parser.add_argument(
+        "--stats-interval",
+        type=float,
+        default=10.0,
+        help="Seconds between stats reports when --stats is set (default: 10)",
+    )
     return parser.parse_args(argv)
 
 
@@ -104,6 +125,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     jpeg_quality = default_jpeg_quality(args.width, args.height)
     capture_audio = not args.no_audio
+    stats = PipelineStats(target_fps=float(fps)) if args.stats else None
 
     screencaster = TabScreencaster(
         args.url,
@@ -114,6 +136,8 @@ def main(argv: list[str] | None = None) -> int:
         on_frame=lambda _frame: None,
         headless=args.headless,
         capture_audio=capture_audio,
+        capture_method=args.capture,
+        stats=stats,
     )
     streamer: HLSStreamer | None = None
     audio_capture: AudioCapture | None = None
@@ -170,6 +194,7 @@ def main(argv: list[str] | None = None) -> int:
             codec=codec,
             buffered=args.buffered,
             audio_fd=audio_capture.read_fd if audio_capture else None,
+            stats=stats,
         )
         screencaster.on_frame = streamer.publish_frame
 
@@ -177,8 +202,8 @@ def main(argv: list[str] | None = None) -> int:
         latency_mode = "buffered (~45s TV delay)" if args.buffered else "low-latency"
         print(
             f"Streaming at {args.width}x{args.height} {fps} fps "
-            f"(jpeg q={jpeg_quality}) {audio_mode} using {codec_label(codec)}, "
-            f"{latency_mode}."
+            f"(jpeg q={jpeg_quality}, capture={args.capture}) {audio_mode} "
+            f"using {codec_label(codec)}, {latency_mode}."
         )
         if codec == "av1":
             print("AV1 uses software encoding and may not play on older Chromecasts.")
@@ -197,9 +222,18 @@ def main(argv: list[str] | None = None) -> int:
             print("A browser window is rendering the page locally.")
         if capture_audio:
             print("Cast browser audio plays on your TV only; other Mac audio is unchanged.")
+        if stats is not None:
+            print(f"Stats enabled (every {args.stats_interval:.0f}s).")
 
+        next_stats_at = time.monotonic() + args.stats_interval
         while not shutting_down:
-            time.sleep(1)
+            if stats is not None and time.monotonic() >= next_stats_at:
+                streamer.poll_hls_stats()
+                tv_state, tv_pos = caster.poll_playback_stats()
+                stats.record_tv(state=tv_state, position_s=tv_pos)
+                print(stats.format_report(args.stats_interval), flush=True)
+                next_stats_at = time.monotonic() + args.stats_interval
+            time.sleep(0.5)
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         shutdown()

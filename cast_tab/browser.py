@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import base64
 import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Literal
 
 from playwright.sync_api import sync_playwright
 
 from cast_tab.audio import chrome_pids_for_profile
+from cast_tab.stats import PipelineStats
+
+CaptureMethod = Literal["cdp", "playwright"]
+CAPTURE_METHODS: frozenset[str] = frozenset({"cdp", "playwright"})
 
 
 class TabScreencaster:
@@ -27,7 +32,12 @@ class TabScreencaster:
         on_frame: Callable[[bytes], None],
         headless: bool = False,
         capture_audio: bool = False,
+        capture_method: CaptureMethod = "cdp",
+        stats: PipelineStats | None = None,
     ) -> None:
+        if capture_method not in CAPTURE_METHODS:
+            raise ValueError(f"Unknown capture method: {capture_method}")
+
         self.url = url
         self.width = width
         self.height = height
@@ -36,6 +46,8 @@ class TabScreencaster:
         self._on_frame = on_frame
         self.headless = headless
         self.capture_audio = capture_audio
+        self.capture_method = capture_method
+        self._stats = stats
 
         self.user_data_dir = Path(tempfile.mkdtemp(prefix="cast-tab-chrome-"))
         self._thread: threading.Thread | None = None
@@ -119,8 +131,8 @@ class TabScreencaster:
             self._ready.set()
             self._capture_enabled.wait()
 
-            # CDP screencast stops updating once video plays (HW layer). Paced
-            # screenshots reliably capture playing video at the target frame rate.
+            cdp = context.new_cdp_session(page) if self.capture_method == "cdp" else None
+
             frame_period = 1.0 / self.fps
             next_tick = time.monotonic()
 
@@ -133,25 +145,42 @@ class TabScreencaster:
                 now = time.monotonic()
                 if now >= next_tick:
                     try:
-                        self._on_frame(
-                            page.screenshot(
-                                type="jpeg",
-                                quality=self.jpeg_quality,
-                                animations="disabled",
-                                caret="hide",
-                                timeout=5_000,
-                            )
-                        )
+                        started = time.monotonic()
+                        self._on_frame(self._capture_frame(page, cdp))
+                        latency = time.monotonic() - started
                     except Exception:
+                        if self._stats is not None:
+                            self._stats.record_capture_error()
                         if self._stop.is_set():
                             break
+                        latency = None
                     next_tick += frame_period
-                    if next_tick < now - frame_period:
+                    behind = next_tick < now - frame_period
+                    if behind:
                         next_tick = now + frame_period
+                    if latency is not None and self._stats is not None:
+                        self._stats.record_capture(latency, behind=behind)
 
                 self._stop.wait(timeout=0.005)
 
             context.close()
+
+    def _capture_frame(self, page, cdp) -> bytes:
+        if self.capture_method == "cdp":
+            assert cdp is not None
+            shot = cdp.send(
+                "Page.captureScreenshot",
+                {"format": "jpeg", "quality": self.jpeg_quality},
+            )
+            return base64.b64decode(shot["data"])
+
+        return page.screenshot(
+            type="jpeg",
+            quality=self.jpeg_quality,
+            animations="disabled",
+            caret="hide",
+            timeout=5_000,
+        )
 
     def _try_start_playback(self, page) -> None:
         """Click common play buttons so the user doesn't have to."""

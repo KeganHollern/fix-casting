@@ -71,9 +71,13 @@ cast <url> [options]
                           Video codec (default: auto = H.264)
   --buffered / --no-buffered
                           Buffered mode for quality vs latency (default: buffered)
+  --capture {cdp,playwright}
+                          Tab capture backend (default: cdp)
   --no-audio              Video only, skip tab audio capture
   --headless              Hide the local browser window (may break some players)
   --discovery-timeout SEC Seconds to search for devices (default: 5)
+  --stats                 Print pipeline timing stats every 10s (diagnose lag)
+  --stats-interval SEC    Seconds between stats reports (default: 10)
 ```
 
 ### Examples
@@ -96,6 +100,12 @@ Video only (no audio tap):
 cast --no-audio "https://example.com"
 ```
 
+Legacy Playwright screenshot capture (slower with a visible window):
+
+```bash
+cast --capture playwright "https://example.com"
+```
+
 Older Chromecast that rejects HEVC (auto already uses H.264):
 
 ```bash
@@ -114,7 +124,7 @@ URL → Chrome tab → JPEG frames + PCM audio
               Chromecast plays stream.m3u8
 ```
 
-- **Video capture** uses paced tab screenshots. CDP screencast stops updating once hardware-accelerated video plays, which caused frozen frames on the TV.
+- **Video capture** uses paced tab frames at the target frame rate. The default `cdp` backend calls Chrome DevTools `Page.captureScreenshot` (faster with a visible window). Use `--capture playwright` for the legacy Playwright screenshot path. CDP screencast is not used — it freezes once hardware-accelerated video plays.
 - **Audio capture** uses a vendored [AudioTee](https://github.com/makeusabrew/audiotee) binary to tap only the cast browser's processes. Your other apps are not routed through a virtual audio device.
 - **Streaming** uses ffmpeg to mux H.264 + AAC into an HLS playlist served from `/tmp/cast-tab-stream/`.
 - **Casting** uses [pychromecast](https://github.com/home-assistant-libs/pychromecast) to load the HLS URL on the default media receiver.
@@ -141,6 +151,31 @@ Make sure you are on a recent version of this repo (paced screenshot capture). T
 
 **High CPU**  
 Lower `--fps`, resolution, or use `--no-buffered`.
+
+**Lag builds up over time**  
+Run with `--stats` and watch which stage drifts:
+
+```bash
+cast --stats "https://example.com"
+```
+
+Every 10 seconds you'll see something like:
+
+```
+[stats] capture 28.5/30 fps, capture avg 35ms peak 52ms, behind 3x
+[stats] encode  30.0/30 fps to ffmpeg, frame age avg 8ms peak 20ms, stdin write avg 0.5ms
+[stats] hls     12 segments, newest segment 1.2s old
+[stats] tv      PLAYING, playback position 142s
+```
+
+How to read it:
+
+- **capture fps drops** or **screenshot ms rises** → Chrome tab capture is the bottleneck (CPU or page complexity)
+- **behind Nx** → capture is missing its schedule and skipping ticks
+- **encode fps drops** but capture is fine → ffmpeg encoding is struggling
+- **frame age rises** → encoder is feeding ffmpeg stale frames (usually means capture slowed down)
+- **newest segment age rises** → ffmpeg/HLS segment generation is falling behind
+- **tv position** creeping further behind real time → TV buffer or network (expected ~45s with `--buffered`)
 
 ## Project layout
 
