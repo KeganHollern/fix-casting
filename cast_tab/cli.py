@@ -307,6 +307,14 @@ def main(argv: list[str] | None = None) -> int:
         streamer.start()
         streamer.wait_until_ready()
 
+        if capture_audio:
+            # Let the video frame-queue reach steady state, then delay audio to
+            # match its latency. Done before the TV connects so the one-time
+            # ffmpeg relaunch is invisible to the viewer.
+            time.sleep(4)
+            streamer.measure_and_apply_av_delay()
+            streamer.wait_until_ready()
+
         caster.connect()
         caster.play_hls(streamer.playlist_url)
 

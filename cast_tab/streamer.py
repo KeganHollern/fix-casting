@@ -17,8 +17,9 @@ from cast_tab.stats import PipelineStats
 FFMPEG_BACKPRESSURE_WRITE_S = 0.050
 FFMPEG_BACKPRESSURE_DURATION_S = 60.0
 
-# Never trust a measurement beyond this; a sane capture pre-roll is well under.
-MAX_AUTO_AV_OFFSET_S = 1.5
+# Never trust a measurement beyond this; covers the audio pre-roll plus the
+# video frame-queue latency we compensate for.
+MAX_AUTO_AV_OFFSET_S = 3.0
 
 
 def _ffmpeg_supports_encoder(encoder: str) -> bool:
@@ -115,10 +116,6 @@ def _video_encoder_args(
             "hevc_videotoolbox",
             "-profile:v",
             "main",
-            # Real-time encoding hint: minimizes how many frames the encoder
-            # buffers internally, trimming the video-behind-audio latency.
-            "-realtime",
-            "true",
             "-b:v",
             bitrate,
             "-maxrate",
@@ -159,10 +156,6 @@ def _video_encoder_args(
             "h264_videotoolbox",
             "-profile:v",
             "main",
-            # Real-time encoding hint: minimizes how many frames the encoder
-            # buffers internally, trimming the video-behind-audio latency.
-            "-realtime",
-            "true",
             "-b:v",
             bitrate,
             "-maxrate",
@@ -306,6 +299,9 @@ class HLSStreamer:
         self._stats = stats
         self._ffmpeg_lock = threading.Lock()
         self._backpressure_started_at: float | None = None
+        # Extra audio delay (seconds) to match the video frame-queue latency,
+        # set once by measure_and_apply_av_delay().
+        self._measured_av_delay_s = 0.0
         self._last_sampled_generation = -1
         self._known_hls_segments: set[str] = set()
         # Frames sampled at an even cadence wait here for the writer thread to
@@ -434,17 +430,52 @@ class HLSStreamer:
             buffered = _pipe_bytes_available(self.audio_fd)
         except OSError:
             return []
-        offset_s = buffered / self.audio_format.bytes_per_second
+        # Audio leads video by the capture pre-roll plus the time video spends
+        # in our frame queue (the dominant term); delay audio to cover both.
+        pre_roll_s = buffered / self.audio_format.bytes_per_second
+        offset_s = pre_roll_s + self._measured_av_delay_s
         offset_s = max(0.0, min(offset_s, MAX_AUTO_AV_OFFSET_S))
         if offset_s < 0.005:
             return []
         print(
             f"Auto A/V sync: delaying audio {offset_s * 1000:.0f}ms "
-            f"({buffered}-byte capture pre-roll).",
+            f"(pre-roll {pre_roll_s * 1000:.0f}ms + video buffer "
+            f"{self._measured_av_delay_s * 1000:.0f}ms).",
             flush=True,
         )
         # Audio runs ahead of video, so delay it (positive itsoffset).
         return ["-itsoffset", f"{offset_s:.3f}"]
+
+    def _current_queue_depth(self) -> int:
+        with self._queue_cond:
+            return len(self._frame_queue)
+
+    def measure_and_apply_av_delay(self, *, settle_s: float = 2.0) -> float:
+        """Measure the standing video frame-queue depth and delay audio to match.
+
+        ffmpeg is paced by the live audio, so the frame queue can't be drained
+        with CPU; instead we compensate. Measuring the depth (in frames) gives
+        the video-behind-audio latency directly. Re-launches ffmpeg once with
+        the matching audio offset — call this before the Chromecast connects so
+        the relaunch is invisible.
+        """
+        deadline = time.monotonic() + settle_s
+        samples: list[int] = []
+        while time.monotonic() < deadline and not self._stopped.is_set():
+            samples.append(self._current_queue_depth())
+            time.sleep(0.1)
+        avg_depth = sum(samples) / len(samples) if samples else 0.0
+        self._measured_av_delay_s = avg_depth / self.fps
+        print(
+            f"Auto A/V sync: measured video buffer ~{avg_depth:.0f} frames "
+            f"({self._measured_av_delay_s * 1000:.0f}ms); recalibrating.",
+            flush=True,
+        )
+        with self._ffmpeg_lock:
+            self._kill_ffmpeg()
+            self._start_ffmpeg()
+        self._backpressure_started_at = None
+        return self._measured_av_delay_s
 
     def _kill_ffmpeg(self) -> None:
         if self._ffmpeg is None:
