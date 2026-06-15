@@ -268,6 +268,7 @@ class HLSStreamer:
         audio_fd: int | None = None,
         audio_sync: str = "off",
         audio_format: AudioFormat | None = None,
+        audio_offset_ms: int = 0,
         port: int = 0,
         work_dir: Path | None = None,
         stats: PipelineStats | None = None,
@@ -280,6 +281,7 @@ class HLSStreamer:
         self.audio_fd = audio_fd
         self.audio_sync = audio_sync
         self.audio_format = audio_format or DEFAULT_AUDIO_FORMAT
+        self.audio_offset_ms = audio_offset_ms
         self.work_dir = work_dir or Path("/tmp/cast-tab-stream")
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -431,19 +433,21 @@ class HLSStreamer:
         except OSError:
             return []
         # Audio leads video by the capture pre-roll plus the time video spends
-        # in our frame queue (the dominant term); delay audio to cover both.
+        # in our frame queue (the dominant term), plus any manual trim for the
+        # latency ffmpeg buffers internally that we can't measure.
         pre_roll_s = buffered / self.audio_format.bytes_per_second
-        offset_s = pre_roll_s + self._measured_av_delay_s
-        offset_s = max(0.0, min(offset_s, MAX_AUTO_AV_OFFSET_S))
-        if offset_s < 0.005:
+        manual_s = self.audio_offset_ms / 1000.0
+        offset_s = pre_roll_s + self._measured_av_delay_s + manual_s
+        offset_s = max(-MAX_AUTO_AV_OFFSET_S, min(offset_s, MAX_AUTO_AV_OFFSET_S))
+        if abs(offset_s) < 0.005:
             return []
         print(
-            f"Auto A/V sync: delaying audio {offset_s * 1000:.0f}ms "
+            f"Auto A/V sync: shifting audio {offset_s * 1000:+.0f}ms "
             f"(pre-roll {pre_roll_s * 1000:.0f}ms + video buffer "
-            f"{self._measured_av_delay_s * 1000:.0f}ms).",
+            f"{self._measured_av_delay_s * 1000:.0f}ms + manual {self.audio_offset_ms:+d}ms).",
             flush=True,
         )
-        # Audio runs ahead of video, so delay it (positive itsoffset).
+        # Positive itsoffset delays audio (it runs ahead of video).
         return ["-itsoffset", f"{offset_s:.3f}"]
 
     def _current_queue_depth(self) -> int:
@@ -471,10 +475,7 @@ class HLSStreamer:
             f"({self._measured_av_delay_s * 1000:.0f}ms); recalibrating.",
             flush=True,
         )
-        with self._ffmpeg_lock:
-            self._kill_ffmpeg()
-            self._start_ffmpeg()
-        self._backpressure_started_at = None
+        self._relaunch_ffmpeg()
         return self._measured_av_delay_s
 
     def _kill_ffmpeg(self) -> None:
@@ -494,14 +495,22 @@ class HLSStreamer:
                 self._ffmpeg.wait(timeout=3)
         self._ffmpeg = None
 
+    def _relaunch_ffmpeg(self) -> None:
+        with self._ffmpeg_lock:
+            self._kill_ffmpeg()
+            # Drop the queued backlog: the sampler keeps producing during the
+            # relaunch gap, and a fresh ffmpeg would otherwise inherit and
+            # buffer seconds of stale video, inflating the A/V latency.
+            with self._queue_cond:
+                self._frame_queue.clear()
+            self._start_ffmpeg()
+        self._backpressure_started_at = None
+
     def _restart_ffmpeg(self) -> None:
         print("Restarting ffmpeg after sustained encoder backpressure...", flush=True)
         if self._stats is not None:
             self._stats.record_ffmpeg_restart()
-        with self._ffmpeg_lock:
-            self._kill_ffmpeg()
-            self._start_ffmpeg()
-        self._backpressure_started_at = None
+        self._relaunch_ffmpeg()
 
     def _note_encode_backpressure(self, write_s: float) -> None:
         now = time.monotonic()

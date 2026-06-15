@@ -103,6 +103,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Disable tab audio capture (video only)",
     )
     parser.add_argument(
+        "--audio-offset-ms",
+        type=int,
+        default=0,
+        help=(
+            "Manual A/V trim added to the auto-measured sync, in ms. Positive "
+            "delays audio (use if audio is still ahead of video); negative "
+            "advances it. Use to dial in lip-sync if the automatic value is off."
+        ),
+    )
+    parser.add_argument(
         "--audio-sync",
         choices=("off", "soft"),
         default="off",
@@ -284,6 +294,7 @@ def main(argv: list[str] | None = None) -> int:
             audio_fd=audio_capture.read_fd if audio_capture else None,
             audio_sync=args.audio_sync,
             audio_format=audio_capture.audio_format if audio_capture else None,
+            audio_offset_ms=args.audio_offset_ms,
             stats=stats,
         )
         screencaster.on_frame = streamer.publish_frame
