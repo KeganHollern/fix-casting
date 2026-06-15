@@ -512,12 +512,11 @@ class HLSStreamer:
             str(self.audio_format.sample_rate),
             "-ac",
             str(self.audio_format.channels),
-            # async resampling chases A/V drift by inserting/dropping samples,
-            # which adds discontinuities (clicks that get louder with the
-            # signal). Default off for clean PCM; "soft" re-enables it only
-            # when a session actually drifts.
+            # "soft" corrects slow A/V clock drift over long sessions. async=1000
+            # allows generous *gentle* stretching so it never resorts to hard
+            # sample drops/inserts (which click). Default off keeps clean PCM.
             *(
-                ["-af", "aresample=async=1:min_hard_comp=0.100:first_pts=0"]
+                ["-af", "aresample=async=1000"]
                 if self.audio_sync == "soft"
                 else []
             ),

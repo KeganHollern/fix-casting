@@ -108,8 +108,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="off",
         help=(
             "Audio drift correction (default: off = clean PCM). 'soft' enables "
-            "async resampling; use only if audio drifts out of sync over a long "
-            "session, as it can add faint clicks."
+            "gentle async resampling (aresample=async=1000) that corrects slow "
+            "clock drift over long sessions without audible artifacts."
         ),
     )
     parser.add_argument(
