@@ -115,6 +115,10 @@ def _video_encoder_args(
             "hevc_videotoolbox",
             "-profile:v",
             "main",
+            # Real-time encoding hint: minimizes how many frames the encoder
+            # buffers internally, trimming the video-behind-audio latency.
+            "-realtime",
+            "true",
             "-b:v",
             bitrate,
             "-maxrate",
@@ -155,6 +159,10 @@ def _video_encoder_args(
             "h264_videotoolbox",
             "-profile:v",
             "main",
+            # Real-time encoding hint: minimizes how many frames the encoder
+            # buffers internally, trimming the video-behind-audio latency.
+            "-realtime",
+            "true",
             "-b:v",
             bitrate,
             "-maxrate",
@@ -191,6 +199,9 @@ def _video_encoder_args(
         "-keyint_min",
         str(fps),
         "-sc_threshold",
+        "0",
+        # No B-frames: avoid frame-reorder latency (video lagging audio).
+        "-bf",
         "0",
     ]
 
@@ -489,9 +500,12 @@ class HLSStreamer:
             "-i",
             "pipe:0",
             *self._audio_input_args(),
+            # Capture is already viewport-sized (== output), so skip scale/crop
+            # and only convert pixel format. Dropping the per-frame scale pass
+            # gives ffmpeg throughput headroom to drain the frame queue, which
+            # is what keeps video ~0.5s behind the audio.
             "-filter:v",
-            f"scale={self.width}:{self.height}:force_original_aspect_ratio=increase,"
-            f"crop={self.width}:{self.height},format=yuv420p",
+            "format=yuv420p",
             "-map",
             "0:v",
             "-map",
