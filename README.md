@@ -71,8 +71,8 @@ cast <url> [options]
                           Video codec (default: auto = H.264)
   --buffered / --no-buffered
                           Buffered mode for quality vs latency (default: buffered)
-  --capture {cdp,playwright}
-                          Tab capture backend (default: cdp)
+  --capture {screencast,screenshot,playwright}
+                          Tab capture backend (default: screencast)
   --no-audio              Video only, skip tab audio capture
   --headless              Hide the local browser window (may break some players)
   --discovery-timeout SEC Seconds to search for devices (default: 5)
@@ -100,10 +100,16 @@ Video only (no audio tap):
 cast --no-audio "https://example.com"
 ```
 
-Legacy Playwright screenshot capture (slower with a visible window):
+Smoother 60fps (needs a Chromecast that supports 1080p60):
 
 ```bash
-cast --capture playwright "https://example.com"
+cast --fps 60 "https://example.com"
+```
+
+Paced screenshot capture instead of screencast:
+
+```bash
+cast --capture screenshot "https://example.com"
 ```
 
 Older Chromecast that rejects HEVC (auto already uses H.264):
@@ -124,8 +130,8 @@ URL → Chrome tab → JPEG frames + PCM audio
               Chromecast plays stream.m3u8
 ```
 
-- **Video capture** uses paced tab frames at the target frame rate. The default `cdp` backend calls Chrome DevTools `Page.captureScreenshot` (faster with a visible window). Captures time out after 250ms so a slow Chrome hitch cannot block the loop for seconds. Use `--capture playwright` for the legacy Playwright screenshot path. CDP screencast is not used — it freezes once hardware-accelerated video plays.
-- **Encoder resilience** skips duplicate frames (so a capture stall does not spam ffmpeg with identical JPEGs), and restarts ffmpeg automatically if stdin writes stay slow for 60s.
+- **Video capture** defaults to CDP `Page.startScreencast` (`--capture screencast`): Chrome pushes JPEG frames as the page paints (up to ~60fps), and every frame is acknowledged with `Page.screencastFrameAck` so the stream never stalls. `--capture screenshot` uses a paced `Page.captureScreenshot` loop (captures time out after 250ms so a slow Chrome hitch cannot block for seconds); `--capture playwright` is the legacy Playwright screenshot path.
+- **Even-paced encoding** samples the latest frame at a constant cadence on one thread and feeds ffmpeg on another, with a bounded queue between them. Even sampling keeps motion smooth (no judder) even when an ffmpeg write stalls on an HLS segment flush, while the constant rate keeps the TV buffer from draining. ffmpeg is restarted automatically if it dies or stays backpressured.
 - **Audio capture** uses a vendored [AudioTee](https://github.com/makeusabrew/audiotee) binary to tap only the cast browser's processes. Your other apps are not routed through a virtual audio device.
 - **Streaming** uses ffmpeg to mux H.264 + AAC into an HLS playlist served from `/tmp/cast-tab-stream/`.
 - **Casting** uses [pychromecast](https://github.com/home-assistant-libs/pychromecast) to load the HLS URL on the default media receiver.

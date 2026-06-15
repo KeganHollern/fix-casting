@@ -74,12 +74,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--capture",
-        choices=("cdp", "playwright", "screencast"),
-        default="cdp",
+        choices=("screencast", "screenshot", "playwright"),
+        default="screencast",
         help=(
-            "Tab frame capture backend (default: cdp screenshot loop). "
-            "Use screencast for CDP Page.startScreencast (paint-driven, can "
-            "reach ~60fps) or playwright for the legacy screenshot path."
+            "Tab frame capture backend (default: screencast). screencast uses "
+            "CDP Page.startScreencast (paint-driven, can reach ~60fps). Use "
+            "screenshot for the paced CDP Page.captureScreenshot loop, or "
+            "playwright for the legacy Playwright screenshot path."
         ),
     )
     parser.add_argument(

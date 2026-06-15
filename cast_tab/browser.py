@@ -16,8 +16,8 @@ from playwright.sync_api import sync_playwright
 from cast_tab.audio import chrome_pids_for_profile
 from cast_tab.stats import PipelineStats
 
-CaptureMethod = Literal["cdp", "playwright", "screencast"]
-CAPTURE_METHODS: frozenset[str] = frozenset({"cdp", "playwright", "screencast"})
+CaptureMethod = Literal["screencast", "screenshot", "playwright"]
+CAPTURE_METHODS: frozenset[str] = frozenset({"screencast", "screenshot", "playwright"})
 CAPTURE_TIMEOUT_MS = 250
 
 
@@ -36,7 +36,7 @@ class TabScreencaster:
         on_frame: Callable[[bytes], None],
         headless: bool = False,
         capture_audio: bool = False,
-        capture_method: CaptureMethod = "cdp",
+        capture_method: CaptureMethod = "screencast",
         stats: PipelineStats | None = None,
     ) -> None:
         if capture_method not in CAPTURE_METHODS:
@@ -139,7 +139,7 @@ class TabScreencaster:
             self._ready.set()
             self._capture_enabled.wait()
 
-            needs_cdp = self.capture_method in ("cdp", "screencast")
+            needs_cdp = self.capture_method in ("screenshot", "screencast")
             cdp = context.new_cdp_session(page) if needs_cdp else None
 
             try:
@@ -261,7 +261,7 @@ class TabScreencaster:
     def _capture_frame(self, page, cdp) -> bytes:
         page.set_default_timeout(CAPTURE_TIMEOUT_MS)
         try:
-            if self.capture_method == "cdp":
+            if self.capture_method == "screenshot":
                 assert cdp is not None
                 shot = cdp.send(
                     "Page.captureScreenshot",
