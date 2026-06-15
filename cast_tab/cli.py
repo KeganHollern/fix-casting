@@ -109,6 +109,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=10.0,
         help="Seconds between stats reports when --stats is set (default: 10)",
     )
+    parser.add_argument(
+        "--tv-poll-interval",
+        type=float,
+        default=2.0,
+        help="Seconds between Chromecast status polls when --stats is set (default: 2)",
+    )
     return parser.parse_args(argv)
 
 
@@ -223,17 +229,31 @@ def main(argv: list[str] | None = None) -> int:
         if capture_audio:
             print("Cast browser audio plays on your TV only; other Mac audio is unchanged.")
         if stats is not None:
-            print(f"Stats enabled (every {args.stats_interval:.0f}s).")
+            print(
+                f"Stats enabled (every {args.stats_interval:.0f}s, "
+                f"tv polls every {args.tv_poll_interval:.0f}s)."
+            )
 
         next_stats_at = time.monotonic() + args.stats_interval
+        next_tv_poll_at = time.monotonic()
         while not shutting_down:
-            if stats is not None and time.monotonic() >= next_stats_at:
-                streamer.poll_hls_stats()
-                tv_state, tv_pos = caster.poll_playback_stats()
-                stats.record_tv(state=tv_state, position_s=tv_pos)
+            now = time.monotonic()
+            if stats is not None and now >= next_tv_poll_at:
+                for event in streamer.poll_hls_stats():
+                    print(f"[stats] {event}", flush=True)
+                tv = caster.poll_playback_stats()
+                for event in stats.record_tv_poll(
+                    state=tv.state,
+                    position_s=tv.position_s,
+                    idle_reason=tv.idle_reason,
+                ):
+                    print(f"[stats] {event}", flush=True)
+                next_tv_poll_at = now + args.tv_poll_interval
+
+            if stats is not None and now >= next_stats_at:
                 print(stats.format_report(args.stats_interval), flush=True)
-                next_stats_at = time.monotonic() + args.stats_interval
-            time.sleep(0.5)
+                next_stats_at = now + args.stats_interval
+            time.sleep(0.25)
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         shutdown()

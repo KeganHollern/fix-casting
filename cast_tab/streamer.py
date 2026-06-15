@@ -286,6 +286,7 @@ class HLSStreamer:
         self._ffmpeg_lock = threading.Lock()
         self._backpressure_started_at: float | None = None
         self._last_encoded_generation = -1
+        self._known_hls_segments: set[str] = set()
 
     @property
     def playlist_url(self) -> str:
@@ -307,17 +308,28 @@ class HLSStreamer:
             if self._stats is not None:
                 self._stats.record_publish()
 
-    def poll_hls_stats(self) -> None:
+    def poll_hls_stats(self) -> list[str]:
         if self._stats is None:
-            return
+            return []
         segments = sorted(self.work_dir.glob("seg*.ts"))
         newest_age: float | None = None
         if segments:
             newest_age = time.time() - segments[-1].stat().st_mtime
+
+        current = {path.name for path in segments}
+        had_segments = bool(self._known_hls_segments)
+        deleted = sorted(self._known_hls_segments - current)
+        events: list[str] = []
+        if deleted and had_segments:
+            events.append(f"hls deleted {', '.join(deleted)}")
+        self._known_hls_segments = current
+
         self._stats.record_hls(
             segment_count=len(segments),
             newest_age_s=newest_age,
+            segments_deleted=len(deleted) if had_segments else 0,
         )
+        return events
 
     def wait_until_ready(self, timeout: float | None = None) -> None:
         if timeout is None:

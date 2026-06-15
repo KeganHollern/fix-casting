@@ -7,7 +7,16 @@ import time
 import pychromecast
 from pychromecast import Chromecast
 
+from dataclasses import dataclass
+
 from cast_tab.devices import CastDevice
+
+
+@dataclass(frozen=True)
+class TvPlaybackSnapshot:
+    state: str | None
+    position_s: float | None
+    idle_reason: str | None
 
 
 class TabCaster:
@@ -83,18 +92,22 @@ class TabCaster:
         except KeyboardInterrupt:
             pass
 
-    def poll_playback_stats(self) -> tuple[str | None, float | None]:
+    def poll_playback_stats(self) -> TvPlaybackSnapshot:
         if self._chromecast is None:
-            return None, None
+            return TvPlaybackSnapshot(None, None, None)
         try:
             self._chromecast.media_controller.update_status()
             status = self._chromecast.media_controller.status
         except Exception:
-            return None, None
+            return TvPlaybackSnapshot(None, None, None)
         if status is None:
-            return None, None
+            return TvPlaybackSnapshot(None, None, None)
         position = status.current_time
-        return status.player_state, float(position) if position is not None else None
+        return TvPlaybackSnapshot(
+            status.player_state,
+            float(position) if position is not None else None,
+            status.idle_reason,
+        )
 
     def stop(self) -> None:
         if self._chromecast is None:

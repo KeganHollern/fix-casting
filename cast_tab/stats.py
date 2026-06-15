@@ -45,8 +45,17 @@ class PipelineStats:
     _ffmpeg_restarts: int = 0
     _hls_segment_age_s: float | None = None
     _hls_segment_count: int = 0
+    _hls_segments_deleted: int = 0
     _tv_state: str | None = None
     _tv_position_s: float | None = None
+    _tv_idle_reason: str | None = None
+    _tv_polls: int = 0
+    _tv_non_playing_polls: int = 0
+    _tv_non_playing_states: dict[str, int] = field(default_factory=dict, repr=False)
+    _tv_interval_start_pos_s: float | None = None
+    _tv_stall_accum_s: float = 0.0
+    _tv_last_poll_pos_s: float | None = None
+    _tv_last_poll_at: float | None = None
 
     def record_capture(self, latency_s: float, *, behind: bool = False) -> None:
         with self._lock:
@@ -83,15 +92,55 @@ class PipelineStats:
         with self._lock:
             self._ffmpeg_restarts += 1
 
-    def record_hls(self, *, segment_count: int, newest_age_s: float | None) -> None:
+    def record_hls(
+        self,
+        *,
+        segment_count: int,
+        newest_age_s: float | None,
+        segments_deleted: int = 0,
+    ) -> None:
         with self._lock:
             self._hls_segment_count = segment_count
             self._hls_segment_age_s = newest_age_s
+            self._hls_segments_deleted += segments_deleted
 
-    def record_tv(self, *, state: str | None, position_s: float | None) -> None:
+    def record_tv_poll(
+        self,
+        *,
+        state: str | None,
+        position_s: float | None,
+        idle_reason: str | None,
+    ) -> list[str]:
+        """Record a Chromecast status poll. Returns immediate event lines."""
+        events: list[str] = []
+        now = time.monotonic()
+
         with self._lock:
+            self._tv_polls += 1
             self._tv_state = state
             self._tv_position_s = position_s
+            self._tv_idle_reason = idle_reason
+
+            if state and state != "PLAYING":
+                self._tv_non_playing_polls += 1
+                label = state if not idle_reason else f"{state} ({idle_reason})"
+                self._tv_non_playing_states[label] = (
+                    self._tv_non_playing_states.get(label, 0) + 1
+                )
+                events.append(f"tv event {label}")
+
+            if position_s is not None and self._tv_last_poll_pos_s is not None:
+                if self._tv_last_poll_at is not None:
+                    wall_s = now - self._tv_last_poll_at
+                    pos_s = position_s - self._tv_last_poll_pos_s
+                    if wall_s >= 2.0 and pos_s + 1.0 < wall_s:
+                        self._tv_stall_accum_s += wall_s - pos_s
+
+            if position_s is not None:
+                self._tv_last_poll_pos_s = position_s
+                self._tv_last_poll_at = now
+
+        return events
 
     def format_report(self, interval_s: float) -> str:
         with self._lock:
@@ -112,8 +161,19 @@ class PipelineStats:
             ffmpeg_restarts = self._ffmpeg_restarts
             hls_count = self._hls_segment_count
             hls_age = self._hls_segment_age_s
+            hls_deleted = self._hls_segments_deleted
             tv_state = self._tv_state or "unknown"
             tv_pos = self._tv_position_s
+            tv_idle = self._tv_idle_reason
+            tv_polls = self._tv_polls
+            tv_non_playing = self._tv_non_playing_polls
+            tv_non_playing_states = dict(self._tv_non_playing_states)
+            interval_start_pos = self._tv_interval_start_pos_s
+            stall_accum = self._tv_stall_accum_s
+
+            pos_delta: float | None = None
+            if tv_pos is not None and interval_start_pos is not None:
+                pos_delta = tv_pos - interval_start_pos
 
             self._capture.reset()
             self._capture_behind = 0
@@ -125,6 +185,13 @@ class PipelineStats:
             self._encode_skipped = 0
             self._encode_write.reset()
             self._ffmpeg_restarts = 0
+            self._hls_segments_deleted = 0
+            self._tv_polls = 0
+            self._tv_non_playing_polls = 0
+            self._tv_non_playing_states.clear()
+            self._tv_stall_accum_s = 0.0
+            if tv_pos is not None:
+                self._tv_interval_start_pos_s = tv_pos
 
         lines = [
             (
@@ -143,14 +210,37 @@ class PipelineStats:
             ),
         ]
 
+        hls_line = f"hls     {hls_count} segments"
         if hls_age is not None:
-            lines.append(f"hls     {hls_count} segments, newest segment {hls_age:.1f}s old")
-        else:
-            lines.append(f"hls     {hls_count} segments")
+            hls_line += f", newest segment {hls_age:.1f}s old"
+        if hls_deleted:
+            hls_line += f", deleted {hls_deleted}"
+        lines.append(hls_line)
 
+        tv_line = f"tv      {tv_state}"
+        if tv_idle and tv_state != "PLAYING":
+            tv_line += f", idle {tv_idle}"
         if tv_pos is not None:
-            lines.append(f"tv      {tv_state}, playback position {tv_pos:.0f}s")
-        else:
-            lines.append(f"tv      {tv_state}")
+            tv_line += f", playback position {tv_pos:.0f}s"
+        if pos_delta is not None:
+            tv_line += f", position +{pos_delta:.0f}s/{interval_s:.0f}s"
+            interval_stall = max(0.0, interval_s - pos_delta)
+            if interval_stall >= 2.0:
+                tv_line += f", stall ~{interval_stall:.0f}s"
+            elif pos_delta > interval_s + 2.0:
+                tv_line += f", catch-up +{pos_delta - interval_s:.0f}s"
+        if stall_accum >= 2.0:
+            tv_line += f", micro-stalls ~{stall_accum:.0f}s"
+        if tv_polls:
+            tv_line += f", polls {tv_polls}"
+        if tv_non_playing:
+            reasons = ", ".join(
+                f"{label} x{count}"
+                for label, count in sorted(
+                    tv_non_playing_states.items(), key=lambda item: (-item[1], item[0])
+                )
+            )
+            tv_line += f", non-playing {tv_non_playing}/{tv_polls} ({reasons})"
+        lines.append(tv_line)
 
         return "\n".join(f"[stats] {line}" for line in lines)
