@@ -59,7 +59,17 @@ function beep(){try{
   g.gain.setValueAtTime(0.6,actx.currentTime);
   o.start();o.stop(actx.currentTime+0.08);
 }catch(e){}}
-function pulse(){ctx.drawImage(pat,0,0);beep();setTimeout(black,130);}
+// Paint-driven capture (screencast) only emits frames when the page paints, so
+// drive a continuous animation: a moving marker keeps frames flowing (small
+// JPEGs) and the flash overlays a full-screen noise field (a big JPEG spike).
+let flashUntil=0,mark=0;
+function frame(){
+  if(performance.now()<flashUntil){ctx.drawImage(pat,0,0);}
+  else{black();mark=(mark+7)%(W-8);ctx.fillStyle='#fff';ctx.fillRect(mark,0,6,6);}
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+function pulse(){flashUntil=performance.now()+130;beep();}
 setTimeout(()=>{pulse();setInterval(pulse,%PERIOD_MS%);},1500);
 </script></body></html>"""
 
