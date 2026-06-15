@@ -11,7 +11,7 @@ from collections import deque
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from cast_tab.audio import DEFAULT_AUDIO_FORMAT, AudioFormat, _pipe_bytes_available
+from cast_tab.audio import DEFAULT_AUDIO_FORMAT, AudioFormat
 from cast_tab.stats import PipelineStats
 
 FFMPEG_BACKPRESSURE_WRITE_S = 0.050
@@ -418,33 +418,27 @@ class HLSStreamer:
         ]
 
     def _auto_av_offset_args(self) -> list[str]:
-        """Auto-correct the constant A/V skew from startup audio pre-roll.
+        """Delay audio to match the video pipeline's latency (lip-sync).
 
-        The tap fills the audio pipe before ffmpeg starts reading, so ffmpeg
-        stamps that already-buffered audio with the same PTS 0 as the first
-        (current) video frame, leaving audio lagging by the pre-roll duration.
-        Measure exactly how much is queued right now and advance audio by that
-        much with -itsoffset. Re-measured on every (re)start, no manual knob.
+        Video runs through the capture + frame-queue + encoder path and reaches
+        the muxer later than the near-direct audio, so audio plays ahead. The
+        correction is the sum of:
+          - calibrated: the empirical flash+beep measurement of the skew (see
+            cast_tab.calibration), passed in as av_offset_s.
+          - manual: the optional --audio-offset-ms trim for any residual.
+        Applied as a positive -itsoffset, which shifts the audio input later.
         """
         if self.audio_fd is None:
             return []
-        try:
-            buffered = _pipe_bytes_available(self.audio_fd)
-        except OSError:
-            return []
-        # Audio leads video by the capture pre-roll plus the time video spends
-        # in our frame queue (the dominant term), plus any manual trim for the
-        # latency ffmpeg buffers internally that we can't measure.
-        pre_roll_s = buffered / self.audio_format.bytes_per_second
         manual_s = self.audio_offset_ms / 1000.0
-        offset_s = pre_roll_s + self._measured_av_delay_s + manual_s
+        offset_s = self._measured_av_delay_s + manual_s
         offset_s = max(-MAX_AUTO_AV_OFFSET_S, min(offset_s, MAX_AUTO_AV_OFFSET_S))
         if abs(offset_s) < 0.005:
             return []
         print(
-            f"A/V sync: shifting audio {offset_s * 1000:+.0f}ms "
-            f"(calibrated {self._measured_av_delay_s * 1000:.0f}ms + pre-roll "
-            f"{pre_roll_s * 1000:.0f}ms + manual {self.audio_offset_ms:+d}ms).",
+            f"A/V sync: delaying audio {offset_s * 1000:+.0f}ms "
+            f"(calibrated {self._measured_av_delay_s * 1000:.0f}ms + "
+            f"manual {self.audio_offset_ms:+d}ms).",
             flush=True,
         )
         # Positive itsoffset delays audio (it runs ahead of video).
