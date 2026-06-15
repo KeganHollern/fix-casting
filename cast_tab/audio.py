@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import array
+import fcntl
 import os
 import re
+import select
 import shutil
 import subprocess
+import termios
 import threading
 import time
 from collections.abc import Callable
@@ -22,6 +26,13 @@ AUDIOTEE_CANDIDATES = (
 
 class AudioCaptureError(RuntimeError):
     """Raised when tab audio cannot be captured."""
+
+
+def _pipe_bytes_available(fd: int) -> int:
+    """Bytes queued on a pipe read end. 0 while readable means EOF, not data."""
+    buf = array.array("i", [0])
+    fcntl.ioctl(fd, termios.FIONREAD, buf, True)
+    return buf[0]
 
 
 @dataclass(frozen=True)
@@ -108,6 +119,7 @@ def try_start_chrome_audio_capture(
     timeout: float = 30.0,
     retry_interval: float = 2.0,
     on_retry: Callable[[], None] | None = None,
+    on_stderr: Callable[[str], None] | None = None,
 ) -> AudioCapture:
     """Retry audio tap until Chrome is actively outputting audio."""
     deadline = time.monotonic() + timeout
@@ -121,7 +133,7 @@ def try_start_chrome_audio_capture(
             if not pids:
                 continue
             try:
-                return start_chrome_audio_capture(pids)
+                return start_chrome_audio_capture(pids, on_stderr=on_stderr)
             except AudioCaptureError as exc:
                 last_error = str(exc)
                 if "Failed to translate" in last_error or "exited early" in last_error:
@@ -142,8 +154,15 @@ def start_chrome_audio_capture(
     sample_rate: int = 44100,
     chunk_duration: float = 0.1,
     ready_timeout: float = 5.0,
+    on_stderr: Callable[[str], None] | None = None,
 ) -> AudioCapture:
-    """Capture audio from specific Chrome PIDs without touching other apps."""
+    """Capture audio from specific Chrome PIDs without touching other apps.
+
+    AudioTee's stdout fd is handed straight to ffmpeg (via pass_fds) — there
+    is deliberately no Python relay thread between them. A relay would put a
+    GIL-scheduled thread on the path of a real-time audio stream, and any
+    scheduling delay stalls AudioTee's pipe and under-runs capture (clicks).
+    """
     binary = audiotee_path()
     if binary is None:
         raise AudioCaptureError(
@@ -155,7 +174,6 @@ def start_chrome_audio_capture(
         raise AudioCaptureError("No Chrome process IDs found for tab audio capture.")
 
     tap_read, tap_write = os.pipe()
-    relay_read, relay_write = os.pipe()
     command = [
         str(binary),
         "--include-processes",
@@ -174,52 +192,60 @@ def start_chrome_audio_capture(
     )
     os.close(tap_write)
 
-    if process.poll() is not None:
-        stderr = process.stderr.read().decode(errors="replace") if process.stderr else ""
-        os.close(tap_read)
-        os.close(relay_read)
-        os.close(relay_write)
-        raise AudioCaptureError(f"AudioTee failed to start: {stderr.strip()}")
+    # Continuously drain AudioTee stderr: it surfaces capture warnings
+    # (under-runs/drops) and, left unread, its pipe fills and deadlocks
+    # AudioTee. Lines are buffered so error paths can report them.
+    stderr_lines: list[str] = []
 
-    ready = threading.Event()
-
-    def relay_audio() -> None:
+    def drain_stderr() -> None:
         try:
-            while True:
-                chunk = os.read(tap_read, 65_536)
-                if not chunk:
-                    break
-                os.write(relay_write, chunk)
-                ready.set()
-        except OSError:
+            if process.stderr is None:
+                return
+            for raw in process.stderr:
+                line = raw.decode(errors="replace").rstrip()
+                if not line:
+                    continue
+                stderr_lines.append(line)
+                if on_stderr is not None:
+                    on_stderr(line)
+        except (OSError, ValueError):
             pass
-        finally:
-            try:
-                os.close(relay_write)
-            except OSError:
-                pass
-            try:
-                os.close(tap_read)
-            except OSError:
-                pass
 
-    relay_thread = threading.Thread(target=relay_audio, name="audio-relay", daemon=True)
-    relay_thread.start()
+    stderr_thread = threading.Thread(
+        target=drain_stderr, name="audiotee-stderr", daemon=True
+    )
+    stderr_thread.start()
 
+    def _fail_exited_early() -> AudioCaptureError:
+        stderr_thread.join(timeout=0.3)
+        os.close(tap_read)
+        return AudioCaptureError(
+            f"AudioTee exited early: {' '.join(stderr_lines).strip()}"
+        )
+
+    # Wait until AudioTee actually has audio bytes ready, without consuming
+    # them (ffmpeg reads the pipe from the first byte). A pipe read end goes
+    # "readable" both when data arrives and when the writer dies (EOF), so we
+    # confirm with FIONREAD that bytes are really queued before declaring
+    # success — otherwise a crashed AudioTee looks like a working tap.
     deadline = time.monotonic() + ready_timeout
-    while not ready.wait(timeout=0.2):
+    while True:
+        readable, _, _ = select.select([tap_read], [], [], 0.2)
+        if readable:
+            try:
+                available = _pipe_bytes_available(tap_read)
+            except OSError:
+                available = 0
+            if available > 0:
+                return AudioCapture(process=process, read_fd=tap_read, pids=tuple(pids))
+            # Readable with nothing queued == EOF: AudioTee closed stdout.
+            raise _fail_exited_early()
         if process.poll() is not None:
-            stderr = process.stderr.read().decode(errors="replace") if process.stderr else ""
-            os.close(relay_read)
-            raise AudioCaptureError(f"AudioTee exited early: {stderr.strip()}")
+            raise _fail_exited_early()
         if time.monotonic() > deadline:
-            os.close(relay_read)
+            os.close(tap_read)
             process.terminate()
-            raise AudioCaptureError(
-                "No audio data received from cast browser tap."
-            )
-
-    return AudioCapture(process=process, read_fd=relay_read, pids=tuple(pids))
+            raise AudioCaptureError("No audio data received from cast browser tap.")
 
 
 def stop_audio_capture(capture: AudioCapture | None) -> None:

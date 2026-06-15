@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import signal
 import sys
 import time
@@ -178,10 +179,42 @@ def main(argv: list[str] | None = None) -> int:
                 capture_audio = False
             else:
                 print("Waiting for cast browser audio...")
+
+                def on_audio_stderr(line: str) -> None:
+                    mtype = "log"
+                    text = line
+                    try:
+                        parsed = json.loads(line)
+                        mtype = str(parsed.get("message_type", "log"))
+                        data = parsed.get("data") or {}
+                        text = str(data.get("message", line))
+                        context = data.get("context")
+                        if context:
+                            text += f" {context}"
+                    except (ValueError, AttributeError):
+                        pass
+                    # Debug lines are high-volume (per-PID tap attempts); keep
+                    # them out of the log but still surface info/warning/error.
+                    if mtype == "debug":
+                        return
+                    print(f"[audio:{mtype}] {text}", flush=True)
+                    if stats is not None and (
+                        mtype in ("error", "warning")
+                        or any(
+                            kw in text.lower()
+                            for kw in (
+                                "drop", "underrun", "overrun",
+                                "glitch", "discontinu", "xrun",
+                            )
+                        )
+                    ):
+                        stats.record_audio_warning(text)
+
                 try:
                     audio_capture = try_start_chrome_audio_capture(
                         screencaster.user_data_dir,
                         on_retry=screencaster.nudge_playback,
+                        on_stderr=on_audio_stderr,
                     )
                     print(
                         "Capturing audio from cast browser only "

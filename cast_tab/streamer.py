@@ -12,7 +12,7 @@ from pathlib import Path
 
 from cast_tab.stats import PipelineStats
 
-FFMPEG_BACKPRESSURE_WRITE_S = 0.010
+FFMPEG_BACKPRESSURE_WRITE_S = 0.050
 FFMPEG_BACKPRESSURE_DURATION_S = 60.0
 
 
@@ -460,7 +460,11 @@ class HLSStreamer:
             "44100",
             "-ac",
             "2",
-            *([] if self.buffered else ["-async", "1"]),
+            # Resample-async keeps audio aligned to its generated timestamps,
+            # filling gaps with silence/stretch instead of emitting a hard
+            # discontinuity (audible click) when the raw PCM input under-runs.
+            "-af",
+            "aresample=async=1:min_hard_comp=0.100:first_pts=0",
             *_hls_args(buffered=self.buffered),
             "-hls_segment_filename",
             segment_pattern,
@@ -475,8 +479,10 @@ class HLSStreamer:
             "stderr": subprocess.PIPE,
         }
         if self.audio_fd is not None:
+            # pass_fds keeps only this fd open in the child (close_fds stays
+            # True by default); never inherit the rest of our fds, or ffmpeg
+            # holds pipe write-ends open and never sees EOF on shutdown.
             popen_kwargs["pass_fds"] = (self.audio_fd,)
-            popen_kwargs["close_fds"] = False
         self._ffmpeg = subprocess.Popen(cmd, **popen_kwargs)
 
     def _start_encoder_thread(self) -> None:
@@ -489,17 +495,28 @@ class HLSStreamer:
                 sleep_for = next_tick - now
                 if sleep_for > 0:
                     time.sleep(sleep_for)
+                    now = time.monotonic()
+                # If we have fallen far behind (ffmpeg restart, long stall),
+                # resync rather than bursting a large frame backlog at ffmpeg.
+                if now - next_tick > 1.0:
+                    next_tick = now
+                    if self._stats is not None:
+                        self._stats.record_encode_resync()
                 next_tick += frame_period
 
                 frame, published_at, generation = self._latest.peek()
                 if frame is None:
                     continue
-                if generation == self._last_encoded_generation:
-                    if self._stats is not None:
-                        self._stats.record_encode_skip()
-                    continue
 
-                if self._stats is not None and published_at is not None:
+                # Always feed ffmpeg one frame per tick to hold a constant
+                # input frame rate. When capture has not produced a new frame,
+                # re-send the latest one; skipping it would make the encoded
+                # timeline run slower than wall-clock and drain the TV buffer.
+                is_repeat = generation == self._last_encoded_generation
+                if is_repeat:
+                    if self._stats is not None:
+                        self._stats.record_encode_repeat()
+                elif self._stats is not None and published_at is not None:
                     self._stats.record_frame_age(time.monotonic() - published_at)
 
                 with self._ffmpeg_lock:

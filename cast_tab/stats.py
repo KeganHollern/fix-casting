@@ -40,9 +40,12 @@ class PipelineStats:
     _publish: _Window = field(default_factory=_Window, repr=False)
     _frame_age: _Window = field(default_factory=_Window, repr=False)
     _encode: _Window = field(default_factory=_Window, repr=False)
-    _encode_skipped: int = 0
+    _encode_repeats: int = 0
+    _encode_resyncs: int = 0
     _encode_write: _Window = field(default_factory=_Window, repr=False)
     _ffmpeg_restarts: int = 0
+    _audio_warnings: int = 0
+    _audio_last_warning: str | None = None
     _hls_segment_age_s: float | None = None
     _hls_segment_count: int = 0
     _hls_segments_deleted: int = 0
@@ -79,9 +82,20 @@ class PipelineStats:
         with self._lock:
             self._frame_age.add(age_s)
 
-    def record_encode_skip(self) -> None:
+    def record_encode_repeat(self) -> None:
+        """A tick re-sent the last frame because capture produced nothing new."""
         with self._lock:
-            self._encode_skipped += 1
+            self._encode_repeats += 1
+
+    def record_encode_resync(self) -> None:
+        """The encoder fell >1s behind and reset its clock instead of bursting."""
+        with self._lock:
+            self._encode_resyncs += 1
+
+    def record_audio_warning(self, text: str) -> None:
+        with self._lock:
+            self._audio_warnings += 1
+            self._audio_last_warning = text
 
     def record_encode_write(self, write_s: float) -> None:
         with self._lock:
@@ -157,8 +171,11 @@ class PipelineStats:
             behind = self._capture_behind
             errors = self._capture_errors
             timeouts = self._capture_timeouts
-            skipped = self._encode_skipped
+            repeats = self._encode_repeats
+            resyncs = self._encode_resyncs
             ffmpeg_restarts = self._ffmpeg_restarts
+            audio_warnings = self._audio_warnings
+            audio_last_warning = self._audio_last_warning
             hls_count = self._hls_segment_count
             hls_age = self._hls_segment_age_s
             hls_deleted = self._hls_segments_deleted
@@ -182,9 +199,11 @@ class PipelineStats:
             self._publish.reset()
             self._frame_age.reset()
             self._encode.reset()
-            self._encode_skipped = 0
+            self._encode_repeats = 0
+            self._encode_resyncs = 0
             self._encode_write.reset()
             self._ffmpeg_restarts = 0
+            self._audio_warnings = 0
             self._hls_segments_deleted = 0
             self._tv_polls = 0
             self._tv_non_playing_polls = 0
@@ -205,7 +224,8 @@ class PipelineStats:
                 f"encode  {encode_fps:.1f}/{self.target_fps:.0f} fps to ffmpeg, "
                 f"frame age avg {frame_age_ms:.0f}ms peak {frame_age_peak_ms:.0f}ms, "
                 f"stdin write avg {write_ms:.1f}ms peak {write_peak_ms:.1f}ms"
-                + (f", skipped dupes {skipped}" if skipped else "")
+                + (f", repeats {repeats}" if repeats else "")
+                + (f", resyncs {resyncs}" if resyncs else "")
                 + (f", ffmpeg restarts {ffmpeg_restarts}" if ffmpeg_restarts else "")
             ),
         ]
@@ -216,6 +236,12 @@ class PipelineStats:
         if hls_deleted:
             hls_line += f", deleted {hls_deleted}"
         lines.append(hls_line)
+
+        if audio_warnings:
+            audio_line = f"audio   {audio_warnings} warnings this interval"
+            if audio_last_warning:
+                audio_line += f' (last: "{audio_last_warning}")'
+            lines.append(audio_line)
 
         tv_line = f"tv      {tv_state}"
         if tv_idle and tv_state != "PLAYING":
