@@ -72,16 +72,16 @@ def main() -> None:
 
     print("\n=== VIDEO (output brightness) ===")
     _summary("YAVG", video)
-    ve = cal._detect_events(video, ratio=3.0)
-    print(f"  flash events @ {[round(t, 2) for t in ve]}")
+    vp = cal._classify(cal._detect_pulses(video, ratio=3.0))
+    print(f"  flashes (t, step): {[(round(t, 2), k) for t, k in vp]}")
 
     print("\n=== AUDIO (output rms) ===")
     _summary("rms", audio)
-    ae = cal._detect_events(audio, ratio=4.0)
-    print(f"  beep events  @ {[round(t, 2) for t in ae]}")
+    ap = cal._classify(cal._detect_pulses(audio, ratio=4.0))
+    print(f"  beeps   (t, step): {[(round(t, 2), k) for t, k in ap]}")
 
-    print("\n=== OFFSET ===")
-    result = cal._median_offset(ve, ae)
+    print("\n=== OFFSET (matched by cycle-step identity) ===")
+    result = cal._identity_offset(vp, ap)
     if result is None:
         print("  could not match flash/beep pairs")
     else:

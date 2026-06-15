@@ -29,20 +29,21 @@ from cast_tab.audio import (
 from cast_tab.browser import CaptureMethod, TabScreencaster
 from cast_tab.streamer import HLSStreamer
 
-# Flash + beep fire together every PULSE_PERIOD_S. The period must exceed twice
-# the expected offset so each flash's nearest beep is unambiguously its own.
-PULSE_PERIOD_S = 5.0
+# Each pulse cycles through N_LEVELS distinct intensities: a flash brightness
+# and a beep amplitude that encode the same sequence index. We match a flash to
+# a beep by that shared identity, not by proximity in time, so the measurement
+# survives missing early pulses (the tap is latent on startup) and large skews.
+PULSE_PERIOD_S = 1.5
+FLASH_GRAYS = [52, 104, 156, 208]   # video flash luma per cycle step
+BEEP_AMPS = [0.15, 0.30, 0.45, 0.60]  # audio beep amplitude per cycle step
+N_LEVELS = len(FLASH_GRAYS)
 _CALIBRATION_HTML = """<!doctype html><html><head><meta charset=utf-8>
 <style>html,body{margin:0;background:#000;overflow:hidden}canvas{display:block}</style>
 </head><body><canvas id=c></canvas><script>
 const cv=document.getElementById('c');const W=cv.width=innerWidth,H=cv.height=innerHeight;
 const ctx=cv.getContext('2d');
-const pat=document.createElement('canvas');pat.width=W;pat.height=H;
-const pc=pat.getContext('2d');const img=pc.createImageData(W,H);
-for(let i=0;i<img.data.length;i+=4){img.data[i]=Math.random()*255;img.data[i+1]=Math.random()*255;img.data[i+2]=Math.random()*255;img.data[i+3]=255;}
-pc.putImageData(img,0,0);
-function black(){ctx.fillStyle='#000';ctx.fillRect(0,0,W,H);}
-let actx;
+const grays=%GRAYS%,amps=%AMPS%,N=grays.length;
+let k=0,flashUntil=0,flashGray=0,mark=0,actx;
 function ensureCtx(){
   if(!actx){actx=new (window.AudioContext||window.webkitAudioContext)();
     const bg=actx.createOscillator(),bgg=actx.createGain();
@@ -50,29 +51,33 @@ function ensureCtx(){
   }
   if(actx.state==='suspended')actx.resume();
 }
-function beep(){try{
+function beep(amp){try{
   ensureCtx();
   const o=actx.createOscillator(),g=actx.createGain();
   o.type='square';o.frequency.value=1000;o.connect(g);g.connect(actx.destination);
-  g.gain.setValueAtTime(0.6,actx.currentTime);
-  o.start();o.stop(actx.currentTime+0.08);
+  g.gain.setValueAtTime(amp,actx.currentTime);
+  o.start();o.stop(actx.currentTime+0.10);
 }catch(e){}}
-// Drive a continuous marker so the paint-driven capture keeps emitting frames;
-// the flash overlays a full-screen noise field (a bright, high-entropy frame).
-let flashUntil=0,mark=0;
+// Continuous marker keeps the paint-driven capture emitting frames; the flash
+// overlays a full-screen gray whose luma encodes the cycle step.
 function frame(){
-  if(performance.now()<flashUntil){ctx.drawImage(pat,0,0);}
-  else{black();mark=(mark+7)%(W-8);ctx.fillStyle='#fff';ctx.fillRect(mark,0,6,6);}
+  if(performance.now()<flashUntil){const c='rgb('+flashGray+','+flashGray+','+flashGray+')';ctx.fillStyle=c;ctx.fillRect(0,0,W,H);}
+  else{ctx.fillStyle='#000';ctx.fillRect(0,0,W,H);mark=(mark+7)%(W-8);ctx.fillStyle='#fff';ctx.fillRect(mark,0,6,6);}
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
-function pulse(){flashUntil=performance.now()+130;beep();}
+function pulse(){flashGray=grays[k];flashUntil=performance.now()+130;beep(amps[k]);k=(k+1)%N;}
 setTimeout(()=>{pulse();setInterval(pulse,%PERIOD_MS%);},1500);
 </script></body></html>"""
 
 
 def _calibration_url() -> str:
-    html = _CALIBRATION_HTML.replace("%PERIOD_MS%", str(int(PULSE_PERIOD_S * 1000)))
+    html = (
+        _CALIBRATION_HTML
+        .replace("%GRAYS%", str(FLASH_GRAYS))
+        .replace("%AMPS%", str(BEEP_AMPS))
+        .replace("%PERIOD_MS%", str(int(PULSE_PERIOD_S * 1000)))
+    )
     return "data:text/html," + urllib.parse.quote(html)
 
 
@@ -114,32 +119,60 @@ def probe_audio_rms(mkv: Path) -> list[tuple[float, float]]:
     return [(t, 10 ** (db / 20) if db > -200 else 0.0) for t, db in raw]
 
 
-def _detect_events(series: list[tuple[float, float]], *, ratio: float) -> list[float]:
-    """Return the onset time of each spike (value > ratio * median baseline)."""
+def _detect_pulses(
+    series: list[tuple[float, float]], *, ratio: float
+) -> list[tuple[float, float]]:
+    """Return (onset_time, peak_value) for each spike above the baseline."""
     if len(series) < 4:
         return []
     ordered = sorted(v for _, v in series)
     median = ordered[len(ordered) // 2] or 1e-9
     threshold = median * ratio
-    events: list[float] = []
-    last = -1e9
+    refractory = PULSE_PERIOD_S * 0.6
+    pulses: list[tuple[float, float]] = []
+    in_event = False
+    onset = 0.0
+    peak = 0.0
+    last_end = -1e9
     for t, value in series:
-        if value >= threshold and (t - last) > PULSE_PERIOD_S * 0.5:
-            events.append(t)
-            last = t
-    return events
+        if value >= threshold:
+            if not in_event and (t - last_end) > refractory:
+                in_event, onset, peak = True, t, value
+            elif in_event:
+                peak = max(peak, value)
+        elif in_event:
+            in_event, last_end = False, t
+            pulses.append((onset, peak))
+    if in_event:
+        pulses.append((onset, peak))
+    return pulses
 
 
-def _median_offset(
-    video_events: list[float], audio_events: list[float]
+def _classify(pulses: list[tuple[float, float]]) -> list[tuple[float, int]]:
+    """Tag each pulse with its cycle step from its peak level (scale-free)."""
+    if not pulses:
+        return []
+    top = max(p for _, p in pulses) or 1e-9
+    tagged: list[tuple[float, int]] = []
+    for t, peak in pulses:
+        norm = peak / top
+        step = min(range(N_LEVELS), key=lambda i: abs(norm - (i + 1) / N_LEVELS))
+        tagged.append((t, step))
+    return tagged
+
+
+def _identity_offset(
+    video: list[tuple[float, int]], audio: list[tuple[float, int]]
 ) -> tuple[float, int] | None:
-    if not video_events or not audio_events:
-        return None
+    """Median (flash - beep) over pulses matched by their cycle-step identity."""
     offsets: list[float] = []
-    for ve in video_events:
-        ae = min(audio_events, key=lambda a: abs(a - ve))
-        if abs(ve - ae) < PULSE_PERIOD_S * 0.5:
-            offsets.append(ve - ae)
+    for vt, vstep in video:
+        same = [at for at, astep in audio if astep == vstep]
+        if not same:
+            continue
+        at = min(same, key=lambda a: abs(a - vt))
+        if abs(vt - at) < PULSE_PERIOD_S * N_LEVELS * 0.5:
+            offsets.append(vt - at)
     if len(offsets) < 2:
         return None
     offsets.sort()
@@ -185,17 +218,14 @@ def offset_from_output(
     if mkv is None:
         return None
 
-    video_events = _detect_events(probe_video_brightness(mkv), ratio=3.0)
-    audio_events = _detect_events(probe_audio_rms(mkv), ratio=4.0)
-    log(
-        f"Calibration: output had {len(video_events)} flashes / "
-        f"{len(audio_events)} beeps."
-    )
-    result = _median_offset(video_events, audio_events)
+    video = _classify(_detect_pulses(probe_video_brightness(mkv), ratio=3.0))
+    audio = _classify(_detect_pulses(probe_audio_rms(mkv), ratio=4.0))
+    log(f"Calibration: output had {len(video)} flashes / {len(audio)} beeps.")
+    result = _identity_offset(video, audio)
     if result is None:
         return None
     offset_s, matched = result
-    log(f"Calibration: matched {matched} flash/beep pairs.")
+    log(f"Calibration: matched {matched} flash/beep pairs by identity.")
     return offset_s
 
 
