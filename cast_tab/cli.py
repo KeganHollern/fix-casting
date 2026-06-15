@@ -17,6 +17,7 @@ from cast_tab.audio import (
     stop_audio_capture,
 )
 from cast_tab.browser import TabScreencaster
+from cast_tab.calibration import measure_av_offset
 from cast_tab.caster import TabCaster
 from cast_tab.devices import discover_devices, select_device
 from cast_tab.stats import PipelineStats
@@ -141,6 +142,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--calibrate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Measure the A/V capture offset with a flash+beep test page before "
+            "streaming, and auto-correct lip-sync (default: on). "
+            "Use --no-calibrate to skip the ~15s calibration step."
+        ),
+    )
+    parser.add_argument(
         "--stats",
         action="store_true",
         help="Print pipeline timing stats every 10s to diagnose lag",
@@ -176,6 +187,22 @@ def main(argv: list[str] | None = None) -> int:
     jpeg_quality = args.jpeg_quality or default_jpeg_quality(args.width, args.height)
     capture_audio = not args.no_audio
     stats = PipelineStats(target_fps=float(encode_fps)) if args.stats else None
+
+    av_offset_s = 0.0
+    if capture_audio and args.calibrate:
+        print("Calibrating A/V sync (flash + beep test, ~15s)...")
+        measured = measure_av_offset(
+            capture_method=args.capture,
+            width=args.width,
+            height=args.height,
+            jpeg_quality=jpeg_quality,
+            headless=args.headless,
+        )
+        if measured is None:
+            print("Calibration: could not measure offset; continuing without it.")
+        else:
+            av_offset_s = measured
+            print(f"Calibration: audio leads video by {av_offset_s * 1000:.0f}ms.")
 
     screencaster = TabScreencaster(
         args.url,
@@ -295,6 +322,7 @@ def main(argv: list[str] | None = None) -> int:
             audio_sync=args.audio_sync,
             audio_format=audio_capture.audio_format if audio_capture else None,
             audio_offset_ms=args.audio_offset_ms,
+            av_offset_s=av_offset_s,
             stats=stats,
         )
         screencaster.on_frame = streamer.publish_frame
@@ -317,14 +345,6 @@ def main(argv: list[str] | None = None) -> int:
 
         streamer.start()
         streamer.wait_until_ready()
-
-        if capture_audio:
-            # Let the video frame-queue reach steady state, then delay audio to
-            # match its latency. Done before the TV connects so the one-time
-            # ffmpeg relaunch is invisible to the viewer.
-            time.sleep(4)
-            streamer.measure_and_apply_av_delay()
-            streamer.wait_until_ready()
 
         caster.connect()
         caster.play_hls(streamer.playlist_url)

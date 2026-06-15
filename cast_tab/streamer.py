@@ -269,6 +269,7 @@ class HLSStreamer:
         audio_sync: str = "off",
         audio_format: AudioFormat | None = None,
         audio_offset_ms: int = 0,
+        av_offset_s: float = 0.0,
         port: int = 0,
         work_dir: Path | None = None,
         stats: PipelineStats | None = None,
@@ -282,6 +283,8 @@ class HLSStreamer:
         self.audio_sync = audio_sync
         self.audio_format = audio_format or DEFAULT_AUDIO_FORMAT
         self.audio_offset_ms = audio_offset_ms
+        # Measured by the flash+beep calibration: how far audio leads video.
+        self._measured_av_delay_s = av_offset_s
         self.work_dir = work_dir or Path("/tmp/cast-tab-stream")
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -301,9 +304,6 @@ class HLSStreamer:
         self._stats = stats
         self._ffmpeg_lock = threading.Lock()
         self._backpressure_started_at: float | None = None
-        # Extra audio delay (seconds) to match the video frame-queue latency,
-        # set once by measure_and_apply_av_delay().
-        self._measured_av_delay_s = 0.0
         self._last_sampled_generation = -1
         self._known_hls_segments: set[str] = set()
         # Frames sampled at an even cadence wait here for the writer thread to
@@ -442,41 +442,13 @@ class HLSStreamer:
         if abs(offset_s) < 0.005:
             return []
         print(
-            f"Auto A/V sync: shifting audio {offset_s * 1000:+.0f}ms "
-            f"(pre-roll {pre_roll_s * 1000:.0f}ms + video buffer "
-            f"{self._measured_av_delay_s * 1000:.0f}ms + manual {self.audio_offset_ms:+d}ms).",
+            f"A/V sync: shifting audio {offset_s * 1000:+.0f}ms "
+            f"(calibrated {self._measured_av_delay_s * 1000:.0f}ms + pre-roll "
+            f"{pre_roll_s * 1000:.0f}ms + manual {self.audio_offset_ms:+d}ms).",
             flush=True,
         )
         # Positive itsoffset delays audio (it runs ahead of video).
         return ["-itsoffset", f"{offset_s:.3f}"]
-
-    def _current_queue_depth(self) -> int:
-        with self._queue_cond:
-            return len(self._frame_queue)
-
-    def measure_and_apply_av_delay(self, *, settle_s: float = 2.0) -> float:
-        """Measure the standing video frame-queue depth and delay audio to match.
-
-        ffmpeg is paced by the live audio, so the frame queue can't be drained
-        with CPU; instead we compensate. Measuring the depth (in frames) gives
-        the video-behind-audio latency directly. Re-launches ffmpeg once with
-        the matching audio offset — call this before the Chromecast connects so
-        the relaunch is invisible.
-        """
-        deadline = time.monotonic() + settle_s
-        samples: list[int] = []
-        while time.monotonic() < deadline and not self._stopped.is_set():
-            samples.append(self._current_queue_depth())
-            time.sleep(0.1)
-        avg_depth = sum(samples) / len(samples) if samples else 0.0
-        self._measured_av_delay_s = avg_depth / self.fps
-        print(
-            f"Auto A/V sync: measured video buffer ~{avg_depth:.0f} frames "
-            f"({self._measured_av_delay_s * 1000:.0f}ms); recalibrating.",
-            flush=True,
-        )
-        self._relaunch_ffmpeg()
-        return self._measured_av_delay_s
 
     def _kill_ffmpeg(self) -> None:
         if self._ffmpeg is None:
