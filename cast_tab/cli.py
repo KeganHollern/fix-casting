@@ -54,7 +54,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--fps",
         type=int,
         default=None,
-        help="Encode frame rate (default: 23 at 1080p, 24 at 720p)",
+        help="Encode frame rate (default: 30 buffered, 23 at 1080p / 24 at 720p otherwise)",
+    )
+    parser.add_argument(
+        "--capture-fps",
+        type=int,
+        default=None,
+        help=(
+            "Tab capture rate (default: ~1.5x the encode fps). Capturing faster "
+            "than the encoder keeps a fresh frame ready each tick, reducing "
+            "duplicate frames and motion judder on the TV."
+        ),
     )
     parser.add_argument(
         "--discovery-timeout",
@@ -127,18 +137,21 @@ def main(argv: list[str] | None = None) -> int:
     device = select_device(devices)
 
     codec = resolve_codec(args.codec)
-    fps = args.fps or default_fps_for_resolution(
+    encode_fps = args.fps or default_fps_for_resolution(
         args.width, args.height, buffered=args.buffered
     )
+    # Oversample capture so a fresh frame is ready at every encoder tick.
+    capture_fps = args.capture_fps or max(encode_fps, round(encode_fps * 1.5))
     jpeg_quality = default_jpeg_quality(args.width, args.height)
     capture_audio = not args.no_audio
-    stats = PipelineStats(target_fps=float(fps)) if args.stats else None
+    stats = PipelineStats(target_fps=float(encode_fps)) if args.stats else None
 
     screencaster = TabScreencaster(
         args.url,
         width=args.width,
         height=args.height,
-        fps=fps,
+        fps=capture_fps,
+        pace_fps=encode_fps,
         jpeg_quality=jpeg_quality,
         on_frame=lambda _frame: None,
         headless=args.headless,
@@ -179,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
                 capture_audio = False
             else:
                 print("Waiting for cast browser audio...")
+                audio_attached = False
 
                 def on_audio_stderr(line: str) -> None:
                     mtype = "log"
@@ -196,6 +210,19 @@ def main(argv: list[str] | None = None) -> int:
                     # Debug lines are high-volume (per-PID tap attempts); keep
                     # them out of the log but still surface info/warning/error.
                     if mtype == "debug":
+                        return
+                    # AudioTee probes PID candidates that do not tap on modern
+                    # macOS (renderers). "failed to translate" only happens
+                    # during that probing, so it is always search noise; a bare
+                    # "failure" is suppressed only until a tap succeeds, so a
+                    # mid-stream AudioTee death still surfaces.
+                    low = text.strip().lower()
+                    if "failed to translate" in low:
+                        return
+                    if not audio_attached and (
+                        low in ("error: failure", "failure")
+                        or low.startswith("starting audiotee")
+                    ):
                         return
                     print(f"[audio:{mtype}] {text}", flush=True)
                     if stats is not None and (
@@ -216,6 +243,7 @@ def main(argv: list[str] | None = None) -> int:
                         on_retry=screencaster.nudge_playback,
                         on_stderr=on_audio_stderr,
                     )
+                    audio_attached = True
                     print(
                         "Capturing audio from cast browser only "
                         f"(PIDs: {', '.join(str(pid) for pid in audio_capture.pids)})."
@@ -229,7 +257,7 @@ def main(argv: list[str] | None = None) -> int:
         streamer = HLSStreamer(
             width=args.width,
             height=args.height,
-            fps=fps,
+            fps=encode_fps,
             codec=codec,
             buffered=args.buffered,
             audio_fd=audio_capture.read_fd if audio_capture else None,
@@ -240,8 +268,9 @@ def main(argv: list[str] | None = None) -> int:
         audio_mode = "with tab audio" if capture_audio else "video only"
         latency_mode = "buffered (~45s TV delay)" if args.buffered else "low-latency"
         print(
-            f"Streaming at {args.width}x{args.height} {fps} fps "
-            f"(jpeg q={jpeg_quality}, capture={args.capture}) {audio_mode} "
+            f"Streaming at {args.width}x{args.height} {encode_fps} fps "
+            f"(capture ~{capture_fps} fps, jpeg q={jpeg_quality}, "
+            f"capture={args.capture}) {audio_mode} "
             f"using {codec_label(codec)}, {latency_mode}."
         )
         if codec == "av1":

@@ -30,6 +30,7 @@ class TabScreencaster:
         width: int = 1920,
         height: int = 1080,
         fps: int = 24,
+        pace_fps: int | None = None,
         jpeg_quality: int = 75,
         on_frame: Callable[[bytes], None],
         headless: bool = False,
@@ -44,6 +45,10 @@ class TabScreencaster:
         self.width = width
         self.height = height
         self.fps = fps
+        # The rate the encoder consumes at. Capturing faster than this (fps >
+        # pace_fps) keeps a fresh frame ready at every encoder tick, so the
+        # encoder rarely has to repeat -> smoother constant-rate output.
+        self._pace_fps = pace_fps or fps
         self.jpeg_quality = jpeg_quality
         self._on_frame = on_frame
         self.headless = headless
@@ -135,7 +140,8 @@ class TabScreencaster:
 
             cdp = context.new_cdp_session(page) if self.capture_method == "cdp" else None
 
-            frame_period = 1.0 / self.fps
+            capture_period = 1.0 / self.fps
+            pace_period = 1.0 / self._pace_fps
             next_tick = time.monotonic()
 
             while not self._stop.is_set():
@@ -146,6 +152,7 @@ class TabScreencaster:
 
                 now = time.monotonic()
                 if now >= next_tick:
+                    latency = None
                     try:
                         started = time.monotonic()
                         self._on_frame(self._capture_frame(page, cdp))
@@ -158,15 +165,17 @@ class TabScreencaster:
                             self._stats.record_capture_error()
                         if self._stop.is_set():
                             break
-                        latency = None
-                    next_tick += frame_period
-                    behind = next_tick < now - frame_period
-                    if behind:
-                        next_tick = now + frame_period
+                    next_tick += capture_period
+                    if next_tick < now:
+                        # Capture is the bottleneck (slower than the target
+                        # rate); run flat-out instead of building a backlog.
+                        next_tick = now + capture_period
                     if latency is not None and self._stats is not None:
-                        self._stats.record_capture(latency, behind=behind)
+                        # "behind" = capture blew the encoder's frame budget,
+                        # so the encoder may have to repeat this frame.
+                        self._stats.record_capture(latency, behind=latency > pace_period)
 
-                self._stop.wait(timeout=0.005)
+                self._stop.wait(timeout=0.002)
 
             context.close()
 
