@@ -124,7 +124,8 @@ URL → Chrome tab → JPEG frames + PCM audio
               Chromecast plays stream.m3u8
 ```
 
-- **Video capture** uses paced tab frames at the target frame rate. The default `cdp` backend calls Chrome DevTools `Page.captureScreenshot` (faster with a visible window). Use `--capture playwright` for the legacy Playwright screenshot path. CDP screencast is not used — it freezes once hardware-accelerated video plays.
+- **Video capture** uses paced tab frames at the target frame rate. The default `cdp` backend calls Chrome DevTools `Page.captureScreenshot` (faster with a visible window). Captures time out after 250ms so a slow Chrome hitch cannot block the loop for seconds. Use `--capture playwright` for the legacy Playwright screenshot path. CDP screencast is not used — it freezes once hardware-accelerated video plays.
+- **Encoder resilience** skips duplicate frames (so a capture stall does not spam ffmpeg with identical JPEGs), and restarts ffmpeg automatically if stdin writes stay slow for 60s.
 - **Audio capture** uses a vendored [AudioTee](https://github.com/makeusabrew/audiotee) binary to tap only the cast browser's processes. Your other apps are not routed through a virtual audio device.
 - **Streaming** uses ffmpeg to mux H.264 + AAC into an HLS playlist served from `/tmp/cast-tab-stream/`.
 - **Casting** uses [pychromecast](https://github.com/home-assistant-libs/pychromecast) to load the HLS URL on the default media receiver.

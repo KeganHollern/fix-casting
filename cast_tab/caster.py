@@ -83,6 +83,19 @@ class TabCaster:
         except KeyboardInterrupt:
             pass
 
+    def poll_playback_stats(self) -> tuple[str | None, float | None]:
+        if self._chromecast is None:
+            return None, None
+        try:
+            self._chromecast.media_controller.update_status()
+            status = self._chromecast.media_controller.status
+        except Exception:
+            return None, None
+        if status is None:
+            return None, None
+        position = status.current_time
+        return status.player_state, float(position) if position is not None else None
+
     def stop(self) -> None:
         if self._chromecast is None:
             return

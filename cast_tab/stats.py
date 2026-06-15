@@ -36,10 +36,13 @@ class PipelineStats:
     _capture: _Window = field(default_factory=_Window, repr=False)
     _capture_behind: int = 0
     _capture_errors: int = 0
+    _capture_timeouts: int = 0
     _publish: _Window = field(default_factory=_Window, repr=False)
     _frame_age: _Window = field(default_factory=_Window, repr=False)
     _encode: _Window = field(default_factory=_Window, repr=False)
+    _encode_skipped: int = 0
     _encode_write: _Window = field(default_factory=_Window, repr=False)
+    _ffmpeg_restarts: int = 0
     _hls_segment_age_s: float | None = None
     _hls_segment_count: int = 0
     _tv_state: str | None = None
@@ -55,6 +58,10 @@ class PipelineStats:
         with self._lock:
             self._capture_errors += 1
 
+    def record_capture_timeout(self) -> None:
+        with self._lock:
+            self._capture_timeouts += 1
+
     def record_publish(self) -> None:
         with self._lock:
             self._publish.add(1.0)
@@ -63,10 +70,18 @@ class PipelineStats:
         with self._lock:
             self._frame_age.add(age_s)
 
+    def record_encode_skip(self) -> None:
+        with self._lock:
+            self._encode_skipped += 1
+
     def record_encode_write(self, write_s: float) -> None:
         with self._lock:
             self._encode.add(1.0)
             self._encode_write.add(write_s)
+
+    def record_ffmpeg_restart(self) -> None:
+        with self._lock:
+            self._ffmpeg_restarts += 1
 
     def record_hls(self, *, segment_count: int, newest_age_s: float | None) -> None:
         with self._lock:
@@ -92,6 +107,9 @@ class PipelineStats:
 
             behind = self._capture_behind
             errors = self._capture_errors
+            timeouts = self._capture_timeouts
+            skipped = self._encode_skipped
+            ffmpeg_restarts = self._ffmpeg_restarts
             hls_count = self._hls_segment_count
             hls_age = self._hls_segment_age_s
             tv_state = self._tv_state or "unknown"
@@ -100,22 +118,28 @@ class PipelineStats:
             self._capture.reset()
             self._capture_behind = 0
             self._capture_errors = 0
+            self._capture_timeouts = 0
             self._publish.reset()
             self._frame_age.reset()
             self._encode.reset()
+            self._encode_skipped = 0
             self._encode_write.reset()
+            self._ffmpeg_restarts = 0
 
         lines = [
             (
                 f"capture {capture_fps:.1f}/{self.target_fps:.0f} fps, "
                 f"capture avg {capture_ms:.0f}ms peak {capture_peak_ms:.0f}ms"
                 + (f", behind {behind}x" if behind else "")
+                + (f", timeouts {timeouts}" if timeouts else "")
                 + (f", errors {errors}" if errors else "")
             ),
             (
                 f"encode  {encode_fps:.1f}/{self.target_fps:.0f} fps to ffmpeg, "
                 f"frame age avg {frame_age_ms:.0f}ms peak {frame_age_peak_ms:.0f}ms, "
                 f"stdin write avg {write_ms:.1f}ms peak {write_peak_ms:.1f}ms"
+                + (f", skipped dupes {skipped}" if skipped else "")
+                + (f", ffmpeg restarts {ffmpeg_restarts}" if ffmpeg_restarts else "")
             ),
         ]
 

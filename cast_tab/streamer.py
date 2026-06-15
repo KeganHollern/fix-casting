@@ -10,6 +10,11 @@ import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from cast_tab.stats import PipelineStats
+
+FFMPEG_BACKPRESSURE_WRITE_S = 0.010
+FFMPEG_BACKPRESSURE_DURATION_S = 60.0
+
 
 def _ffmpeg_supports_encoder(encoder: str) -> bool:
     try:
@@ -219,14 +224,18 @@ class LatestFrame:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._frame: bytes | None = None
+        self._published_at: float | None = None
+        self._generation = 0
 
     def publish(self, frame: bytes) -> None:
         with self._lock:
             self._frame = frame
+            self._published_at = time.monotonic()
+            self._generation += 1
 
-    def peek(self) -> bytes | None:
+    def peek(self) -> tuple[bytes | None, float | None, int]:
         with self._lock:
-            return self._frame
+            return self._frame, self._published_at, self._generation
 
 
 def get_local_ip() -> str:
@@ -250,6 +259,7 @@ class HLSStreamer:
         audio_fd: int | None = None,
         port: int = 0,
         work_dir: Path | None = None,
+        stats: PipelineStats | None = None,
     ) -> None:
         self.width = width
         self.height = height
@@ -272,6 +282,10 @@ class HLSStreamer:
         self._http_thread: threading.Thread | None = None
         self._port = port
         self._stopped = threading.Event()
+        self._stats = stats
+        self._ffmpeg_lock = threading.Lock()
+        self._backpressure_started_at: float | None = None
+        self._last_encoded_generation = -1
 
     @property
     def playlist_url(self) -> str:
@@ -290,6 +304,20 @@ class HLSStreamer:
     def publish_frame(self, jpeg_data: bytes) -> None:
         if not self._stopped.is_set():
             self._latest.publish(jpeg_data)
+            if self._stats is not None:
+                self._stats.record_publish()
+
+    def poll_hls_stats(self) -> None:
+        if self._stats is None:
+            return
+        segments = sorted(self.work_dir.glob("seg*.ts"))
+        newest_age: float | None = None
+        if segments:
+            newest_age = time.time() - segments[-1].stat().st_mtime
+        self._stats.record_hls(
+            segment_count=len(segments),
+            newest_age_s=newest_age,
+        )
 
     def wait_until_ready(self, timeout: float | None = None) -> None:
         if timeout is None:
@@ -314,16 +342,8 @@ class HLSStreamer:
         if self._encoder_thread and self._encoder_thread.is_alive():
             self._encoder_thread.join(timeout=5)
 
-        if self._ffmpeg and self._ffmpeg.stdin:
-            try:
-                self._ffmpeg.stdin.close()
-            except OSError:
-                pass
-        if self._ffmpeg:
-            try:
-                self._ffmpeg.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._ffmpeg.kill()
+        with self._ffmpeg_lock:
+            self._kill_ffmpeg()
 
         if self._http_server:
             self._http_server.shutdown()
@@ -350,6 +370,43 @@ class HLSStreamer:
             "-i",
             "anullsrc=channel_layout=stereo:sample_rate=44100",
         ]
+
+    def _kill_ffmpeg(self) -> None:
+        if self._ffmpeg is None:
+            return
+        if self._ffmpeg.stdin:
+            try:
+                self._ffmpeg.stdin.close()
+            except OSError:
+                pass
+        if self._ffmpeg.poll() is None:
+            try:
+                self._ffmpeg.terminate()
+                self._ffmpeg.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._ffmpeg.kill()
+                self._ffmpeg.wait(timeout=3)
+        self._ffmpeg = None
+
+    def _restart_ffmpeg(self) -> None:
+        print("Restarting ffmpeg after sustained encoder backpressure...", flush=True)
+        if self._stats is not None:
+            self._stats.record_ffmpeg_restart()
+        with self._ffmpeg_lock:
+            self._kill_ffmpeg()
+            self._start_ffmpeg()
+        self._last_encoded_generation = -1
+        self._backpressure_started_at = None
+
+    def _note_encode_backpressure(self, write_s: float) -> None:
+        now = time.monotonic()
+        if write_s >= FFMPEG_BACKPRESSURE_WRITE_S:
+            if self._backpressure_started_at is None:
+                self._backpressure_started_at = now
+            elif now - self._backpressure_started_at >= FFMPEG_BACKPRESSURE_DURATION_S:
+                self._restart_ffmpeg()
+        else:
+            self._backpressure_started_at = None
 
     def _start_ffmpeg(self) -> None:
         playlist = self.work_dir / "stream.m3u8"
@@ -412,10 +469,6 @@ class HLSStreamer:
 
     def _start_encoder_thread(self) -> None:
         def run() -> None:
-            assert self._ffmpeg is not None
-            stdin = self._ffmpeg.stdin
-            assert stdin is not None
-            last_frame: bytes | None = None
             frame_period = 1.0 / self.fps
             next_tick = time.monotonic()
 
@@ -426,15 +479,36 @@ class HLSStreamer:
                     time.sleep(sleep_for)
                 next_tick += frame_period
 
-                frame = self._latest.peek() or last_frame
+                frame, published_at, generation = self._latest.peek()
                 if frame is None:
                     continue
-                last_frame = frame
-                try:
-                    stdin.write(frame)
-                    stdin.flush()
-                except (BrokenPipeError, OSError):
-                    break
+                if generation == self._last_encoded_generation:
+                    if self._stats is not None:
+                        self._stats.record_encode_skip()
+                    continue
+
+                if self._stats is not None and published_at is not None:
+                    self._stats.record_frame_age(time.monotonic() - published_at)
+
+                with self._ffmpeg_lock:
+                    ffmpeg = self._ffmpeg
+                    if ffmpeg is None or ffmpeg.poll() is not None:
+                        break
+                    stdin = ffmpeg.stdin
+                    if stdin is None:
+                        break
+                    try:
+                        write_started = time.monotonic()
+                        stdin.write(frame)
+                        stdin.flush()
+                        write_s = time.monotonic() - write_started
+                    except (BrokenPipeError, OSError):
+                        break
+
+                self._last_encoded_generation = generation
+                if self._stats is not None:
+                    self._stats.record_encode_write(write_s)
+                self._note_encode_backpressure(write_s)
 
         self._encoder_thread = threading.Thread(target=run, name="hls-encoder", daemon=True)
         self._encoder_thread.start()

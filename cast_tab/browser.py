@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Callable, Literal
 
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 from cast_tab.audio import chrome_pids_for_profile
@@ -16,6 +17,7 @@ from cast_tab.stats import PipelineStats
 
 CaptureMethod = Literal["cdp", "playwright"]
 CAPTURE_METHODS: frozenset[str] = frozenset({"cdp", "playwright"})
+CAPTURE_TIMEOUT_MS = 250
 
 
 class TabScreencaster:
@@ -148,6 +150,9 @@ class TabScreencaster:
                         started = time.monotonic()
                         self._on_frame(self._capture_frame(page, cdp))
                         latency = time.monotonic() - started
+                    except PlaywrightTimeoutError:
+                        if self._stats is not None:
+                            self._stats.record_capture_timeout()
                     except Exception:
                         if self._stats is not None:
                             self._stats.record_capture_error()
@@ -166,21 +171,24 @@ class TabScreencaster:
             context.close()
 
     def _capture_frame(self, page, cdp) -> bytes:
-        if self.capture_method == "cdp":
-            assert cdp is not None
-            shot = cdp.send(
-                "Page.captureScreenshot",
-                {"format": "jpeg", "quality": self.jpeg_quality},
-            )
-            return base64.b64decode(shot["data"])
+        page.set_default_timeout(CAPTURE_TIMEOUT_MS)
+        try:
+            if self.capture_method == "cdp":
+                assert cdp is not None
+                shot = cdp.send(
+                    "Page.captureScreenshot",
+                    {"format": "jpeg", "quality": self.jpeg_quality},
+                )
+                return base64.b64decode(shot["data"])
 
-        return page.screenshot(
-            type="jpeg",
-            quality=self.jpeg_quality,
-            animations="disabled",
-            caret="hide",
-            timeout=5_000,
-        )
+            return page.screenshot(
+                type="jpeg",
+                quality=self.jpeg_quality,
+                animations="disabled",
+                caret="hide",
+            )
+        finally:
+            page.set_default_timeout(5_000)
 
     def _try_start_playback(self, page) -> None:
         """Click common play buttons so the user doesn't have to."""
