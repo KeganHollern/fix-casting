@@ -103,6 +103,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Disable tab audio capture (video only)",
     )
     parser.add_argument(
+        "--audio-sync",
+        choices=("off", "soft"),
+        default="off",
+        help=(
+            "Audio drift correction (default: off = clean PCM). 'soft' enables "
+            "async resampling; use only if audio drifts out of sync over a long "
+            "session, as it can add faint clicks."
+        ),
+    )
+    parser.add_argument(
         "--codec",
         choices=("auto", "h264", "hevc", "av1"),
         default="auto",
@@ -272,6 +282,7 @@ def main(argv: list[str] | None = None) -> int:
             codec=codec,
             buffered=args.buffered,
             audio_fd=audio_capture.read_fd if audio_capture else None,
+            audio_sync=args.audio_sync,
             stats=stats,
         )
         screencaster.on_frame = streamer.publish_frame

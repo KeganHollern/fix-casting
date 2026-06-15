@@ -258,6 +258,7 @@ class HLSStreamer:
         codec: str = "hevc",
         buffered: bool = True,
         audio_fd: int | None = None,
+        audio_sync: str = "off",
         port: int = 0,
         work_dir: Path | None = None,
         stats: PipelineStats | None = None,
@@ -268,6 +269,7 @@ class HLSStreamer:
         self.codec = codec
         self.buffered = buffered
         self.audio_fd = audio_fd
+        self.audio_sync = audio_sync
         self.work_dir = work_dir or Path("/tmp/cast-tab-stream")
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -472,11 +474,15 @@ class HLSStreamer:
             "44100",
             "-ac",
             "2",
-            # Resample-async keeps audio aligned to its generated timestamps,
-            # filling gaps with silence/stretch instead of emitting a hard
-            # discontinuity (audible click) when the raw PCM input under-runs.
-            "-af",
-            "aresample=async=1:min_hard_comp=0.100:first_pts=0",
+            # async resampling chases A/V drift by inserting/dropping samples,
+            # which adds discontinuities (clicks that get louder with the
+            # signal). Default off for clean PCM; "soft" re-enables it only
+            # when a session actually drifts.
+            *(
+                ["-af", "aresample=async=1:min_hard_comp=0.100:first_pts=0"]
+                if self.audio_sync == "soft"
+                else []
+            ),
             *_hls_args(buffered=self.buffered),
             "-hls_segment_filename",
             segment_pattern,
