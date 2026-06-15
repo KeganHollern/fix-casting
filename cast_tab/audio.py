@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import array
 import fcntl
+import json
 import os
 import re
 import select
@@ -35,11 +36,26 @@ def _pipe_bytes_available(fd: int) -> int:
     return buf[0]
 
 
+def _parse_sample_rate(line: str) -> int | None:
+    """Pull the output sample rate out of an AudioTee JSON metadata line."""
+    try:
+        data = json.loads(line)
+    except ValueError:
+        return None
+    payload = data.get("data") if isinstance(data, dict) else None
+    rate = payload.get("sample_rate") if isinstance(payload, dict) else None
+    try:
+        return int(float(rate)) if rate is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass(frozen=True)
 class AudioCapture:
     process: subprocess.Popen[bytes]
     read_fd: int
     pids: tuple[int, ...]
+    sample_rate: int
 
 
 def audiotee_path() -> Path | None:
@@ -148,10 +164,13 @@ def try_start_chrome_audio_capture(
     )
 
 
+DEFAULT_SAMPLE_RATE = 48_000
+
+
 def start_chrome_audio_capture(
     pids: list[int],
     *,
-    sample_rate: int = 44100,
+    sample_rate: int | None = None,
     chunk_duration: float = 0.1,
     ready_timeout: float = 5.0,
     on_stderr: Callable[[str], None] | None = None,
@@ -162,6 +181,11 @@ def start_chrome_audio_capture(
     is deliberately no Python relay thread between them. A relay would put a
     GIL-scheduled thread on the path of a real-time audio stream, and any
     scheduling delay stalls AudioTee's pipe and under-runs capture (clicks).
+
+    sample_rate=None (default) lets AudioTee emit the device's native rate so
+    it does no resampling; resampling per 100ms chunk leaves a discontinuity
+    at every chunk boundary (audible as rapid clicking). The actual rate is
+    read back from AudioTee's metadata and carried on the returned capture.
     """
     binary = audiotee_path()
     if binary is None:
@@ -180,11 +204,12 @@ def start_chrome_audio_capture(
         *[str(pid) for pid in pids],
         "--mute",
         "--stereo",
-        "--sample-rate",
-        str(sample_rate),
         "--chunk-duration",
         str(chunk_duration),
     ]
+    # Only pin a rate if explicitly asked; otherwise pass native through.
+    if sample_rate is not None:
+        command += ["--sample-rate", str(sample_rate)]
     process = subprocess.Popen(
         command,
         stdout=tap_write,
@@ -196,6 +221,8 @@ def start_chrome_audio_capture(
     # (under-runs/drops) and, left unread, its pipe fills and deadlocks
     # AudioTee. Lines are buffered so error paths can report them.
     stderr_lines: list[str] = []
+    detected_rate: dict[str, int] = {}
+    rate_ready = threading.Event()
 
     def drain_stderr() -> None:
         try:
@@ -205,6 +232,11 @@ def start_chrome_audio_capture(
                 line = raw.decode(errors="replace").rstrip()
                 if not line:
                     continue
+                if not rate_ready.is_set():
+                    rate = _parse_sample_rate(line)
+                    if rate is not None:
+                        detected_rate["v"] = rate
+                        rate_ready.set()
                 stderr_lines.append(line)
                 if on_stderr is not None:
                     on_stderr(line)
@@ -237,7 +269,13 @@ def start_chrome_audio_capture(
             except OSError:
                 available = 0
             if available > 0:
-                return AudioCapture(process=process, read_fd=tap_read, pids=tuple(pids))
+                rate_ready.wait(timeout=0.5)
+                return AudioCapture(
+                    process=process,
+                    read_fd=tap_read,
+                    pids=tuple(pids),
+                    sample_rate=detected_rate.get("v", DEFAULT_SAMPLE_RATE),
+                )
             # Readable with nothing queued == EOF: AudioTee closed stdout.
             raise _fail_exited_early()
         if process.poll() is not None:

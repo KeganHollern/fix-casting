@@ -283,6 +283,7 @@ def main(argv: list[str] | None = None) -> int:
             buffered=args.buffered,
             audio_fd=audio_capture.read_fd if audio_capture else None,
             audio_sync=args.audio_sync,
+            audio_sample_rate=audio_capture.sample_rate if audio_capture else 48_000,
             stats=stats,
         )
         screencaster.on_frame = streamer.publish_frame

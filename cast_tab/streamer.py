@@ -17,8 +17,6 @@ from cast_tab.stats import PipelineStats
 FFMPEG_BACKPRESSURE_WRITE_S = 0.050
 FFMPEG_BACKPRESSURE_DURATION_S = 60.0
 
-# Raw tab audio is 44.1kHz, 16-bit, stereo: 4 bytes per sample frame.
-AUDIO_BYTES_PER_SECOND = 44_100 * 2 * 2
 # Never trust a measurement beyond this; a sane capture pre-roll is well under.
 MAX_AUTO_AV_OFFSET_S = 1.5
 
@@ -265,6 +263,7 @@ class HLSStreamer:
         buffered: bool = True,
         audio_fd: int | None = None,
         audio_sync: str = "off",
+        audio_sample_rate: int = 48_000,
         port: int = 0,
         work_dir: Path | None = None,
         stats: PipelineStats | None = None,
@@ -276,6 +275,7 @@ class HLSStreamer:
         self.buffered = buffered
         self.audio_fd = audio_fd
         self.audio_sync = audio_sync
+        self.audio_sample_rate = audio_sample_rate
         self.work_dir = work_dir or Path("/tmp/cast-tab-stream")
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -388,11 +388,11 @@ class HLSStreamer:
             return [
                 *self._auto_av_offset_args(),
                 "-thread_queue_size",
-                "512",
+                "4096",
                 "-f",
                 "s16le",
                 "-ar",
-                "44100",
+                str(self.audio_sample_rate),
                 "-ac",
                 "2",
                 "-i",
@@ -420,18 +420,18 @@ class HLSStreamer:
             buffered = _pipe_bytes_available(self.audio_fd)
         except OSError:
             return []
-        offset_s = buffered / AUDIO_BYTES_PER_SECOND
+        bytes_per_second = self.audio_sample_rate * 2 * 2
+        offset_s = buffered / bytes_per_second
         offset_s = max(0.0, min(offset_s, MAX_AUTO_AV_OFFSET_S))
         if offset_s < 0.005:
             return []
         print(
-            f"Auto A/V sync: advancing audio {offset_s * 1000:.0f}ms "
+            f"Auto A/V sync: delaying audio {offset_s * 1000:.0f}ms "
             f"({buffered}-byte capture pre-roll).",
             flush=True,
         )
-        # Negative itsoffset shifts the audio input earlier (the leading
-        # pre-roll samples get negative PTS and are dropped by the muxer).
-        return ["-itsoffset", f"-{offset_s:.3f}"]
+        # Audio runs ahead of video, so delay it (positive itsoffset).
+        return ["-itsoffset", f"{offset_s:.3f}"]
 
     def _kill_ffmpeg(self) -> None:
         if self._ffmpeg is None:
@@ -505,8 +505,9 @@ class HLSStreamer:
             "aac",
             "-b:a",
             "160k" if self.buffered else "128k",
+            # Keep the capture's native rate end to end so nothing resamples.
             "-ar",
-            "44100",
+            str(self.audio_sample_rate),
             "-ac",
             "2",
             # async resampling chases A/V drift by inserting/dropping samples,
