@@ -7,6 +7,7 @@ import socket
 import subprocess
 import threading
 import time
+from collections import deque
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -277,7 +278,8 @@ class HLSStreamer:
 
         self._latest = LatestFrame()
         self._ffmpeg: subprocess.Popen[bytes] | None = None
-        self._encoder_thread: threading.Thread | None = None
+        self._sampler_thread: threading.Thread | None = None
+        self._writer_thread: threading.Thread | None = None
         self._http_server: ThreadingHTTPServer | None = None
         self._http_thread: threading.Thread | None = None
         self._port = port
@@ -285,8 +287,15 @@ class HLSStreamer:
         self._stats = stats
         self._ffmpeg_lock = threading.Lock()
         self._backpressure_started_at: float | None = None
-        self._last_encoded_generation = -1
+        self._last_sampled_generation = -1
         self._known_hls_segments: set[str] = set()
+        # Frames sampled at an even cadence wait here for the writer thread to
+        # push them into ffmpeg. Decoupling the two keeps sampling perfectly
+        # paced even when an ffmpeg write stalls (HLS segment flush, keyframe),
+        # which is what otherwise distorts motion into judder.
+        self._frame_queue: deque[bytes] = deque()
+        self._queue_cond = threading.Condition()
+        self._queue_maxlen = max(1, self.fps * 3)
 
     @property
     def playlist_url(self) -> str:
@@ -299,7 +308,8 @@ class HLSStreamer:
             raise RuntimeError("ffmpeg is required but was not found in PATH.")
 
         self._start_ffmpeg()
-        self._start_encoder_thread()
+        self._start_sampler_thread()
+        self._start_writer_thread()
         self._start_http_server()
 
     def publish_frame(self, jpeg_data: bytes) -> None:
@@ -350,9 +360,12 @@ class HLSStreamer:
 
     def stop(self) -> None:
         self._stopped.set()
+        with self._queue_cond:
+            self._queue_cond.notify_all()
 
-        if self._encoder_thread and self._encoder_thread.is_alive():
-            self._encoder_thread.join(timeout=5)
+        for thread in (self._sampler_thread, self._writer_thread):
+            if thread and thread.is_alive():
+                thread.join(timeout=5)
 
         with self._ffmpeg_lock:
             self._kill_ffmpeg()
@@ -407,7 +420,6 @@ class HLSStreamer:
         with self._ffmpeg_lock:
             self._kill_ffmpeg()
             self._start_ffmpeg()
-        self._last_encoded_generation = -1
         self._backpressure_started_at = None
 
     def _note_encode_backpressure(self, write_s: float) -> None:
@@ -485,7 +497,28 @@ class HLSStreamer:
             popen_kwargs["pass_fds"] = (self.audio_fd,)
         self._ffmpeg = subprocess.Popen(cmd, **popen_kwargs)
 
-    def _start_encoder_thread(self) -> None:
+    def _enqueue_frame(self, frame: bytes) -> None:
+        with self._queue_cond:
+            dropped = 0
+            if len(self._frame_queue) >= self._queue_maxlen:
+                # ffmpeg is sustainably behind; drop the oldest frame so latency
+                # cannot grow without bound. Even sampling is preserved.
+                self._frame_queue.popleft()
+                dropped = 1
+            self._frame_queue.append(frame)
+            depth = len(self._frame_queue)
+            self._queue_cond.notify()
+        if self._stats is not None:
+            self._stats.record_queue(depth=depth, dropped=dropped)
+
+    def _start_sampler_thread(self) -> None:
+        """Sample the latest frame at an exactly even cadence and enqueue it.
+
+        Keeping this loop free of the (variable-latency) ffmpeg write is what
+        eliminates motion judder: every output frame represents an evenly
+        spaced moment in real time, regardless of write stalls downstream.
+        """
+
         def run() -> None:
             frame_period = 1.0 / self.fps
             next_tick = time.monotonic()
@@ -494,10 +527,10 @@ class HLSStreamer:
                 now = time.monotonic()
                 sleep_for = next_tick - now
                 if sleep_for > 0:
-                    time.sleep(sleep_for)
+                    self._stopped.wait(sleep_for)
                     now = time.monotonic()
-                # If we have fallen far behind (ffmpeg restart, long stall),
-                # resync rather than bursting a large frame backlog at ffmpeg.
+                # If we fell far behind schedule (system hiccup), resync rather
+                # than bursting a backlog of identical timestamps.
                 if now - next_tick > 1.0:
                     next_tick = now
                     if self._stats is not None:
@@ -508,39 +541,59 @@ class HLSStreamer:
                 if frame is None:
                     continue
 
-                # Always feed ffmpeg one frame per tick to hold a constant
-                # input frame rate. When capture has not produced a new frame,
-                # re-send the latest one; skipping it would make the encoded
-                # timeline run slower than wall-clock and drain the TV buffer.
-                is_repeat = generation == self._last_encoded_generation
-                if is_repeat:
+                # One frame per tick holds a constant input rate. When capture
+                # produced nothing new, re-enqueue the latest; skipping it would
+                # make the encoded timeline lag wall-clock and drain the TV.
+                if generation == self._last_sampled_generation:
                     if self._stats is not None:
                         self._stats.record_encode_repeat()
                 elif self._stats is not None and published_at is not None:
                     self._stats.record_frame_age(time.monotonic() - published_at)
+                self._last_sampled_generation = generation
+                self._enqueue_frame(frame)
 
+        self._sampler_thread = threading.Thread(target=run, name="hls-sampler", daemon=True)
+        self._sampler_thread.start()
+
+    def _start_writer_thread(self) -> None:
+        """Drain the frame queue into ffmpeg as fast as it will accept."""
+
+        def run() -> None:
+            while not self._stopped.is_set():
+                with self._queue_cond:
+                    while not self._frame_queue and not self._stopped.is_set():
+                        self._queue_cond.wait(timeout=0.5)
+                    if not self._frame_queue:
+                        continue
+                    frame = self._frame_queue.popleft()
+
+                write_s: float | None = None
                 with self._ffmpeg_lock:
                     ffmpeg = self._ffmpeg
-                    if ffmpeg is None or ffmpeg.poll() is not None:
-                        break
-                    stdin = ffmpeg.stdin
-                    if stdin is None:
-                        break
-                    try:
-                        write_started = time.monotonic()
-                        stdin.write(frame)
-                        stdin.flush()
-                        write_s = time.monotonic() - write_started
-                    except (BrokenPipeError, OSError):
-                        break
+                    stdin = ffmpeg.stdin if ffmpeg is not None else None
+                    if ffmpeg is not None and ffmpeg.poll() is None and stdin is not None:
+                        try:
+                            write_started = time.monotonic()
+                            stdin.write(frame)
+                            stdin.flush()
+                            write_s = time.monotonic() - write_started
+                        except (BrokenPipeError, OSError):
+                            write_s = None
 
-                self._last_encoded_generation = generation
+                if write_s is None:
+                    if self._stopped.is_set():
+                        break
+                    # ffmpeg died or the pipe broke; respawn it (outside the
+                    # lock) and keep streaming from the next queued frame.
+                    self._restart_ffmpeg()
+                    continue
+
                 if self._stats is not None:
                     self._stats.record_encode_write(write_s)
                 self._note_encode_backpressure(write_s)
 
-        self._encoder_thread = threading.Thread(target=run, name="hls-encoder", daemon=True)
-        self._encoder_thread.start()
+        self._writer_thread = threading.Thread(target=run, name="hls-writer", daemon=True)
+        self._writer_thread.start()
 
     def _start_http_server(self) -> None:
         serve_dir = str(self.work_dir)

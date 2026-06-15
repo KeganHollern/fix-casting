@@ -43,6 +43,8 @@ class PipelineStats:
     _encode_repeats: int = 0
     _encode_resyncs: int = 0
     _encode_write: _Window = field(default_factory=_Window, repr=False)
+    _queue_peak: int = 0
+    _queue_dropped: int = 0
     _ffmpeg_restarts: int = 0
     _audio_warnings: int = 0
     _audio_last_warning: str | None = None
@@ -101,6 +103,11 @@ class PipelineStats:
         with self._lock:
             self._encode.add(1.0)
             self._encode_write.add(write_s)
+
+    def record_queue(self, *, depth: int, dropped: int = 0) -> None:
+        with self._lock:
+            self._queue_peak = max(self._queue_peak, depth)
+            self._queue_dropped += dropped
 
     def record_ffmpeg_restart(self) -> None:
         with self._lock:
@@ -173,6 +180,8 @@ class PipelineStats:
             timeouts = self._capture_timeouts
             repeats = self._encode_repeats
             resyncs = self._encode_resyncs
+            queue_peak = self._queue_peak
+            queue_dropped = self._queue_dropped
             ffmpeg_restarts = self._ffmpeg_restarts
             audio_warnings = self._audio_warnings
             audio_last_warning = self._audio_last_warning
@@ -202,6 +211,8 @@ class PipelineStats:
             self._encode_repeats = 0
             self._encode_resyncs = 0
             self._encode_write.reset()
+            self._queue_peak = 0
+            self._queue_dropped = 0
             self._ffmpeg_restarts = 0
             self._audio_warnings = 0
             self._hls_segments_deleted = 0
@@ -224,6 +235,8 @@ class PipelineStats:
                 f"encode  {encode_fps:.1f}/{self.target_fps:.0f} fps to ffmpeg, "
                 f"frame age avg {frame_age_ms:.0f}ms peak {frame_age_peak_ms:.0f}ms, "
                 f"stdin write avg {write_ms:.1f}ms peak {write_peak_ms:.1f}ms"
+                + (f", queue peak {queue_peak}" if queue_peak else "")
+                + (f", dropped {queue_dropped}" if queue_dropped else "")
                 + (f", repeats {repeats}" if repeats else "")
                 + (f", resyncs {resyncs}" if resyncs else "")
                 + (f", ffmpeg restarts {ffmpeg_restarts}" if ffmpeg_restarts else "")
