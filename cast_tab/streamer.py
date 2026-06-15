@@ -11,7 +11,7 @@ from collections import deque
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from cast_tab.audio import _pipe_bytes_available
+from cast_tab.audio import DEFAULT_AUDIO_FORMAT, AudioFormat, _pipe_bytes_available
 from cast_tab.stats import PipelineStats
 
 FFMPEG_BACKPRESSURE_WRITE_S = 0.050
@@ -263,7 +263,7 @@ class HLSStreamer:
         buffered: bool = True,
         audio_fd: int | None = None,
         audio_sync: str = "off",
-        audio_sample_rate: int = 48_000,
+        audio_format: AudioFormat | None = None,
         port: int = 0,
         work_dir: Path | None = None,
         stats: PipelineStats | None = None,
@@ -275,7 +275,7 @@ class HLSStreamer:
         self.buffered = buffered
         self.audio_fd = audio_fd
         self.audio_sync = audio_sync
-        self.audio_sample_rate = audio_sample_rate
+        self.audio_format = audio_format or DEFAULT_AUDIO_FORMAT
         self.work_dir = work_dir or Path("/tmp/cast-tab-stream")
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -389,12 +389,15 @@ class HLSStreamer:
                 *self._auto_av_offset_args(),
                 "-thread_queue_size",
                 "4096",
+                # Match AudioTee's actual native PCM format exactly so ffmpeg
+                # never misreads the bytes (wrong format == white noise) and
+                # nothing resamples.
                 "-f",
-                "s16le",
+                self.audio_format.ffmpeg_format,
                 "-ar",
-                str(self.audio_sample_rate),
+                str(self.audio_format.sample_rate),
                 "-ac",
-                "2",
+                str(self.audio_format.channels),
                 "-i",
                 f"/dev/fd/{self.audio_fd}",
             ]
@@ -420,8 +423,7 @@ class HLSStreamer:
             buffered = _pipe_bytes_available(self.audio_fd)
         except OSError:
             return []
-        bytes_per_second = self.audio_sample_rate * 2 * 2
-        offset_s = buffered / bytes_per_second
+        offset_s = buffered / self.audio_format.bytes_per_second
         offset_s = max(0.0, min(offset_s, MAX_AUTO_AV_OFFSET_S))
         if offset_s < 0.005:
             return []
@@ -507,9 +509,9 @@ class HLSStreamer:
             "160k" if self.buffered else "128k",
             # Keep the capture's native rate end to end so nothing resamples.
             "-ar",
-            str(self.audio_sample_rate),
+            str(self.audio_format.sample_rate),
             "-ac",
-            "2",
+            str(self.audio_format.channels),
             # async resampling chases A/V drift by inserting/dropping samples,
             # which adds discontinuities (clicks that get louder with the
             # signal). Default off for clean PCM; "soft" re-enables it only

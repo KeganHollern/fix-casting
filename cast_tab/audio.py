@@ -36,18 +36,54 @@ def _pipe_bytes_available(fd: int) -> int:
     return buf[0]
 
 
-def _parse_sample_rate(line: str) -> int | None:
-    """Pull the output sample rate out of an AudioTee JSON metadata line."""
+def _parse_audio_format(line: str) -> AudioFormat | None:
+    """Pull the real PCM format out of an AudioTee JSON metadata line."""
     try:
         data = json.loads(line)
     except ValueError:
         return None
     payload = data.get("data") if isinstance(data, dict) else None
-    rate = payload.get("sample_rate") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    rate = payload.get("sample_rate")
+    channels = payload.get("channels_per_frame")
+    bits = payload.get("bits_per_channel")
+    encoding = payload.get("encoding")  # e.g. "pcm_f32le"
+    if rate is None or channels is None or bits is None or not encoding:
+        return None
     try:
-        return int(float(rate)) if rate is not None else None
+        rate = int(float(rate))
+        channels = int(channels)
+        bits = int(bits)
     except (TypeError, ValueError):
         return None
+    ffmpeg_format = str(encoding)
+    if ffmpeg_format.startswith("pcm_"):
+        ffmpeg_format = ffmpeg_format[len("pcm_") :]
+    return AudioFormat(
+        sample_rate=rate,
+        channels=channels,
+        ffmpeg_format=ffmpeg_format,
+        sample_bytes=max(1, bits // 8),
+    )
+
+
+@dataclass(frozen=True)
+class AudioFormat:
+    """The raw PCM format AudioTee is actually emitting (read from metadata)."""
+
+    sample_rate: int
+    channels: int
+    ffmpeg_format: str  # raw demuxer name, e.g. "f32le" or "s16le"
+    sample_bytes: int  # bytes per sample per channel
+
+    @property
+    def bytes_per_second(self) -> int:
+        return self.sample_rate * self.channels * self.sample_bytes
+
+
+# AudioTee's native macOS format when we don't force a conversion.
+DEFAULT_AUDIO_FORMAT = AudioFormat(48_000, 2, "f32le", 4)
 
 
 @dataclass(frozen=True)
@@ -55,7 +91,7 @@ class AudioCapture:
     process: subprocess.Popen[bytes]
     read_fd: int
     pids: tuple[int, ...]
-    sample_rate: int
+    audio_format: AudioFormat
 
 
 def audiotee_path() -> Path | None:
@@ -164,9 +200,6 @@ def try_start_chrome_audio_capture(
     )
 
 
-DEFAULT_SAMPLE_RATE = 48_000
-
-
 def start_chrome_audio_capture(
     pids: list[int],
     *,
@@ -221,8 +254,8 @@ def start_chrome_audio_capture(
     # (under-runs/drops) and, left unread, its pipe fills and deadlocks
     # AudioTee. Lines are buffered so error paths can report them.
     stderr_lines: list[str] = []
-    detected_rate: dict[str, int] = {}
-    rate_ready = threading.Event()
+    detected_format: dict[str, AudioFormat] = {}
+    format_ready = threading.Event()
 
     def drain_stderr() -> None:
         try:
@@ -232,11 +265,11 @@ def start_chrome_audio_capture(
                 line = raw.decode(errors="replace").rstrip()
                 if not line:
                     continue
-                if not rate_ready.is_set():
-                    rate = _parse_sample_rate(line)
-                    if rate is not None:
-                        detected_rate["v"] = rate
-                        rate_ready.set()
+                if not format_ready.is_set():
+                    fmt = _parse_audio_format(line)
+                    if fmt is not None:
+                        detected_format["v"] = fmt
+                        format_ready.set()
                 stderr_lines.append(line)
                 if on_stderr is not None:
                     on_stderr(line)
@@ -269,12 +302,12 @@ def start_chrome_audio_capture(
             except OSError:
                 available = 0
             if available > 0:
-                rate_ready.wait(timeout=0.5)
+                format_ready.wait(timeout=0.5)
                 return AudioCapture(
                     process=process,
                     read_fd=tap_read,
                     pids=tuple(pids),
-                    sample_rate=detected_rate.get("v", DEFAULT_SAMPLE_RATE),
+                    audio_format=detected_format.get("v", DEFAULT_AUDIO_FORMAT),
                 )
             # Readable with nothing queued == EOF: AudioTee closed stdout.
             raise _fail_exited_early()
