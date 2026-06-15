@@ -6,6 +6,7 @@ import base64
 import tempfile
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -15,8 +16,8 @@ from playwright.sync_api import sync_playwright
 from cast_tab.audio import chrome_pids_for_profile
 from cast_tab.stats import PipelineStats
 
-CaptureMethod = Literal["cdp", "playwright"]
-CAPTURE_METHODS: frozenset[str] = frozenset({"cdp", "playwright"})
+CaptureMethod = Literal["cdp", "playwright", "screencast"]
+CAPTURE_METHODS: frozenset[str] = frozenset({"cdp", "playwright", "screencast"})
 CAPTURE_TIMEOUT_MS = 250
 
 
@@ -138,46 +139,124 @@ class TabScreencaster:
             self._ready.set()
             self._capture_enabled.wait()
 
-            cdp = context.new_cdp_session(page) if self.capture_method == "cdp" else None
+            needs_cdp = self.capture_method in ("cdp", "screencast")
+            cdp = context.new_cdp_session(page) if needs_cdp else None
 
-            capture_period = 1.0 / self.fps
-            pace_period = 1.0 / self._pace_fps
-            next_tick = time.monotonic()
+            try:
+                if self.capture_method == "screencast":
+                    self._run_screencast(page, cdp)
+                else:
+                    self._run_screenshot_loop(page, cdp)
+            finally:
+                context.close()
 
+    def _run_screenshot_loop(self, page, cdp) -> None:
+        """Pull model: grab one frame per tick at a steady pace."""
+        capture_period = 1.0 / self.fps
+        pace_period = 1.0 / self._pace_fps
+        next_tick = time.monotonic()
+
+        while not self._stop.is_set():
+            if self._nudge_playback.is_set():
+                self._nudge_playback.clear()
+                self._try_start_playback(page)
+                self.chrome_pids = chrome_pids_for_profile(self.user_data_dir)
+
+            now = time.monotonic()
+            if now >= next_tick:
+                latency = None
+                try:
+                    started = time.monotonic()
+                    self._on_frame(self._capture_frame(page, cdp))
+                    latency = time.monotonic() - started
+                except PlaywrightTimeoutError:
+                    if self._stats is not None:
+                        self._stats.record_capture_timeout()
+                except Exception:
+                    if self._stats is not None:
+                        self._stats.record_capture_error()
+                    if self._stop.is_set():
+                        break
+                next_tick += capture_period
+                if next_tick < now:
+                    # Capture is the bottleneck (slower than the target
+                    # rate); run flat-out instead of building a backlog.
+                    next_tick = now + capture_period
+                if latency is not None and self._stats is not None:
+                    # "behind" = capture blew the encoder's frame budget,
+                    # so the encoder may have to repeat this frame.
+                    self._stats.record_capture(latency, behind=latency > pace_period)
+
+            self._stop.wait(timeout=0.002)
+
+    def _run_screencast(self, page, cdp) -> None:
+        """Push model: Chrome streams frames as the page paints (up to ~60fps).
+
+        Each Page.screencastFrame MUST be acknowledged or Chrome stops sending
+        after a few frames (the classic screencast "freeze"). The event handler
+        only enqueues; we ack and publish from this loop so we never re-enter
+        Playwright from inside a CDP callback.
+        """
+        assert cdp is not None
+        pace_period = 1.0 / self._pace_fps
+        pending: deque[tuple[str | None, str | None]] = deque()
+
+        def on_screencast_frame(params: dict) -> None:
+            pending.append((params.get("data"), params.get("sessionId")))
+
+        cdp.on("Page.screencastFrame", on_screencast_frame)
+        cdp.send("Page.enable")
+        cdp.send(
+            "Page.startScreencast",
+            {
+                "format": "jpeg",
+                "quality": self.jpeg_quality,
+                "maxWidth": self.width,
+                "maxHeight": self.height,
+                "everyNthFrame": 1,
+            },
+        )
+
+        try:
             while not self._stop.is_set():
                 if self._nudge_playback.is_set():
                     self._nudge_playback.clear()
                     self._try_start_playback(page)
                     self.chrome_pids = chrome_pids_for_profile(self.user_data_dir)
 
-                now = time.monotonic()
-                if now >= next_tick:
-                    latency = None
+                while pending:
+                    data_b64, session_id = pending.popleft()
+                    # Ack first so Chrome keeps the frames flowing.
+                    if session_id is not None:
+                        try:
+                            cdp.send(
+                                "Page.screencastFrameAck", {"sessionId": session_id}
+                            )
+                        except Exception:
+                            if self._stop.is_set():
+                                return
+                    if data_b64 is None:
+                        continue
+                    started = time.monotonic()
                     try:
-                        started = time.monotonic()
-                        self._on_frame(self._capture_frame(page, cdp))
-                        latency = time.monotonic() - started
-                    except PlaywrightTimeoutError:
-                        if self._stats is not None:
-                            self._stats.record_capture_timeout()
+                        self._on_frame(base64.b64decode(data_b64))
                     except Exception:
                         if self._stats is not None:
                             self._stats.record_capture_error()
                         if self._stop.is_set():
-                            break
-                    next_tick += capture_period
-                    if next_tick < now:
-                        # Capture is the bottleneck (slower than the target
-                        # rate); run flat-out instead of building a backlog.
-                        next_tick = now + capture_period
-                    if latency is not None and self._stats is not None:
-                        # "behind" = capture blew the encoder's frame budget,
-                        # so the encoder may have to repeat this frame.
+                            return
+                        continue
+                    if self._stats is not None:
+                        latency = time.monotonic() - started
                         self._stats.record_capture(latency, behind=latency > pace_period)
 
-                self._stop.wait(timeout=0.002)
-
-            context.close()
+                # Pump the Playwright/CDP event loop so new frames are delivered.
+                page.wait_for_timeout(5)
+        finally:
+            try:
+                cdp.send("Page.stopScreencast")
+            except Exception:
+                pass
 
     def _capture_frame(self, page, cdp) -> bytes:
         page.set_default_timeout(CAPTURE_TIMEOUT_MS)
@@ -186,7 +265,13 @@ class TabScreencaster:
                 assert cdp is not None
                 shot = cdp.send(
                     "Page.captureScreenshot",
-                    {"format": "jpeg", "quality": self.jpeg_quality},
+                    {
+                        "format": "jpeg",
+                        "quality": self.jpeg_quality,
+                        # Trade a little quality for a faster encode path so the
+                        # screenshot round-trip can clear the encoder's budget.
+                        "optimizeForSpeed": True,
+                    },
                 )
                 return base64.b64decode(shot["data"])
 

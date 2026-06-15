@@ -74,11 +74,21 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--capture",
-        choices=("cdp", "playwright"),
+        choices=("cdp", "playwright", "screencast"),
         default="cdp",
         help=(
-            "Tab frame capture backend (default: cdp). "
-            "Use playwright for the legacy Playwright screenshot path."
+            "Tab frame capture backend (default: cdp screenshot loop). "
+            "Use screencast for CDP Page.startScreencast (paint-driven, can "
+            "reach ~60fps) or playwright for the legacy screenshot path."
+        ),
+    )
+    parser.add_argument(
+        "--jpeg-quality",
+        type=int,
+        default=None,
+        help=(
+            "JPEG quality of captured frames (1-100; default: 75 at 1080p, "
+            "80 below). Lower trades image quality for faster capture."
         ),
     )
     parser.add_argument(
@@ -142,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     # Oversample capture so a fresh frame is ready at every encoder tick.
     capture_fps = args.capture_fps or max(encode_fps, round(encode_fps * 1.5))
-    jpeg_quality = default_jpeg_quality(args.width, args.height)
+    jpeg_quality = args.jpeg_quality or default_jpeg_quality(args.width, args.height)
     capture_audio = not args.no_audio
     stats = PipelineStats(target_fps=float(encode_fps)) if args.stats else None
 
@@ -267,10 +277,13 @@ def main(argv: list[str] | None = None) -> int:
 
         audio_mode = "with tab audio" if capture_audio else "video only"
         latency_mode = "buffered (~45s TV delay)" if args.buffered else "low-latency"
+        if args.capture == "screencast":
+            capture_desc = "capture=screencast (paint-driven)"
+        else:
+            capture_desc = f"capture={args.capture} ~{capture_fps}fps"
         print(
             f"Streaming at {args.width}x{args.height} {encode_fps} fps "
-            f"(capture ~{capture_fps} fps, jpeg q={jpeg_quality}, "
-            f"capture={args.capture}) {audio_mode} "
+            f"({capture_desc}, jpeg q={jpeg_quality}) {audio_mode} "
             f"using {codec_label(codec)}, {latency_mode}."
         )
         if codec == "av1":
