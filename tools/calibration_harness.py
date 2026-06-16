@@ -36,6 +36,8 @@ def main() -> None:
         "--capture", default="screencast",
         choices=["screencast", "screenshot", "playwright"],
     )
+    ap.add_argument("--content", default="video", choices=["canvas", "video"],
+                    help="canvas paints instantly; video plays a clip through the decode path")
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--buffered", action="store_true", help="match buffered real-stream config")
     ap.add_argument("--duration", type=float, default=20.0)
@@ -48,11 +50,12 @@ def main() -> None:
     work_dir = Path(tempfile.mkdtemp(prefix="cast-calib-harness-"))
     print(f"work dir: {work_dir}")
     print(
-        f"running pipeline (capture={args.capture}, headless={args.headless}, "
-        f"buffered={args.buffered}, {args.duration:.0f}s)..."
+        f"running pipeline (content={args.content}, capture={args.capture}, "
+        f"headless={args.headless}, buffered={args.buffered}, {args.duration:.0f}s)..."
     )
     playlist = cal.run_calibration_pipeline(
         work_dir,
+        content=args.content,
         capture_method=args.capture,
         width=args.width, height=args.height, fps=args.fps,
         jpeg_quality=75, codec=args.codec, buffered=args.buffered,
@@ -72,7 +75,7 @@ def main() -> None:
 
     print("\n=== VIDEO (output brightness) ===")
     _summary("YAVG", video)
-    vp = cal._classify(cal._detect_pulses(video, ratio=3.0))
+    vp = cal._classify(cal._detect_pulses(video, ratio=3.0, floor=25.0))
     print(f"  flashes (t, step): {[(round(t, 2), k) for t, k in vp]}")
 
     print("\n=== AUDIO (output rms) ===")

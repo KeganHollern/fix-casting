@@ -13,11 +13,16 @@ measured here stays valid once the user's real page is loaded.
 
 from __future__ import annotations
 
+import functools
+import math
+import struct
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.parse
 from collections.abc import Callable
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from cast_tab.audio import (
@@ -81,6 +86,82 @@ def _calibration_url() -> str:
     return "data:text/html," + urllib.parse.quote(html)
 
 
+# A page that plays the baked clip in a real <video> element, so capture goes
+# through the browser's video decode/compositing path (like real content) --
+# unlike the canvas page, which paints instantly.
+_VIDEO_PAGE_HTML = (
+    "<!doctype html><html><head><meta charset=utf-8>"
+    "<style>html,body{margin:0;background:#000;overflow:hidden}"
+    "video{width:100vw;height:100vh;object-fit:fill;display:block}</style></head>"
+    "<body><video id=v src=clip.mp4 autoplay loop playsinline></video>"
+    "<script>const v=document.getElementById('v');v.muted=false;v.volume=1;"
+    "function p(){v.play().catch(()=>{})}p();v.addEventListener('canplay',p);"
+    "setInterval(p,400);</script></body></html>"
+)
+
+
+def _generate_test_clip(path: Path, *, duration_s: float) -> bool:
+    """Bake the flash+beep cycle into an mp4 with flash and beep frame-aligned.
+
+    Solid-gray flash frames (luma = cycle step) over black, and a quiet tone
+    with amplitude-coded beeps at the same instants. Since both are written off
+    the same pulse schedule, they are perfectly synced at the source, so any
+    skew the harness later measures is the pipeline's, not the clip's.
+    """
+    fps, sr, side = 30, 48_000, 64
+    start, flash_dur, beep_dur = 1.0, 0.13, 0.10
+
+    def pulse(t: float) -> tuple[int, bool, bool]:
+        if t < start:
+            return 0, False, False
+        i = int((t - start) // PULSE_PERIOD_S)
+        dt = (t - start) - i * PULSE_PERIOD_S
+        return i % N_LEVELS, dt < flash_dur, dt < beep_dur
+
+    vraw, araw = path.parent / "clip_v.raw", path.parent / "clip_a.raw"
+    try:
+        with open(vraw, "wb") as vf:
+            for f in range(int(duration_s * fps)):
+                step, in_flash, _ = pulse(f / fps)
+                g = FLASH_GRAYS[step] if in_flash else 0
+                vf.write(bytes((g, g, g)) * (side * side))
+        with open(araw, "wb") as af:
+            buf = bytearray()
+            for s in range(int(duration_s * sr)):
+                t = s / sr
+                val = 0.01 * math.sin(2 * math.pi * 120 * t)
+                step, _, in_beep = pulse(t)
+                if in_beep:
+                    val += BEEP_AMPS[step] * math.sin(2 * math.pi * 1000 * t)
+                buf += struct.pack("<f", val)
+                if len(buf) >= 1 << 16:
+                    af.write(buf)
+                    buf.clear()
+            af.write(buf)
+        subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+             "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{side}x{side}",
+             "-r", str(fps), "-i", str(vraw),
+             "-f", "f32le", "-ar", str(sr), "-ac", "1", "-i", str(araw),
+             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+             "-shortest", str(path)],
+            check=True, timeout=180,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    finally:
+        vraw.unlink(missing_ok=True)
+        araw.unlink(missing_ok=True)
+    return path.exists()
+
+
+def _serve(directory: Path) -> tuple[ThreadingHTTPServer, str]:
+    handler = functools.partial(SimpleHTTPRequestHandler, directory=str(directory))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_port}/index.html"
+
+
 def _ffprobe_frame_values(lavfi_input: str, tag: str) -> list[tuple[float, float]]:
     """Return (pts_time, value) per frame for a lavfi-tagged metric."""
     try:
@@ -120,14 +201,19 @@ def probe_audio_rms(mkv: Path) -> list[tuple[float, float]]:
 
 
 def _detect_pulses(
-    series: list[tuple[float, float]], *, ratio: float
+    series: list[tuple[float, float]], *, ratio: float, floor: float = 0.0
 ) -> list[tuple[float, float]]:
-    """Return (onset_time, peak_value) for each spike above the baseline."""
+    """Return (onset_time, peak_value) for each spike above the baseline.
+
+    floor is an absolute minimum threshold: needed for video, where the gaps
+    are near-pure-black (median ~0), so a ratio alone would trip on encoder
+    noise. Flash luma is >=52, so a floor well below that rejects the noise.
+    """
     if len(series) < 4:
         return []
     ordered = sorted(v for _, v in series)
     median = ordered[len(ordered) // 2] or 1e-9
-    threshold = median * ratio
+    threshold = max(median * ratio, floor)
     refractory = PULSE_PERIOD_S * 0.6
     pulses: list[tuple[float, float]] = []
     in_event = False
@@ -218,7 +304,7 @@ def offset_from_output(
     if mkv is None:
         return None
 
-    video = _classify(_detect_pulses(probe_video_brightness(mkv), ratio=3.0))
+    video = _classify(_detect_pulses(probe_video_brightness(mkv), ratio=3.0, floor=25.0))
     audio = _classify(_detect_pulses(probe_audio_rms(mkv), ratio=4.0))
     log(f"Calibration: output had {len(video)} flashes / {len(audio)} beeps.")
     result = _identity_offset(video, audio)
@@ -232,6 +318,7 @@ def offset_from_output(
 def run_calibration_pipeline(
     work_dir: Path,
     *,
+    content: str = "canvas",
     capture_method: CaptureMethod,
     width: int,
     height: int,
@@ -242,9 +329,22 @@ def run_calibration_pipeline(
     headless: bool,
     duration_s: float,
 ) -> Path | None:
-    """Run the flash+beep page through the full pipeline; return the playlist."""
+    """Run the flash+beep test page through the full pipeline; return playlist.
+
+    content="canvas" paints instantly; content="video" plays a baked clip in a
+    <video> element so capture goes through the browser's video decode path.
+    """
+    server = None
+    if content == "video":
+        if not _generate_test_clip(work_dir / "clip.mp4", duration_s=duration_s + 5):
+            return None
+        (work_dir / "index.html").write_text(_VIDEO_PAGE_HTML)
+        server, url = _serve(work_dir)
+    else:
+        url = _calibration_url()
+
     frames_screencaster = TabScreencaster(
-        _calibration_url(),
+        url,
         width=width, height=height, fps=fps, jpeg_quality=jpeg_quality,
         on_frame=lambda _f: None, headless=headless, capture_audio=True,
         capture_method=capture_method,
@@ -277,6 +377,8 @@ def run_calibration_pipeline(
             streamer.stop()
         frames_screencaster.stop()
         stop_audio_capture(audio_capture)
+        if server is not None:
+            server.shutdown()
 
 
 def measure_av_offset(
@@ -289,6 +391,7 @@ def measure_av_offset(
     codec: str,
     buffered: bool,
     headless: bool,
+    content: str = "video",
     duration_s: float = 20.0,
     log: Callable[[str], None] = print,
 ) -> float | None:
@@ -302,6 +405,7 @@ def measure_av_offset(
     work_dir = Path(tempfile.mkdtemp(prefix="cast-calib-"))
     playlist = run_calibration_pipeline(
         work_dir,
+        content=content,
         capture_method=capture_method, width=width, height=height, fps=fps,
         jpeg_quality=jpeg_quality, codec=codec, buffered=buffered,
         headless=headless, duration_s=duration_s,
