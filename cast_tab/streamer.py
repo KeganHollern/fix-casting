@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import socket
 import subprocess
@@ -11,11 +12,16 @@ from collections import deque
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from cast_tab.audio import DEFAULT_AUDIO_FORMAT, AudioFormat
+from cast_tab.audio import DEFAULT_AUDIO_FORMAT, AudioFormat, _pipe_bytes_available
 from cast_tab.stats import PipelineStats
 
 FFMPEG_BACKPRESSURE_WRITE_S = 0.050
 FFMPEG_BACKPRESSURE_DURATION_S = 60.0
+
+# Keep filling video frames to catch up after a stall this long or shorter (so
+# the encoded timeline stays locked to wall-clock and audio can't drift ahead);
+# only abandon catch-up past it (machine slept, multi-second hang).
+SAMPLER_MAX_CATCHUP_S = 5.0
 
 # Clamp the manual --audio-offset-ms trim to a sane range; covers the audio
 # pre-roll plus the video frame-queue latency we compensate for.
@@ -355,6 +361,34 @@ class HLSStreamer:
         # Positive itsoffset delays audio (it runs ahead of video).
         return ["-itsoffset", f"{offset_s:.3f}"]
 
+    def _drain_audio_fd(self) -> None:
+        """Discard PCM that buffered in the pipe before ffmpeg attaches.
+
+        AudioTee streams into the pipe from the moment it starts, but ffmpeg
+        only opens the fd when it (re)launches here. Whatever sat in the OS pipe
+        buffer in the meantime (~64KB, ~170ms) would otherwise be read as the
+        start of the stream and play ahead of video. Drop it so audio and video
+        both effectively begin "now". Bounded so a live writer can't spin us.
+        """
+        if self.audio_fd is None:
+            return
+        max_drop = self.audio_format.bytes_per_second * 2
+        dropped = 0
+        try:
+            while dropped < max_drop:
+                available = _pipe_bytes_available(self.audio_fd)
+                if available <= 0:
+                    break
+                chunk = os.read(self.audio_fd, min(available, 1 << 16))
+                if not chunk:
+                    break
+                dropped += len(chunk)
+        except OSError:
+            return
+        if dropped:
+            ms = dropped / self.audio_format.bytes_per_second * 1000
+            print(f"A/V sync: dropped {ms:.0f}ms of buffered pre-roll audio.", flush=True)
+
     def _kill_ffmpeg(self) -> None:
         if self._ffmpeg is None:
             return
@@ -460,6 +494,9 @@ class HLSStreamer:
             # True by default); never inherit the rest of our fds, or ffmpeg
             # holds pipe write-ends open and never sees EOF on shutdown.
             popen_kwargs["pass_fds"] = (self.audio_fd,)
+            # Drain the pipe right before the child opens it so ffmpeg starts
+            # reading at "now" instead of inheriting buffered pre-roll audio.
+            self._drain_audio_fd()
         self._ffmpeg = subprocess.Popen(cmd, **popen_kwargs)
 
     def _enqueue_frame(self, frame: bytes) -> None:
@@ -494,9 +531,13 @@ class HLSStreamer:
                 if sleep_for > 0:
                     self._stopped.wait(sleep_for)
                     now = time.monotonic()
-                # If we fell far behind schedule (system hiccup), resync rather
-                # than bursting a backlog of identical timestamps.
-                if now - next_tick > 1.0:
+                # When we fall behind schedule, keep the loop running back-to-
+                # back (no sleep) so it feeds one frame per missed tick — those
+                # catch-up frames hold the encoded timeline level with wall-clock
+                # so audio can't drift ahead of video. Only give up and resync
+                # past a large gap (machine slept), where bursting the whole
+                # backlog isn't worth it. The bounded queue caps the burst.
+                if now - next_tick > SAMPLER_MAX_CATCHUP_S:
                     next_tick = now
                     if self._stats is not None:
                         self._stats.record_encode_resync()
