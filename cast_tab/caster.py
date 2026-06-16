@@ -77,21 +77,6 @@ class TabCaster:
         idle = status.idle_reason if status else None
         raise RuntimeError(f"Chromecast did not start playback (state={state}, idle={idle}).")
 
-    def wait_until_stopped(self) -> None:
-        if self._chromecast is None:
-            return
-
-        try:
-            while True:
-                self._chromecast.media_controller.update_status()
-                status = self._chromecast.media_controller.status
-                if status is None or status.player_state in ("IDLE", "UNKNOWN"):
-                    time.sleep(1)
-                    continue
-                time.sleep(2)
-        except KeyboardInterrupt:
-            pass
-
     def poll_playback_stats(self) -> TvPlaybackSnapshot:
         if self._chromecast is None:
             return TvPlaybackSnapshot(None, None, None)

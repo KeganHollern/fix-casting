@@ -17,8 +17,8 @@ from cast_tab.stats import PipelineStats
 FFMPEG_BACKPRESSURE_WRITE_S = 0.050
 FFMPEG_BACKPRESSURE_DURATION_S = 60.0
 
-# Never trust a measurement beyond this; covers the audio pre-roll plus the
-# video frame-queue latency we compensate for.
+# Clamp the manual --audio-offset-ms trim to a sane range; covers the audio
+# pre-roll plus the video frame-queue latency we compensate for.
 MAX_AUTO_AV_OFFSET_S = 3.0
 
 
@@ -44,35 +44,8 @@ def default_fps_for_resolution(width: int, height: int, *, buffered: bool = Fals
     return 24
 
 
-def resolve_codec(requested: str) -> str:
-    """Pick a Chromecast-compatible video codec."""
-    if requested == "auto":
-        # H.264 is universally supported on Chromecast; HEVC/AV1 need newer models.
-        return "h264"
-
-    if requested == "hevc":
-        if not _ffmpeg_supports_encoder("hevc_videotoolbox"):
-            raise RuntimeError("HEVC encoding is not available (hevc_videotoolbox).")
-        return "hevc"
-
-    if requested == "av1":
-        if not _ffmpeg_supports_encoder("libsvtav1"):
-            raise RuntimeError("AV1 encoding is not available (libsvtav1).")
-        return "av1"
-
-    if requested == "h264":
-        return "h264"
-
-    raise RuntimeError(f"Unknown codec: {requested}")
-
-
-def codec_label(codec: str) -> str:
-    labels = {
-        "h264": "H.264 (VideoToolbox)" if _ffmpeg_supports_encoder("h264_videotoolbox") else "H.264",
-        "hevc": "HEVC/H.265 (VideoToolbox)",
-        "av1": "AV1 (SVT, software)",
-    }
-    return labels.get(codec, codec)
+def codec_label() -> str:
+    return "H.264 (VideoToolbox)" if _ffmpeg_supports_encoder("h264_videotoolbox") else "H.264"
 
 
 def default_jpeg_quality(width: int, height: int) -> int:
@@ -81,74 +54,25 @@ def default_jpeg_quality(width: int, height: int) -> int:
     return 80
 
 
-def _target_bitrate(codec: str, width: int, height: int, *, buffered: bool) -> tuple[str, str, str]:
-    """Pick bitrate targets. Efficient codecs use lower bitrate for similar quality."""
+def _target_bitrate(width: int, height: int, *, buffered: bool) -> tuple[str, str, str]:
+    """Pick H.264 bitrate targets (bitrate, maxrate, bufsize)."""
     pixels = width * height
     if pixels >= 1920 * 1080:
-        if codec == "hevc":
-            return ("3M", "3.5M", "12M") if buffered else ("2.5M", "3M", "6M")
-        if codec == "av1":
-            return ("2.5M", "3M", "12M") if buffered else ("2M", "2.5M", "6M")
         return ("5M", "6M", "12M") if buffered else ("4.5M", "5M", "5M")
     if pixels >= 1280 * 720:
-        if codec in ("hevc", "av1"):
-            return ("1.8M", "2.2M", "8M") if buffered else ("1.5M", "2M", "4M")
         return ("3M", "3.5M", "8M") if buffered else ("2.5M", "3M", "3M")
-    if codec in ("hevc", "av1"):
-        return ("1M", "1.2M", "4M") if buffered else ("900k", "1.1M", "2M")
     return ("1.5M", "2M", "4M") if buffered else ("1.5M", "2M", "2M")
 
 
 def _video_encoder_args(
-    codec: str,
     fps: int,
     width: int,
     height: int,
     *,
     buffered: bool,
 ) -> list[str]:
-    bitrate, maxrate, bufsize = _target_bitrate(codec, width, height, buffered=buffered)
+    bitrate, maxrate, bufsize = _target_bitrate(width, height, buffered=buffered)
     gop = fps * (2 if buffered else 1)
-
-    if codec == "hevc" and _ffmpeg_supports_encoder("hevc_videotoolbox"):
-        return [
-            "-c:v",
-            "hevc_videotoolbox",
-            "-profile:v",
-            "main",
-            "-b:v",
-            bitrate,
-            "-maxrate",
-            maxrate,
-            "-bufsize",
-            bufsize,
-            "-g",
-            str(gop),
-            "-keyint_min",
-            str(fps),
-        ]
-
-    if codec == "av1" and _ffmpeg_supports_encoder("libsvtav1"):
-        return [
-            "-c:v",
-            "libsvtav1",
-            "-preset",
-            "6" if buffered else "10",
-            "-crf",
-            "32",
-            "-b:v",
-            bitrate,
-            "-maxrate",
-            maxrate,
-            "-bufsize",
-            bufsize,
-            "-g",
-            str(gop),
-            "-keyint_min",
-            str(fps),
-            "-pix_fmt",
-            "yuv420p",
-        ]
 
     if _ffmpeg_supports_encoder("h264_videotoolbox"):
         return [
@@ -263,13 +187,10 @@ class HLSStreamer:
         width: int = 1920,
         height: int = 1080,
         fps: int = 24,
-        codec: str = "hevc",
         buffered: bool = True,
         audio_fd: int | None = None,
-        audio_sync: str = "off",
         audio_format: AudioFormat | None = None,
         audio_offset_ms: int = 0,
-        av_offset_s: float = 0.0,
         port: int = 0,
         work_dir: Path | None = None,
         stats: PipelineStats | None = None,
@@ -277,14 +198,10 @@ class HLSStreamer:
         self.width = width
         self.height = height
         self.fps = fps
-        self.codec = codec
         self.buffered = buffered
         self.audio_fd = audio_fd
-        self.audio_sync = audio_sync
         self.audio_format = audio_format or DEFAULT_AUDIO_FORMAT
         self.audio_offset_ms = audio_offset_ms
-        # Measured by the flash+beep calibration: how far audio leads video.
-        self._measured_av_delay_s = av_offset_s
         self.work_dir = work_dir or Path("/tmp/cast-tab-stream")
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -422,23 +339,17 @@ class HLSStreamer:
 
         Video runs through the capture + frame-queue + encoder path and reaches
         the muxer later than the near-direct audio, so audio plays ahead. The
-        correction is the sum of:
-          - calibrated: the empirical flash+beep measurement of the skew (see
-            cast_tab.calibration), passed in as av_offset_s.
-          - manual: the optional --audio-offset-ms trim for any residual.
-        Applied as a positive -itsoffset, which shifts the audio input later.
+        --audio-offset-ms trim shifts the audio input later, as a positive
+        -itsoffset, to line them back up.
         """
         if self.audio_fd is None:
             return []
-        manual_s = self.audio_offset_ms / 1000.0
-        offset_s = self._measured_av_delay_s + manual_s
+        offset_s = self.audio_offset_ms / 1000.0
         offset_s = max(-MAX_AUTO_AV_OFFSET_S, min(offset_s, MAX_AUTO_AV_OFFSET_S))
         if abs(offset_s) < 0.005:
             return []
         print(
-            f"A/V sync: delaying audio {offset_s * 1000:+.0f}ms "
-            f"(calibrated {self._measured_av_delay_s * 1000:.0f}ms + "
-            f"manual {self.audio_offset_ms:+d}ms).",
+            f"A/V sync: delaying audio {offset_s * 1000:+.0f}ms (manual).",
             flush=True,
         )
         # Positive itsoffset delays audio (it runs ahead of video).
@@ -460,11 +371,6 @@ class HLSStreamer:
                 self._ffmpeg.kill()
                 self._ffmpeg.wait(timeout=3)
         self._ffmpeg = None
-
-    def set_av_offset(self, offset_s: float) -> None:
-        """Apply a measured A/V offset and relaunch ffmpeg so it takes effect."""
-        self._measured_av_delay_s = offset_s
-        self._relaunch_ffmpeg()
 
     def _relaunch_ffmpeg(self) -> None:
         with self._ffmpeg_lock:
@@ -522,7 +428,6 @@ class HLSStreamer:
             "-map",
             "1:a",
             *_video_encoder_args(
-                self.codec,
                 self.fps,
                 self.width,
                 self.height,
@@ -537,14 +442,6 @@ class HLSStreamer:
             str(self.audio_format.sample_rate),
             "-ac",
             str(self.audio_format.channels),
-            # "soft" corrects slow A/V clock drift over long sessions. async=1000
-            # allows generous *gentle* stretching so it never resorts to hard
-            # sample drops/inserts (which click). Default off keeps clean PCM.
-            *(
-                ["-af", "aresample=async=1000"]
-                if self.audio_sync == "soft"
-                else []
-            ),
             *_hls_args(buffered=self.buffered),
             "-hls_segment_filename",
             segment_pattern,
