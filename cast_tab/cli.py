@@ -190,19 +190,26 @@ def main(argv: list[str] | None = None) -> int:
 
     av_offset_s = 0.0
     if capture_audio and args.calibrate:
-        print("Calibrating A/V sync (flash + beep test, ~15s)...")
+        print("Calibrating A/V sync (flash + beep test, ~30s)...")
         measured = measure_av_offset(
             capture_method=args.capture,
             width=args.width,
             height=args.height,
+            fps=encode_fps,
             jpeg_quality=jpeg_quality,
+            codec=codec,
+            buffered=args.buffered,
             headless=args.headless,
         )
         if measured is None:
             print("Calibration: could not measure offset; continuing without it.")
         else:
             av_offset_s = measured
-            print(f"Calibration: audio leads video by {av_offset_s * 1000:.0f}ms.")
+            direction = "lags" if measured < 0 else "leads"
+            print(
+                f"Calibration: audio {direction} video by {abs(measured) * 1000:.0f}ms "
+                f"(applying {measured * 1000:+.0f}ms to audio)."
+            )
 
     screencaster = TabScreencaster(
         args.url,
