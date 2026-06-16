@@ -63,6 +63,8 @@ class TabScreencaster:
         self._ready = threading.Event()
         self._capture_enabled = threading.Event()
         self._nudge_playback = threading.Event()
+        self._navigate_url: str | None = None
+        self._navigate_done = threading.Event()
         self.chrome_pids: list[int] = []
 
     @property
@@ -87,6 +89,35 @@ class TabScreencaster:
     def nudge_playback(self) -> None:
         """Ask the browser thread to retry autoplay (helps audio tap attach)."""
         self._nudge_playback.set()
+
+    def navigate(self, url: str, timeout: float = 130.0) -> None:
+        """Navigate the live tab to a new URL (keeps the same capture streams).
+
+        Used to switch from the calibration page to the user's URL without
+        tearing down the screencast/audio tap that calibration measured.
+        """
+        self._navigate_done.clear()
+        self._navigate_url = url
+        if not self._navigate_done.wait(timeout):
+            raise TimeoutError("Timed out navigating the browser tab.")
+
+    def _perform_navigate(self, page) -> None:
+        url = self._navigate_url
+        self._navigate_url = None
+        self.url = url or self.url
+        try:
+            print(f"Loading {url} ...")
+            page.goto(url, wait_until="load", timeout=120_000)
+            page.add_style_tag(
+                content="html,body{overflow:hidden!important;margin:0!important;}"
+            )
+            self._try_start_playback(page)
+            page.wait_for_timeout(1_000)
+            self.chrome_pids = chrome_pids_for_profile(self.user_data_dir)
+        except Exception:
+            pass
+        finally:
+            self._navigate_done.set()
 
     def stop(self) -> None:
         self._stop.set()
@@ -157,6 +188,8 @@ class TabScreencaster:
         next_tick = time.monotonic()
 
         while not self._stop.is_set():
+            if self._navigate_url is not None:
+                self._perform_navigate(page)
             if self._nudge_playback.is_set():
                 self._nudge_playback.clear()
                 self._try_start_playback(page)
@@ -189,6 +222,18 @@ class TabScreencaster:
 
             self._stop.wait(timeout=0.002)
 
+    def _start_screencast(self, cdp) -> None:
+        cdp.send(
+            "Page.startScreencast",
+            {
+                "format": "jpeg",
+                "quality": self.jpeg_quality,
+                "maxWidth": self.width,
+                "maxHeight": self.height,
+                "everyNthFrame": 1,
+            },
+        )
+
     def _run_screencast(self, page, cdp) -> None:
         """Push model: Chrome streams frames as the page paints (up to ~60fps).
 
@@ -206,19 +251,18 @@ class TabScreencaster:
 
         cdp.on("Page.screencastFrame", on_screencast_frame)
         cdp.send("Page.enable")
-        cdp.send(
-            "Page.startScreencast",
-            {
-                "format": "jpeg",
-                "quality": self.jpeg_quality,
-                "maxWidth": self.width,
-                "maxHeight": self.height,
-                "everyNthFrame": 1,
-            },
-        )
+        self._start_screencast(cdp)
 
         try:
             while not self._stop.is_set():
+                if self._navigate_url is not None:
+                    try:
+                        cdp.send("Page.stopScreencast")
+                    except Exception:
+                        pass
+                    pending.clear()
+                    self._perform_navigate(page)
+                    self._start_screencast(cdp)
                 if self._nudge_playback.is_set():
                     self._nudge_playback.clear()
                     self._try_start_playback(page)

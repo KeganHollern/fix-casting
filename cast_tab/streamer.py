@@ -461,6 +461,11 @@ class HLSStreamer:
                 self._ffmpeg.wait(timeout=3)
         self._ffmpeg = None
 
+    def set_av_offset(self, offset_s: float) -> None:
+        """Apply a measured A/V offset and relaunch ffmpeg so it takes effect."""
+        self._measured_av_delay_s = offset_s
+        self._relaunch_ffmpeg()
+
     def _relaunch_ffmpeg(self) -> None:
         with self._ffmpeg_lock:
             self._kill_ffmpeg()

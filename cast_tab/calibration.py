@@ -162,6 +162,18 @@ def _serve(directory: Path) -> tuple[ThreadingHTTPServer, str]:
     return server, f"http://127.0.0.1:{server.server_port}/index.html"
 
 
+def serve_calibration_content(
+    directory: Path, *, duration_s: float
+) -> tuple[ThreadingHTTPServer, str] | None:
+    """Bake the test clip and serve the <video> page; return (server, url)."""
+    if not audiotee_available():
+        return None
+    if not _generate_test_clip(directory / "clip.mp4", duration_s=duration_s + 5):
+        return None
+    (directory / "index.html").write_text(_VIDEO_PAGE_HTML)
+    return _serve(directory)
+
+
 def _ffprobe_frame_values(lavfi_input: str, tag: str) -> list[tuple[float, float]]:
     """Return (pts_time, value) per frame for a lavfi-tagged metric."""
     try:
@@ -294,16 +306,7 @@ def remux_to_mkv(playlist: Path) -> Path | None:
     return mkv if mkv.exists() else None
 
 
-def offset_from_output(
-    playlist: Path, *, log: Callable[[str], None] = print
-) -> float | None:
-    """Remux the HLS output and measure the flash-vs-beep skew in it."""
-    if not playlist.exists():
-        return None
-    mkv = remux_to_mkv(playlist)
-    if mkv is None:
-        return None
-
+def _offset_from_mkv(mkv: Path, *, log: Callable[[str], None]) -> float | None:
     video = _classify(_detect_pulses(probe_video_brightness(mkv), ratio=3.0, floor=25.0))
     audio = _classify(_detect_pulses(probe_audio_rms(mkv), ratio=4.0))
     log(f"Calibration: output had {len(video)} flashes / {len(audio)} beeps.")
@@ -313,6 +316,46 @@ def offset_from_output(
     offset_s, matched = result
     log(f"Calibration: matched {matched} flash/beep pairs by identity.")
     return offset_s
+
+
+def offset_from_output(
+    playlist: Path, *, log: Callable[[str], None] = print
+) -> float | None:
+    """Remux the HLS output and measure the flash-vs-beep skew in it."""
+    if not playlist.exists():
+        return None
+    mkv = remux_to_mkv(playlist)
+    if mkv is None:
+        return None
+    return _offset_from_mkv(mkv, log=log)
+
+
+def measure_offset_from_segments(
+    work_dir: Path, *, log: Callable[[str], None] = print
+) -> float | None:
+    """Measure the A/V offset from the live streamer's HLS segments.
+
+    Reads the .ts segments directly (concat) rather than the playlist, which
+    is live (omit_endlist) and would block a normal remux.
+    """
+    segments = sorted(work_dir.glob("seg*.ts"))
+    if len(segments) > 2:
+        segments = segments[:-1]  # the last segment may still be writing
+    if len(segments) < 2:
+        return None
+    mkv = work_dir / "calib_measure.mkv"
+    concat = "concat:" + "|".join(str(s) for s in segments)
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+             "-i", concat, "-c", "copy", str(mkv)],
+            check=True, timeout=60,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if not mkv.exists():
+        return None
+    return _offset_from_mkv(mkv, log=log)
 
 
 def run_calibration_pipeline(

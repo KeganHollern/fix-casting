@@ -6,7 +6,9 @@ import argparse
 import json
 import signal
 import sys
+import tempfile
 import time
+from pathlib import Path
 
 from cast_tab.audio import (
     AudioCapture,
@@ -17,7 +19,10 @@ from cast_tab.audio import (
     stop_audio_capture,
 )
 from cast_tab.browser import TabScreencaster
-from cast_tab.calibration import measure_av_offset
+from cast_tab.calibration import (
+    measure_offset_from_segments,
+    serve_calibration_content,
+)
 from cast_tab.caster import TabCaster
 from cast_tab.devices import discover_devices, select_device
 from cast_tab.stats import PipelineStats
@@ -28,6 +33,9 @@ from cast_tab.streamer import (
     default_jpeg_quality,
     resolve_codec,
 )
+
+# Seconds to capture the flash+beep test page before measuring the offset.
+CALIBRATION_CAPTURE_S = 18.0
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -188,31 +196,22 @@ def main(argv: list[str] | None = None) -> int:
     capture_audio = not args.no_audio
     stats = PipelineStats(target_fps=float(encode_fps)) if args.stats else None
 
-    av_offset_s = 0.0
-    if capture_audio and args.calibrate:
-        print("Calibrating A/V sync (flash + beep test, ~30s)...")
-        measured = measure_av_offset(
-            capture_method=args.capture,
-            width=args.width,
-            height=args.height,
-            fps=encode_fps,
-            jpeg_quality=jpeg_quality,
-            codec=codec,
-            buffered=args.buffered,
-            headless=args.headless,
-        )
-        if measured is None:
-            print("Calibration: could not measure offset; continuing without it.")
+    # Single-session calibration: open a flash+beep test page first, measure the
+    # offset off the live screencast+tap, lock it into ffmpeg, then navigate the
+    # same tab to the user's URL. Keeps the exact streams calibration measured.
+    do_calibrate = capture_audio and args.calibrate and audiotee_available()
+    calib_server = None
+    initial_url = args.url
+    if do_calibrate:
+        calib_dir = Path(tempfile.mkdtemp(prefix="cast-calib-"))
+        served = serve_calibration_content(calib_dir, duration_s=CALIBRATION_CAPTURE_S)
+        if served is None:
+            do_calibrate = False
         else:
-            av_offset_s = measured
-            direction = "lags" if measured < 0 else "leads"
-            print(
-                f"Calibration: audio {direction} video by {abs(measured) * 1000:.0f}ms "
-                f"(applying {measured * 1000:+.0f}ms to audio)."
-            )
+            calib_server, initial_url = served
 
     screencaster = TabScreencaster(
-        args.url,
+        initial_url,
         width=args.width,
         height=args.height,
         fps=capture_fps,
@@ -240,6 +239,8 @@ def main(argv: list[str] | None = None) -> int:
         if streamer is not None:
             streamer.stop()
         stop_audio_capture(audio_capture)
+        if calib_server is not None:
+            calib_server.shutdown()
         caster.stop()
         sys.exit(0)
 
@@ -329,7 +330,7 @@ def main(argv: list[str] | None = None) -> int:
             audio_sync=args.audio_sync,
             audio_format=audio_capture.audio_format if audio_capture else None,
             audio_offset_ms=args.audio_offset_ms,
-            av_offset_s=av_offset_s,
+            av_offset_s=0.0,
             stats=stats,
         )
         screencaster.on_frame = streamer.publish_frame
@@ -352,6 +353,28 @@ def main(argv: list[str] | None = None) -> int:
 
         streamer.start()
         streamer.wait_until_ready()
+
+        if do_calibrate and audio_capture is not None:
+            print(
+                f"Calibrating A/V sync ({CALIBRATION_CAPTURE_S:.0f}s flash+beep "
+                "test, then loading your page)..."
+            )
+            time.sleep(CALIBRATION_CAPTURE_S)
+            measured = measure_offset_from_segments(streamer.work_dir)
+            if measured is None:
+                print("Calibration: could not measure offset; continuing without it.")
+            else:
+                direction = "lags" if measured < 0 else "leads"
+                print(
+                    f"Calibration: audio {direction} video by "
+                    f"{abs(measured) * 1000:.0f}ms (applying {measured * 1000:+.0f}ms)."
+                )
+                streamer.set_av_offset(measured)
+            screencaster.navigate(args.url)
+            if calib_server is not None:
+                calib_server.shutdown()
+                calib_server = None
+            streamer.wait_until_ready()
 
         caster.connect()
         caster.play_hls(streamer.playlist_url)
