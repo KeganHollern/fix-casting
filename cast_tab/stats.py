@@ -49,6 +49,12 @@ class PipelineStats:
     # startup sequence and seeing the audio-vs-video PTS=0 anchor gap.
     _trace_seen: set[str] = field(default_factory=set, repr=False)
     _start_monotonic: float = field(default_factory=time.monotonic, repr=False)
+    # Optional full time-series of queue depth and stdin write times, for
+    # validating whether the video queue drains after a stall or stays deep.
+    _ts_enabled: bool = False
+    _ts_start: float = field(default_factory=time.monotonic, repr=False)
+    _ts_queue: list = field(default_factory=list, repr=False)  # (t, depth, dropped)
+    _ts_write: list = field(default_factory=list, repr=False)  # (t, write_s)
     _publish: _Window = field(default_factory=_Window, repr=False)
     _frame_age: _Window = field(default_factory=_Window, repr=False)
     _encode: _Window = field(default_factory=_Window, repr=False)
@@ -138,15 +144,59 @@ class PipelineStats:
             self._audio_warnings += 1
             self._audio_last_warning = text
 
+    def enable_timeseries(self) -> None:
+        """Start recording the full queue-depth / write-time time-series."""
+        with self._lock:
+            self._ts_enabled = True
+            self._ts_start = time.monotonic()
+            self._ts_queue.clear()
+            self._ts_write.clear()
+
     def record_encode_write(self, write_s: float) -> None:
         with self._lock:
             self._encode.add(1.0)
             self._encode_write.add(write_s)
+            if self._ts_enabled:
+                self._ts_write.append((time.monotonic() - self._ts_start, write_s))
 
     def record_queue(self, *, depth: int, dropped: int = 0) -> None:
         with self._lock:
             self._queue_peak = max(self._queue_peak, depth)
             self._queue_dropped += dropped
+            if self._ts_enabled:
+                self._ts_queue.append(
+                    (time.monotonic() - self._ts_start, depth, dropped)
+                )
+
+    def format_timeseries(self, window_s: float = 2.0) -> str:
+        """Per-window queue depth + write stalls — shows if the queue drains."""
+        with self._lock:
+            q = list(self._ts_queue)
+            w = list(self._ts_write)
+        if not q:
+            return "queue time-series: (no data; call enable_timeseries first)"
+        end = max(q[-1][0], w[-1][0] if w else 0.0)
+        lines = [
+            "queue depth + write stalls over time "
+            f"(per {window_s:.0f}s window):",
+            "  window      depth(avg/max)  drops   write(max)",
+        ]
+        n = int(end // window_s) + 1
+        for b in range(n):
+            t0, t1 = b * window_s, (b + 1) * window_s
+            depths = [d for (t, d, _) in q if t0 <= t < t1]
+            drops = sum(dr for (t, _, dr) in q if t0 <= t < t1)
+            writes = [x for (t, x) in w if t0 <= t < t1]
+            if not depths and not writes:
+                continue
+            avg_d = sum(depths) / len(depths) if depths else 0.0
+            max_d = max(depths) if depths else 0
+            max_w = max(writes) * 1000 if writes else 0.0
+            lines.append(
+                f"  t={t0:5.0f}-{t1:<4.0f}s  {avg_d:5.1f} / {max_d:<4d}     "
+                f"{drops:4d}   {max_w:6.0f}ms"
+            )
+        return "\n".join(lines)
 
     def record_ffmpeg_restart(self) -> None:
         with self._lock:

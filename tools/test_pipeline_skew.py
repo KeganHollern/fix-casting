@@ -31,6 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from cast_tab.audio import DEFAULT_AUDIO_FORMAT  # noqa: E402
+from cast_tab.stats import PipelineStats  # noqa: E402
 from cast_tab.streamer import HLSStreamer  # noqa: E402
 
 CLIP = ROOT / "tools" / "clapboard_clip.mp4"
@@ -102,6 +103,8 @@ def main() -> int:
     print(f"  {len(frames)} frames, {len(pcm)} PCM bytes "
           f"({len(pcm) / fmt.bytes_per_second:.1f}s audio)")
 
+    stats = PipelineStats(target_fps=float(fps))
+    stats.enable_timeseries()
     audio_r, audio_w = os.pipe()
     streamer = HLSStreamer(
         width=args.width,
@@ -112,6 +115,7 @@ def main() -> int:
         audio_format=fmt,
         audio_offset_ms=0,
         work_dir=WORK_DIR,
+        stats=stats,
     )
 
     stop = threading.Event()
@@ -173,6 +177,11 @@ def main() -> int:
     stop.set()
     audio_thread.join(timeout=2)
     streamer.stop()
+
+    print("\n--- queue behavior during this run ---")
+    print(stats.format_timeseries())
+    print(stats.format_report(args.seconds))
+    print("--------------------------------------")
     try:
         os.close(audio_r)
     except OSError:

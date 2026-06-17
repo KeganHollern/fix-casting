@@ -146,6 +146,7 @@ def capture(seconds: float, offset_ms: int, page: Path) -> Path:
     url = page.resolve().as_uri()
     print(f"Capturing {url}")
     stats = PipelineStats(target_fps=30.0)
+    stats.enable_timeseries()
     screencaster = TabScreencaster(
         url,
         width=1920,
@@ -198,6 +199,7 @@ def capture(seconds: float, offset_ms: int, page: Path) -> Path:
     # Show how long video spent in each of our Python stages during this run,
     # so we can see whether the output skew is our pipeline or inside ffmpeg.
     print("\n--- pipeline stage latencies during this run ---")
+    print(stats.format_timeseries())
     print(stats.format_report(seconds))
     print("------------------------------------------------")
 
