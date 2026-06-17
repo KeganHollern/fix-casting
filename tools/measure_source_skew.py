@@ -35,6 +35,7 @@ from cast_tab.audio import (  # noqa: E402
     try_start_chrome_audio_capture,
 )
 from cast_tab.browser import TabScreencaster  # noqa: E402
+from cast_tab.stats import PipelineStats  # noqa: E402
 from cast_tab.streamer import HLSStreamer  # noqa: E402
 
 CLAPBOARD = ROOT / "tools" / "clapboard.html"
@@ -144,6 +145,7 @@ def capture(seconds: float, offset_ms: int, page: Path) -> Path:
 
     url = page.resolve().as_uri()
     print(f"Capturing {url}")
+    stats = PipelineStats(target_fps=30.0)
     screencaster = TabScreencaster(
         url,
         width=1920,
@@ -154,6 +156,7 @@ def capture(seconds: float, offset_ms: int, page: Path) -> Path:
         on_frame=lambda _f: None,
         headless=False,
         capture_audio=True,
+        stats=stats,
     )
     streamer: HLSStreamer | None = None
     audio_capture = None
@@ -178,6 +181,7 @@ def capture(seconds: float, offset_ms: int, page: Path) -> Path:
             audio_format=audio_capture.audio_format,
             audio_offset_ms=offset_ms,
             work_dir=WORK_DIR,
+            stats=stats,
         )
         screencaster.on_frame = streamer.publish_frame
         streamer.start()
@@ -190,6 +194,12 @@ def capture(seconds: float, offset_ms: int, page: Path) -> Path:
         if streamer is not None:
             streamer.stop()
         stop_audio_capture(audio_capture)
+
+    # Show how long video spent in each of our Python stages during this run,
+    # so we can see whether the output skew is our pipeline or inside ffmpeg.
+    print("\n--- pipeline stage latencies during this run ---")
+    print(stats.format_report(seconds))
+    print("------------------------------------------------")
 
     segments = sorted(WORK_DIR.glob("seg*.ts"))
     if not segments:

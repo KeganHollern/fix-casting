@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>clapboard A/V (unmuted)</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; }
+  video { width: 100vw; height: 100vh; object-fit: contain; background: #000; }
+</style>
+</head>
+<body>
+  <!-- Plays the +0-synced flash+beep clip WITH SOUND so AudioTee taps the beep
+       while CDP captures the flash. The input-skew probe records each stream
+       separately and compares the flash vs beep arrival times. -->
+  <video id="v" src="clapboard_clip.mp4" autoplay loop playsinline></video>
+<script>
+  const v = document.getElementById("v");
+  v.muted = false;
+  v.volume = 1.0;
+  const play = () => v.play().catch(() => {});
+  play();
+  v.addEventListener("canplay", play);
+  setInterval(() => { if (v.paused) play(); }, 1000);
+</script>
+</body>
+</html>
