@@ -318,7 +318,6 @@ class HLSStreamer:
     def _audio_input_args(self) -> list[str]:
         if self.audio_fd is not None:
             return [
-                *self._auto_av_offset_args(),
                 "-thread_queue_size",
                 "4096",
                 # Match AudioTee's actual native PCM format exactly so ffmpeg
@@ -340,26 +339,31 @@ class HLSStreamer:
             "anullsrc=channel_layout=stereo:sample_rate=44100",
         ]
 
-    def _auto_av_offset_args(self) -> list[str]:
+    def _audio_delay_filter_args(self) -> list[str]:
         """Delay audio to match the video pipeline's latency (lip-sync).
 
         Video runs through the capture + frame-queue + encoder path and reaches
-        the muxer later than the near-direct audio, so audio plays ahead. The
-        --audio-offset-ms trim shifts the audio input later, as a positive
-        -itsoffset, to line them back up.
+        the muxer later than the near-direct audio, so audio plays ahead. We
+        prepend silence with the adelay filter to push audio later by
+        --audio-offset-ms.
+
+        Input-side -itsoffset is silently ignored for a raw-PCM pipe (ffmpeg
+        regenerates the timestamps from 0), so the delay must live in the audio
+        filter graph instead. adelay only adds delay, which is all we need: the
+        skew is always audio-ahead.
         """
-        if self.audio_fd is None:
+        if self.audio_fd is None or self.audio_offset_ms == 0:
             return []
-        offset_s = self.audio_offset_ms / 1000.0
-        offset_s = max(-MAX_AUTO_AV_OFFSET_S, min(offset_s, MAX_AUTO_AV_OFFSET_S))
-        if abs(offset_s) < 0.005:
+        if self.audio_offset_ms < 0:
+            print(
+                "A/V sync: negative --audio-offset-ms is not supported "
+                "(audio is structurally ahead, never behind); ignoring.",
+                flush=True,
+            )
             return []
-        print(
-            f"A/V sync: delaying audio {offset_s * 1000:+.0f}ms (manual).",
-            flush=True,
-        )
-        # Positive itsoffset delays audio (it runs ahead of video).
-        return ["-itsoffset", f"{offset_s:.3f}"]
+        delay_ms = min(self.audio_offset_ms, int(MAX_AUTO_AV_OFFSET_S * 1000))
+        print(f"A/V sync: delaying audio {delay_ms}ms (adelay).", flush=True)
+        return ["-af", f"adelay={delay_ms}:all=1"]
 
     def _drain_audio_fd(self) -> None:
         """Discard PCM that buffered in the pipe before ffmpeg attaches.
@@ -467,6 +471,7 @@ class HLSStreamer:
                 self.height,
                 buffered=self.buffered,
             ),
+            *self._audio_delay_filter_args(),
             "-c:a",
             "aac",
             "-b:a",
