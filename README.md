@@ -67,18 +67,18 @@ cast <url> [options]
   --width WIDTH           Viewport width (default: 1920)
   --height HEIGHT         Viewport height (default: 1080)
   --fps FPS               Encode frame rate (default: 30 buffered, 23–24 unbuffered)
-  --codec {auto,h264,hevc,av1}
-                          Video codec (default: auto = H.264)
   --buffered / --no-buffered
                           Buffered mode for quality vs latency (default: buffered)
-  --capture {screencast,screenshot,playwright}
-                          Tab capture backend (default: screencast)
   --no-audio              Video only, skip tab audio capture
+  --audio-offset-ms MS    Manual A/V trim; positive delays audio (default: 0)
   --headless              Hide the local browser window (may break some players)
   --discovery-timeout SEC Seconds to search for devices (default: 5)
   --stats                 Print pipeline timing stats every 10s (diagnose lag)
   --stats-interval SEC    Seconds between stats reports (default: 10)
 ```
+
+Video is always encoded as H.264 (universally supported on Chromecast) and
+captured via CDP `Page.startScreencast`.
 
 ### Examples
 
@@ -106,16 +106,10 @@ Smoother 60fps (needs a Chromecast that supports 1080p60):
 cast --fps 60 "https://example.com"
 ```
 
-Paced screenshot capture instead of screencast:
+Dial in lip-sync if audio leads video (positive delays audio):
 
 ```bash
-cast --capture screenshot "https://example.com"
-```
-
-Older Chromecast that rejects HEVC (auto already uses H.264):
-
-```bash
-cast --codec h264 "https://example.com"
+cast --audio-offset-ms 200 "https://example.com"
 ```
 
 ## How it works
@@ -130,7 +124,7 @@ URL → Chrome tab → JPEG frames + PCM audio
               Chromecast plays stream.m3u8
 ```
 
-- **Video capture** defaults to CDP `Page.startScreencast` (`--capture screencast`): Chrome pushes JPEG frames as the page paints (up to ~60fps), and every frame is acknowledged with `Page.screencastFrameAck` so the stream never stalls. `--capture screenshot` uses a paced `Page.captureScreenshot` loop (captures time out after 250ms so a slow Chrome hitch cannot block for seconds); `--capture playwright` is the legacy Playwright screenshot path.
+- **Video capture** uses CDP `Page.startScreencast`: Chrome pushes JPEG frames as the page paints (up to ~60fps), and every frame is acknowledged with `Page.screencastFrameAck` so the stream never stalls.
 - **Even-paced encoding** samples the latest frame at a constant cadence on one thread and feeds ffmpeg on another, with a bounded queue between them. Even sampling keeps motion smooth (no judder) even when an ffmpeg write stalls on an HLS segment flush, while the constant rate keeps the TV buffer from draining. ffmpeg is restarted automatically if it dies or stays backpressured.
 - **Audio capture** uses a vendored [AudioTee](https://github.com/makeusabrew/audiotee) binary to tap only the cast browser's processes. Your other apps are not routed through a virtual audio device.
 - **Streaming** uses ffmpeg to mux H.264 + AAC into an HLS playlist served from `/tmp/cast-tab-stream/`.
@@ -140,9 +134,6 @@ URL → Chrome tab → JPEG frames + PCM audio
 
 **No Chromecast found**  
 Ensure the TV and Mac are on the same network. Try increasing `--discovery-timeout`.
-
-**TV shows idle / stream rejected**  
-Use `--codec h264`. Older Chromecasts do not support HEVC or AV1 HLS.
 
 **No audio on TV**  
 Audio requires AudioTee. Re-run `./install.sh` or build manually:
@@ -154,7 +145,7 @@ cd vendor/audiotee && swift build -c release
 If audio still fails, start playback in the local Chrome window (click Play). The tool retries autoplay automatically.
 
 **Frozen or choppy video**  
-Make sure you are on a recent version of this repo (paced screenshot capture). Try `--no-buffered` to rule out buffer-related delay, or lower resolution with `--width 1280 --height 720`.
+Try `--no-buffered` to rule out buffer-related delay, or lower resolution with `--width 1280 --height 720`.
 
 **High CPU**  
 Lower `--fps`, resolution, or use `--no-buffered`.
@@ -177,7 +168,7 @@ Every 10 seconds you'll see something like:
 
 How to read it:
 
-- **capture fps drops** or **screenshot ms rises** → Chrome tab capture is the bottleneck (CPU or page complexity)
+- **capture fps drops** or **capture ms rises** → Chrome tab capture is the bottleneck (CPU or page complexity)
 - **behind Nx** → capture is missing its schedule and skipping ticks
 - **encode fps drops** but capture is fine → ffmpeg encoding is struggling
 - **frame age rises** → encoder is feeding ffmpeg stale frames (usually means capture slowed down)

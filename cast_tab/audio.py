@@ -120,11 +120,6 @@ def _profile_process_lines(user_data_dir: Path) -> list[tuple[int, str]]:
     return matches
 
 
-def chrome_pids_for_profile(user_data_dir: Path) -> list[int]:
-    """Find Chrome processes launched for a dedicated cast profile."""
-    return sorted({pid for pid, _ in _profile_process_lines(user_data_dir)})
-
-
 def chrome_audio_pid_candidates(user_data_dir: Path) -> list[list[int]]:
     """Return PID sets to try, smallest/most likely first."""
     lines = _profile_process_lines(user_data_dir)
@@ -158,11 +153,6 @@ def chrome_audio_pid_candidates(user_data_dir: Path) -> list[list[int]]:
             seen.add(key)
             deduped.append(candidate)
     return deduped
-
-
-def chrome_audio_pids_for_profile(user_data_dir: Path) -> list[int]:
-    candidates = chrome_audio_pid_candidates(user_data_dir)
-    return candidates[0] if candidates else []
 
 
 def try_start_chrome_audio_capture(

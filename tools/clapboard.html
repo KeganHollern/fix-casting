@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Clapboard — simultaneous flash + beep</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #stage { width: 100vw; height: 100vh; background: #000; }
+  #stage.flash { background: #fff; }
+  #label {
+    position: fixed; top: 12px; left: 12px; color: #0f0;
+    font: 24px/1.2 monospace; opacity: 0.6;
+  }
+</style>
+</head>
+<body>
+  <div id="stage"></div>
+  <div id="label">clapboard: waiting…</div>
+<script>
+// A clapboard for measuring end-to-end audio/video skew. Every PERIOD seconds
+// it flashes the whole screen white and emits a 1 kHz beep *in the same tick*,
+// each lasting PULSE ms. Cast this page, then measure the time between the
+// white flash and the beep in the recorded HLS — that difference is the total
+// source-to-output A/V skew (Chrome capture path + our pipeline + mux).
+const PERIOD = 2.0;   // seconds between pulses
+const PULSE  = 0.120; // seconds each flash/beep lasts
+const FREQ   = 1000;  // Hz
+
+const stage = document.getElementById("stage");
+const label = document.getElementById("label");
+
+let audioCtx = null;
+function ensureAudio() {
+  if (audioCtx) return audioCtx;
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return audioCtx;
+}
+
+function beep() {
+  const ctx = ensureAudio();
+  if (ctx.state === "suspended") ctx.resume();
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = "sine";
+  osc.frequency.value = FREQ;
+  // Start now, hold for PULSE, then stop. Tiny ramps avoid click artifacts
+  // that could blur the onset we measure against.
+  const t0 = ctx.currentTime;
+  gain.gain.setValueAtTime(0.0001, t0);
+  gain.gain.exponentialRampToValueAtTime(0.5, t0 + 0.003);
+  gain.gain.setValueAtTime(0.5, t0 + PULSE - 0.003);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t0 + PULSE);
+  osc.connect(gain).connect(ctx.destination);
+  osc.start(t0);
+  osc.stop(t0 + PULSE);
+}
+
+let count = 0;
+function pulse() {
+  // Flip the DOM to white and fire the beep in the same synchronous tick so
+  // the two events are as simultaneous as the page can make them.
+  stage.classList.add("flash");
+  beep();
+  count += 1;
+  label.textContent = "clapboard pulse #" + count;
+  setTimeout(() => stage.classList.remove("flash"), PULSE * 1000);
+}
+
+// Autoplay flag (--autoplay-policy=no-user-gesture-required) lets us start
+// without a click. Prime the audio context immediately, then run on a timer.
+ensureAudio();
+setInterval(pulse, PERIOD * 1000);
+// First pulse shortly after load so capture is already running.
+setTimeout(pulse, 500);
+</script>
+</body>
+</html>

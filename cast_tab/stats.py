@@ -37,6 +37,18 @@ class PipelineStats:
     _capture_behind: int = 0
     _capture_errors: int = 0
     _capture_timeouts: int = 0
+    # How stale each frame is when it reaches us: time.time() - the Chrome
+    # capture timestamp on the screencast frame. This is the suspected home of
+    # the audio-ahead skew (video arriving from Chrome already seconds old).
+    _screencast_lag: _Window = field(default_factory=_Window, repr=False)
+    # Bytes sitting unread in the audio pipe (ffmpeg's read backlog), in ms of
+    # audio. Stays ~0 if ffmpeg keeps up; grows if audio is being delayed.
+    _audio_backlog_ms: float | None = None
+    _audio_backlog_peak_ms: float = 0.0
+    # One-shot lifecycle markers (relative monotonic seconds) for ordering the
+    # startup sequence and seeing the audio-vs-video PTS=0 anchor gap.
+    _trace_seen: set[str] = field(default_factory=set, repr=False)
+    _start_monotonic: float = field(default_factory=time.monotonic, repr=False)
     _publish: _Window = field(default_factory=_Window, repr=False)
     _frame_age: _Window = field(default_factory=_Window, repr=False)
     _encode: _Window = field(default_factory=_Window, repr=False)
@@ -62,11 +74,38 @@ class PipelineStats:
     _tv_last_poll_pos_s: float | None = None
     _tv_last_poll_at: float | None = None
 
+    def trace(self, label: str, *, once: bool = False) -> None:
+        """Print a lifecycle marker with elapsed monotonic time since startup.
+
+        once=True fires the first time only — use for one-shot anchors (first
+        publish, first sampler tick, first writer write) so the line marks when
+        each stage truly began. Without --stats there is no PipelineStats and
+        these calls don't happen, so traces are opt-in with the rest of --stats.
+        """
+        with self._lock:
+            if once:
+                if label in self._trace_seen:
+                    return
+                self._trace_seen.add(label)
+            elapsed = time.monotonic() - self._start_monotonic
+        print(f"[trace] +{elapsed:8.3f}s {label}", flush=True)
+
     def record_capture(self, latency_s: float, *, behind: bool = False) -> None:
         with self._lock:
             self._capture.add(latency_s)
             if behind:
                 self._capture_behind += 1
+
+    def record_screencast_lag(self, lag_s: float) -> None:
+        """Age of a frame (Chrome capture time → arrival here)."""
+        with self._lock:
+            self._screencast_lag.add(lag_s)
+
+    def record_audio_backlog(self, backlog_ms: float) -> None:
+        """Unread audio bytes in the ffmpeg pipe, expressed as ms of audio."""
+        with self._lock:
+            self._audio_backlog_ms = backlog_ms
+            self._audio_backlog_peak_ms = max(self._audio_backlog_peak_ms, backlog_ms)
 
     def record_capture_error(self) -> None:
         with self._lock:
@@ -170,6 +209,11 @@ class PipelineStats:
 
             capture_ms = self._capture.avg() * 1000
             capture_peak_ms = self._capture.peak * 1000
+            screencast_lag_ms = self._screencast_lag.avg() * 1000
+            screencast_lag_peak_ms = self._screencast_lag.peak * 1000
+            screencast_lag_count = self._screencast_lag.count
+            audio_backlog_ms = self._audio_backlog_ms
+            audio_backlog_peak_ms = self._audio_backlog_peak_ms
             frame_age_ms = self._frame_age.avg() * 1000
             frame_age_peak_ms = self._frame_age.peak * 1000
             write_ms = self._encode_write.avg() * 1000
@@ -205,6 +249,8 @@ class PipelineStats:
             self._capture_behind = 0
             self._capture_errors = 0
             self._capture_timeouts = 0
+            self._screencast_lag.reset()
+            self._audio_backlog_peak_ms = 0.0
             self._publish.reset()
             self._frame_age.reset()
             self._encode.reset()
@@ -223,14 +269,21 @@ class PipelineStats:
             if tv_pos is not None:
                 self._tv_interval_start_pos_s = tv_pos
 
+        capture_line = (
+            f"capture {capture_fps:.1f}/{self.target_fps:.0f} fps, "
+            f"capture avg {capture_ms:.0f}ms peak {capture_peak_ms:.0f}ms"
+            + (f", behind {behind}x" if behind else "")
+            + (f", timeouts {timeouts}" if timeouts else "")
+            + (f", errors {errors}" if errors else "")
+        )
+        if screencast_lag_count:
+            capture_line += (
+                f", chrome→app lag avg {screencast_lag_ms:.0f}ms "
+                f"peak {screencast_lag_peak_ms:.0f}ms"
+            )
+
         lines = [
-            (
-                f"capture {capture_fps:.1f}/{self.target_fps:.0f} fps, "
-                f"capture avg {capture_ms:.0f}ms peak {capture_peak_ms:.0f}ms"
-                + (f", behind {behind}x" if behind else "")
-                + (f", timeouts {timeouts}" if timeouts else "")
-                + (f", errors {errors}" if errors else "")
-            ),
+            capture_line,
             (
                 f"encode  {encode_fps:.1f}/{self.target_fps:.0f} fps to ffmpeg, "
                 f"frame age avg {frame_age_ms:.0f}ms peak {frame_age_peak_ms:.0f}ms, "
@@ -250,11 +303,18 @@ class PipelineStats:
             hls_line += f", deleted {hls_deleted}"
         lines.append(hls_line)
 
+        audio_bits: list[str] = []
+        if audio_backlog_ms is not None:
+            audio_bits.append(
+                f"pipe backlog {audio_backlog_ms:.0f}ms peak {audio_backlog_peak_ms:.0f}ms"
+            )
         if audio_warnings:
-            audio_line = f"audio   {audio_warnings} warnings this interval"
+            warn = f"{audio_warnings} warnings this interval"
             if audio_last_warning:
-                audio_line += f' (last: "{audio_last_warning}")'
-            lines.append(audio_line)
+                warn += f' (last: "{audio_last_warning}")'
+            audio_bits.append(warn)
+        if audio_bits:
+            lines.append("audio   " + ", ".join(audio_bits))
 
         tv_line = f"tv      {tv_state}"
         if tv_idle and tv_state != "PLAYING":

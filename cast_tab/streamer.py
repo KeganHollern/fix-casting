@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import socket
 import subprocess
@@ -11,14 +12,19 @@ from collections import deque
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from cast_tab.audio import DEFAULT_AUDIO_FORMAT, AudioFormat
+from cast_tab.audio import DEFAULT_AUDIO_FORMAT, AudioFormat, _pipe_bytes_available
 from cast_tab.stats import PipelineStats
 
 FFMPEG_BACKPRESSURE_WRITE_S = 0.050
 FFMPEG_BACKPRESSURE_DURATION_S = 60.0
 
-# Never trust a measurement beyond this; covers the audio pre-roll plus the
-# video frame-queue latency we compensate for.
+# Keep filling video frames to catch up after a stall this long or shorter (so
+# the encoded timeline stays locked to wall-clock and audio can't drift ahead);
+# only abandon catch-up past it (machine slept, multi-second hang).
+SAMPLER_MAX_CATCHUP_S = 5.0
+
+# Clamp the manual --audio-offset-ms trim to a sane range; covers the audio
+# pre-roll plus the video frame-queue latency we compensate for.
 MAX_AUTO_AV_OFFSET_S = 3.0
 
 
@@ -44,35 +50,8 @@ def default_fps_for_resolution(width: int, height: int, *, buffered: bool = Fals
     return 24
 
 
-def resolve_codec(requested: str) -> str:
-    """Pick a Chromecast-compatible video codec."""
-    if requested == "auto":
-        # H.264 is universally supported on Chromecast; HEVC/AV1 need newer models.
-        return "h264"
-
-    if requested == "hevc":
-        if not _ffmpeg_supports_encoder("hevc_videotoolbox"):
-            raise RuntimeError("HEVC encoding is not available (hevc_videotoolbox).")
-        return "hevc"
-
-    if requested == "av1":
-        if not _ffmpeg_supports_encoder("libsvtav1"):
-            raise RuntimeError("AV1 encoding is not available (libsvtav1).")
-        return "av1"
-
-    if requested == "h264":
-        return "h264"
-
-    raise RuntimeError(f"Unknown codec: {requested}")
-
-
-def codec_label(codec: str) -> str:
-    labels = {
-        "h264": "H.264 (VideoToolbox)" if _ffmpeg_supports_encoder("h264_videotoolbox") else "H.264",
-        "hevc": "HEVC/H.265 (VideoToolbox)",
-        "av1": "AV1 (SVT, software)",
-    }
-    return labels.get(codec, codec)
+def codec_label() -> str:
+    return "H.264 (VideoToolbox)" if _ffmpeg_supports_encoder("h264_videotoolbox") else "H.264"
 
 
 def default_jpeg_quality(width: int, height: int) -> int:
@@ -81,74 +60,25 @@ def default_jpeg_quality(width: int, height: int) -> int:
     return 80
 
 
-def _target_bitrate(codec: str, width: int, height: int, *, buffered: bool) -> tuple[str, str, str]:
-    """Pick bitrate targets. Efficient codecs use lower bitrate for similar quality."""
+def _target_bitrate(width: int, height: int, *, buffered: bool) -> tuple[str, str, str]:
+    """Pick H.264 bitrate targets (bitrate, maxrate, bufsize)."""
     pixels = width * height
     if pixels >= 1920 * 1080:
-        if codec == "hevc":
-            return ("3M", "3.5M", "12M") if buffered else ("2.5M", "3M", "6M")
-        if codec == "av1":
-            return ("2.5M", "3M", "12M") if buffered else ("2M", "2.5M", "6M")
         return ("5M", "6M", "12M") if buffered else ("4.5M", "5M", "5M")
     if pixels >= 1280 * 720:
-        if codec in ("hevc", "av1"):
-            return ("1.8M", "2.2M", "8M") if buffered else ("1.5M", "2M", "4M")
         return ("3M", "3.5M", "8M") if buffered else ("2.5M", "3M", "3M")
-    if codec in ("hevc", "av1"):
-        return ("1M", "1.2M", "4M") if buffered else ("900k", "1.1M", "2M")
     return ("1.5M", "2M", "4M") if buffered else ("1.5M", "2M", "2M")
 
 
 def _video_encoder_args(
-    codec: str,
     fps: int,
     width: int,
     height: int,
     *,
     buffered: bool,
 ) -> list[str]:
-    bitrate, maxrate, bufsize = _target_bitrate(codec, width, height, buffered=buffered)
+    bitrate, maxrate, bufsize = _target_bitrate(width, height, buffered=buffered)
     gop = fps * (2 if buffered else 1)
-
-    if codec == "hevc" and _ffmpeg_supports_encoder("hevc_videotoolbox"):
-        return [
-            "-c:v",
-            "hevc_videotoolbox",
-            "-profile:v",
-            "main",
-            "-b:v",
-            bitrate,
-            "-maxrate",
-            maxrate,
-            "-bufsize",
-            bufsize,
-            "-g",
-            str(gop),
-            "-keyint_min",
-            str(fps),
-        ]
-
-    if codec == "av1" and _ffmpeg_supports_encoder("libsvtav1"):
-        return [
-            "-c:v",
-            "libsvtav1",
-            "-preset",
-            "6" if buffered else "10",
-            "-crf",
-            "32",
-            "-b:v",
-            bitrate,
-            "-maxrate",
-            maxrate,
-            "-bufsize",
-            bufsize,
-            "-g",
-            str(gop),
-            "-keyint_min",
-            str(fps),
-            "-pix_fmt",
-            "yuv420p",
-        ]
 
     if _ffmpeg_supports_encoder("h264_videotoolbox"):
         return [
@@ -263,13 +193,10 @@ class HLSStreamer:
         width: int = 1920,
         height: int = 1080,
         fps: int = 24,
-        codec: str = "hevc",
         buffered: bool = True,
         audio_fd: int | None = None,
-        audio_sync: str = "off",
         audio_format: AudioFormat | None = None,
         audio_offset_ms: int = 0,
-        av_offset_s: float = 0.0,
         port: int = 0,
         work_dir: Path | None = None,
         stats: PipelineStats | None = None,
@@ -277,14 +204,10 @@ class HLSStreamer:
         self.width = width
         self.height = height
         self.fps = fps
-        self.codec = codec
         self.buffered = buffered
         self.audio_fd = audio_fd
-        self.audio_sync = audio_sync
         self.audio_format = audio_format or DEFAULT_AUDIO_FORMAT
         self.audio_offset_ms = audio_offset_ms
-        # Measured by the flash+beep calibration: how far audio leads video.
-        self._measured_av_delay_s = av_offset_s
         self.work_dir = work_dir or Path("/tmp/cast-tab-stream")
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -294,6 +217,10 @@ class HLSStreamer:
         playlist.unlink(missing_ok=True)
 
         self._latest = LatestFrame()
+        # Set the first time a captured frame is published. We hold ffmpeg's
+        # spawn until this fires so the audio and video inputs anchor their
+        # PTS=0 to the same moment (see start()).
+        self._first_frame = threading.Event()
         self._ffmpeg: subprocess.Popen[bytes] | None = None
         self._sampler_thread: threading.Thread | None = None
         self._writer_thread: threading.Thread | None = None
@@ -320,9 +247,31 @@ class HLSStreamer:
         port = self._port or (self._http_server.server_port if self._http_server else 0)
         return f"http://{host}:{port}/stream.m3u8"
 
+    # How long to wait for Chrome's screencast to deliver its first frame
+    # before spawning ffmpeg anyway. Chrome's screencast can take several
+    # seconds to warm up; we'd rather wait than anchor audio without video.
+    FIRST_FRAME_TIMEOUT_S = 30.0
+
     def start(self) -> None:
         if shutil.which("ffmpeg") is None:
             raise RuntimeError("ffmpeg is required but was not found in PATH.")
+
+        # Hold ffmpeg until the first frame is captured. ffmpeg stamps both the
+        # audio pipe and the video pipe from their first byte; audio is flowing
+        # the instant ffmpeg opens it, but Chrome's screencast warms up several
+        # seconds later. Spawning early anchors audio PTS=0 to "now" and video
+        # PTS=0 to "now + warmup", baking that whole gap in as audio-ahead skew.
+        # Waiting for the first frame anchors both inputs to the same moment.
+        if not self._first_frame.wait(timeout=self.FIRST_FRAME_TIMEOUT_S):
+            print(
+                "Warning: no captured frame after "
+                f"{self.FIRST_FRAME_TIMEOUT_S:.0f}s; starting ffmpeg anyway "
+                "(audio may lead video).",
+                flush=True,
+            )
+        if self._stopped.is_set():
+            # Shut down before the first frame arrived; don't spawn anything.
+            return
 
         self._start_ffmpeg()
         self._start_sampler_thread()
@@ -332,8 +281,28 @@ class HLSStreamer:
     def publish_frame(self, jpeg_data: bytes) -> None:
         if not self._stopped.is_set():
             self._latest.publish(jpeg_data)
+            self._first_frame.set()
             if self._stats is not None:
+                self._stats.trace("first frame published to streamer", once=True)
                 self._stats.record_publish()
+
+    def poll_audio_backlog(self) -> None:
+        """Sample unread bytes in the audio pipe (ffmpeg's read backlog).
+
+        FIONREAD is a non-destructive ioctl, so checking the backlog from here
+        doesn't disturb the bytes ffmpeg reads off the same pipe. A backlog
+        pinned near 0 means ffmpeg consumes audio as fast as AudioTee makes it;
+        a growing backlog means audio is being buffered (delayed) before mux.
+        """
+        if self._stats is None or self.audio_fd is None:
+            return
+        try:
+            backlog = _pipe_bytes_available(self.audio_fd)
+        except OSError:
+            return
+        self._stats.record_audio_backlog(
+            backlog / self.audio_format.bytes_per_second * 1000
+        )
 
     def poll_hls_stats(self) -> list[str]:
         if self._stats is None:
@@ -377,6 +346,8 @@ class HLSStreamer:
 
     def stop(self) -> None:
         self._stopped.set()
+        # Unblock start() if it's still waiting for the first frame.
+        self._first_frame.set()
         with self._queue_cond:
             self._queue_cond.notify_all()
 
@@ -395,7 +366,6 @@ class HLSStreamer:
     def _audio_input_args(self) -> list[str]:
         if self.audio_fd is not None:
             return [
-                *self._auto_av_offset_args(),
                 "-thread_queue_size",
                 "4096",
                 # Match AudioTee's actual native PCM format exactly so ffmpeg
@@ -417,32 +387,61 @@ class HLSStreamer:
             "anullsrc=channel_layout=stereo:sample_rate=44100",
         ]
 
-    def _auto_av_offset_args(self) -> list[str]:
+    def _audio_delay_filter_args(self) -> list[str]:
         """Delay audio to match the video pipeline's latency (lip-sync).
 
         Video runs through the capture + frame-queue + encoder path and reaches
-        the muxer later than the near-direct audio, so audio plays ahead. The
-        correction is the sum of:
-          - calibrated: the empirical flash+beep measurement of the skew (see
-            cast_tab.calibration), passed in as av_offset_s.
-          - manual: the optional --audio-offset-ms trim for any residual.
-        Applied as a positive -itsoffset, which shifts the audio input later.
+        the muxer later than the near-direct audio, so audio plays ahead. We
+        prepend silence with the adelay filter to push audio later by
+        --audio-offset-ms.
+
+        Input-side -itsoffset is silently ignored for a raw-PCM pipe (ffmpeg
+        regenerates the timestamps from 0), so the delay must live in the audio
+        filter graph instead. adelay only adds delay, which is all we need: the
+        skew is always audio-ahead.
+        """
+        if self.audio_fd is None or self.audio_offset_ms == 0:
+            return []
+        if self.audio_offset_ms < 0:
+            print(
+                "A/V sync: negative --audio-offset-ms is not supported "
+                "(audio is structurally ahead, never behind); ignoring.",
+                flush=True,
+            )
+            return []
+        delay_ms = min(self.audio_offset_ms, int(MAX_AUTO_AV_OFFSET_S * 1000))
+        print(f"A/V sync: delaying audio {delay_ms}ms (adelay).", flush=True)
+        return ["-af", f"adelay={delay_ms}:all=1"]
+
+    def _drain_audio_fd(self) -> None:
+        """Discard PCM that buffered in the pipe before ffmpeg attaches.
+
+        AudioTee streams into the pipe from the moment it starts, but ffmpeg
+        only opens the fd when it (re)launches here. Whatever sat in the OS pipe
+        buffer in the meantime (~64KB, ~170ms) would otherwise be read as the
+        start of the stream and play ahead of video. Drop it so audio and video
+        both effectively begin "now". Bounded so a live writer can't spin us.
         """
         if self.audio_fd is None:
-            return []
-        manual_s = self.audio_offset_ms / 1000.0
-        offset_s = self._measured_av_delay_s + manual_s
-        offset_s = max(-MAX_AUTO_AV_OFFSET_S, min(offset_s, MAX_AUTO_AV_OFFSET_S))
-        if abs(offset_s) < 0.005:
-            return []
-        print(
-            f"A/V sync: delaying audio {offset_s * 1000:+.0f}ms "
-            f"(calibrated {self._measured_av_delay_s * 1000:.0f}ms + "
-            f"manual {self.audio_offset_ms:+d}ms).",
-            flush=True,
-        )
-        # Positive itsoffset delays audio (it runs ahead of video).
-        return ["-itsoffset", f"{offset_s:.3f}"]
+            return
+        max_drop = self.audio_format.bytes_per_second * 2
+        dropped = 0
+        try:
+            while dropped < max_drop:
+                available = _pipe_bytes_available(self.audio_fd)
+                if available <= 0:
+                    break
+                chunk = os.read(self.audio_fd, min(available, 1 << 16))
+                if not chunk:
+                    break
+                dropped += len(chunk)
+        except OSError:
+            return
+        if dropped:
+            ms = dropped / self.audio_format.bytes_per_second * 1000
+            print(f"A/V sync: dropped {ms:.0f}ms of buffered pre-roll audio.", flush=True)
+            if self._stats is not None:
+                self._stats.trace(f"audio pre-roll drained ({ms:.0f}ms)")
 
     def _kill_ffmpeg(self) -> None:
         if self._ffmpeg is None:
@@ -517,12 +516,12 @@ class HLSStreamer:
             "-map",
             "1:a",
             *_video_encoder_args(
-                self.codec,
                 self.fps,
                 self.width,
                 self.height,
                 buffered=self.buffered,
             ),
+            *self._audio_delay_filter_args(),
             "-c:a",
             "aac",
             "-b:a",
@@ -532,14 +531,6 @@ class HLSStreamer:
             str(self.audio_format.sample_rate),
             "-ac",
             str(self.audio_format.channels),
-            # "soft" corrects slow A/V clock drift over long sessions. async=1000
-            # allows generous *gentle* stretching so it never resorts to hard
-            # sample drops/inserts (which click). Default off keeps clean PCM.
-            *(
-                ["-af", "aresample=async=1000"]
-                if self.audio_sync == "soft"
-                else []
-            ),
             *_hls_args(buffered=self.buffered),
             "-hls_segment_filename",
             segment_pattern,
@@ -558,7 +549,14 @@ class HLSStreamer:
             # True by default); never inherit the rest of our fds, or ffmpeg
             # holds pipe write-ends open and never sees EOF on shutdown.
             popen_kwargs["pass_fds"] = (self.audio_fd,)
+            # Drain the pipe right before the child opens it so ffmpeg starts
+            # reading at "now" instead of inheriting buffered pre-roll audio.
+            self._drain_audio_fd()
+        if self._stats is not None:
+            self._stats.trace("ffmpeg spawn (audio+video PTS=0 anchor)")
         self._ffmpeg = subprocess.Popen(cmd, **popen_kwargs)
+        if self._stats is not None:
+            self._stats.trace("ffmpeg spawned")
 
     def _enqueue_frame(self, frame: bytes) -> None:
         with self._queue_cond:
@@ -592,9 +590,13 @@ class HLSStreamer:
                 if sleep_for > 0:
                     self._stopped.wait(sleep_for)
                     now = time.monotonic()
-                # If we fell far behind schedule (system hiccup), resync rather
-                # than bursting a backlog of identical timestamps.
-                if now - next_tick > 1.0:
+                # When we fall behind schedule, keep the loop running back-to-
+                # back (no sleep) so it feeds one frame per missed tick — those
+                # catch-up frames hold the encoded timeline level with wall-clock
+                # so audio can't drift ahead of video. Only give up and resync
+                # past a large gap (machine slept), where bursting the whole
+                # backlog isn't worth it. The bounded queue caps the burst.
+                if now - next_tick > SAMPLER_MAX_CATCHUP_S:
                     next_tick = now
                     if self._stats is not None:
                         self._stats.record_encode_resync()
@@ -603,6 +605,8 @@ class HLSStreamer:
                 frame, published_at, generation = self._latest.peek()
                 if frame is None:
                     continue
+                if self._stats is not None:
+                    self._stats.trace("first sampler tick (video PTS=0 frame)", once=True)
 
                 # One frame per tick holds a constant input rate. When capture
                 # produced nothing new, re-enqueue the latest; skipping it would
@@ -652,6 +656,7 @@ class HLSStreamer:
                     continue
 
                 if self._stats is not None:
+                    self._stats.trace("first frame written to ffmpeg stdin", once=True)
                     self._stats.record_encode_write(write_s)
                 self._note_encode_backpressure(write_s)
 

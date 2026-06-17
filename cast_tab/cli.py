@@ -17,7 +17,6 @@ from cast_tab.audio import (
     stop_audio_capture,
 )
 from cast_tab.browser import TabScreencaster
-from cast_tab.calibration import measure_av_offset
 from cast_tab.caster import TabCaster
 from cast_tab.devices import discover_devices, select_device
 from cast_tab.stats import PipelineStats
@@ -26,7 +25,6 @@ from cast_tab.streamer import (
     codec_label,
     default_fps_for_resolution,
     default_jpeg_quality,
-    resolve_codec,
 )
 
 
@@ -58,40 +56,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Encode frame rate (default: 30 buffered, 23 at 1080p / 24 at 720p otherwise)",
     )
     parser.add_argument(
-        "--capture-fps",
-        type=int,
-        default=None,
-        help=(
-            "Tab capture rate (default: ~1.5x the encode fps). Capturing faster "
-            "than the encoder keeps a fresh frame ready each tick, reducing "
-            "duplicate frames and motion judder on the TV."
-        ),
-    )
-    parser.add_argument(
         "--discovery-timeout",
         type=float,
         default=5.0,
         help="Seconds to search for Chromecast devices (default: 5)",
-    )
-    parser.add_argument(
-        "--capture",
-        choices=("screencast", "screenshot", "playwright"),
-        default="screencast",
-        help=(
-            "Tab frame capture backend (default: screencast). screencast uses "
-            "CDP Page.startScreencast (paint-driven, can reach ~60fps). Use "
-            "screenshot for the paced CDP Page.captureScreenshot loop, or "
-            "playwright for the legacy Playwright screenshot path."
-        ),
-    )
-    parser.add_argument(
-        "--jpeg-quality",
-        type=int,
-        default=None,
-        help=(
-            "JPEG quality of captured frames (1-100; default: 75 at 1080p, "
-            "80 below). Lower trades image quality for faster capture."
-        ),
     )
     parser.add_argument(
         "--headless",
@@ -108,28 +76,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "Manual A/V trim added to the auto-measured sync, in ms. Positive "
-            "delays audio (use if audio is still ahead of video); negative "
-            "advances it. Use to dial in lip-sync if the automatic value is off."
-        ),
-    )
-    parser.add_argument(
-        "--audio-sync",
-        choices=("off", "soft"),
-        default="off",
-        help=(
-            "Audio drift correction (default: off = clean PCM). 'soft' enables "
-            "gentle async resampling (aresample=async=1000) that corrects slow "
-            "clock drift over long sessions without audible artifacts."
-        ),
-    )
-    parser.add_argument(
-        "--codec",
-        choices=("auto", "h264", "hevc", "av1"),
-        default="auto",
-        help=(
-            "Video codec (default: auto = H.264). "
-            "HEVC/AV1 may not play on older Chromecasts."
+            "Manual A/V trim in ms (default: 0). Positive delays audio (use if "
+            "audio is ahead of video); negative advances it. Use to dial in "
+            "lip-sync."
         ),
     )
     parser.add_argument(
@@ -139,16 +88,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Buffer ~45s on the TV for higher quality and smoother playback "
             "(default: on). Use --no-buffered for lower latency."
-        ),
-    )
-    parser.add_argument(
-        "--calibrate",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Measure the A/V capture offset with a flash+beep test page before "
-            "streaming, and auto-correct lip-sync (default: on). "
-            "Use --no-calibrate to skip the ~15s calibration step."
         ),
     )
     parser.add_argument(
@@ -178,31 +117,14 @@ def main(argv: list[str] | None = None) -> int:
     devices = discover_devices(timeout=args.discovery_timeout)
     device = select_device(devices)
 
-    codec = resolve_codec(args.codec)
     encode_fps = args.fps or default_fps_for_resolution(
         args.width, args.height, buffered=args.buffered
     )
     # Oversample capture so a fresh frame is ready at every encoder tick.
-    capture_fps = args.capture_fps or max(encode_fps, round(encode_fps * 1.5))
-    jpeg_quality = args.jpeg_quality or default_jpeg_quality(args.width, args.height)
+    capture_fps = max(encode_fps, round(encode_fps * 1.5))
+    jpeg_quality = default_jpeg_quality(args.width, args.height)
     capture_audio = not args.no_audio
     stats = PipelineStats(target_fps=float(encode_fps)) if args.stats else None
-
-    av_offset_s = 0.0
-    if capture_audio and args.calibrate:
-        print("Calibrating A/V sync (flash + beep test, ~15s)...")
-        measured = measure_av_offset(
-            capture_method=args.capture,
-            width=args.width,
-            height=args.height,
-            jpeg_quality=jpeg_quality,
-            headless=args.headless,
-        )
-        if measured is None:
-            print("Calibration: could not measure offset; continuing without it.")
-        else:
-            av_offset_s = measured
-            print(f"Calibration: audio leads video by {av_offset_s * 1000:.0f}ms.")
 
     screencaster = TabScreencaster(
         args.url,
@@ -214,7 +136,6 @@ def main(argv: list[str] | None = None) -> int:
         on_frame=lambda _frame: None,
         headless=args.headless,
         capture_audio=capture_audio,
-        capture_method=args.capture,
         stats=stats,
     )
     streamer: HLSStreamer | None = None
@@ -243,6 +164,8 @@ def main(argv: list[str] | None = None) -> int:
         screencaster.start()
         screencaster.wait_until_ready()
         screencaster.enable_capture()
+        if stats is not None:
+            stats.trace("enable_capture")
 
         if capture_audio:
             if not audiotee_available():
@@ -295,6 +218,8 @@ def main(argv: list[str] | None = None) -> int:
                     ):
                         stats.record_audio_warning(text)
 
+                if stats is not None:
+                    stats.trace("audio try_start begin")
                 try:
                     audio_capture = try_start_chrome_audio_capture(
                         screencaster.user_data_dir,
@@ -302,6 +227,8 @@ def main(argv: list[str] | None = None) -> int:
                         on_stderr=on_audio_stderr,
                     )
                     audio_attached = True
+                    if stats is not None:
+                        stats.trace(f"audio attached (pids={audio_capture.pids})")
                     print(
                         "Capturing audio from cast browser only "
                         f"(PIDs: {', '.join(str(pid) for pid in audio_capture.pids)})."
@@ -316,32 +243,23 @@ def main(argv: list[str] | None = None) -> int:
             width=args.width,
             height=args.height,
             fps=encode_fps,
-            codec=codec,
             buffered=args.buffered,
             audio_fd=audio_capture.read_fd if audio_capture else None,
-            audio_sync=args.audio_sync,
             audio_format=audio_capture.audio_format if audio_capture else None,
             audio_offset_ms=args.audio_offset_ms,
-            av_offset_s=av_offset_s,
             stats=stats,
         )
         screencaster.on_frame = streamer.publish_frame
+        if stats is not None:
+            stats.trace("on_frame wired to streamer")
 
         audio_mode = "with tab audio" if capture_audio else "video only"
         latency_mode = "buffered (~45s TV delay)" if args.buffered else "low-latency"
-        if args.capture == "screencast":
-            capture_desc = "capture=screencast (paint-driven)"
-        else:
-            capture_desc = f"capture={args.capture} ~{capture_fps}fps"
         print(
             f"Streaming at {args.width}x{args.height} {encode_fps} fps "
-            f"({capture_desc}, jpeg q={jpeg_quality}) {audio_mode} "
-            f"using {codec_label(codec)}, {latency_mode}."
+            f"(capture=screencast (paint-driven), jpeg q={jpeg_quality}) {audio_mode} "
+            f"using {codec_label()}, {latency_mode}."
         )
-        if codec == "av1":
-            print("AV1 uses software encoding and may not play on older Chromecasts.")
-        elif codec == "hevc":
-            print("If the TV shows an error, retry with --codec h264.")
 
         streamer.start()
         streamer.wait_until_ready()
@@ -366,6 +284,7 @@ def main(argv: list[str] | None = None) -> int:
         while not shutting_down:
             now = time.monotonic()
             if stats is not None and now >= next_tv_poll_at:
+                streamer.poll_audio_backlog()
                 for event in streamer.poll_hls_stats():
                     print(f"[stats] {event}", flush=True)
                 tv = caster.poll_playback_stats()
