@@ -153,10 +153,16 @@ class TabScreencaster:
         Playwright from inside a CDP callback.
         """
         pace_period = 1.0 / self._pace_fps
-        pending: deque[tuple[str | None, str | None]] = deque()
+        pending: deque[tuple[str | None, str | None, float | None]] = deque()
 
         def on_screencast_frame(params: dict) -> None:
-            pending.append((params.get("data"), params.get("sessionId")))
+            # metadata.timestamp is Chrome's capture time (seconds since epoch),
+            # comparable to time.time(); it lets us measure how stale the frame
+            # already is by the moment it reaches us.
+            metadata = params.get("metadata") or {}
+            pending.append(
+                (params.get("data"), params.get("sessionId"), metadata.get("timestamp"))
+            )
 
         cdp.on("Page.screencastFrame", on_screencast_frame)
         cdp.send("Page.enable")
@@ -169,7 +175,7 @@ class TabScreencaster:
                     self._try_start_playback(page)
 
                 while pending:
-                    data_b64, session_id = pending.popleft()
+                    data_b64, session_id, capture_ts = pending.popleft()
                     # Ack first so Chrome keeps the frames flowing.
                     if session_id is not None:
                         try:
@@ -181,6 +187,14 @@ class TabScreencaster:
                                 return
                     if data_b64 is None:
                         continue
+                    if self._stats is not None:
+                        self._stats.trace("first screencast frame from chrome", once=True)
+                        # How old the frame already is on arrival — the capture-
+                        # side staleness we suspect drives audio-ahead skew.
+                        if capture_ts is not None:
+                            lag = time.time() - capture_ts
+                            if 0.0 <= lag < 60.0:
+                                self._stats.record_screencast_lag(lag)
                     started = time.monotonic()
                     try:
                         self._on_frame(base64.b64decode(data_b64))

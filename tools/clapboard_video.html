@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Clapboard (video element) — A/V skew through &lt;video&gt;</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  video { width: 100vw; height: 100vh; object-fit: fill; background: #000; display: block; }
+  #label {
+    position: fixed; top: 12px; left: 12px; color: #0f0;
+    font: 24px/1.2 monospace; opacity: 0.6; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+  <!-- Plays clapboard_clip.mp4: a clip whose white flash and 1 kHz beep are
+       encoded perfectly in sync (every 3s). Casting this measures how much OUR
+       capture path skews already-synced media playback — i.e. the same path
+       YouTube takes through a <video> element, unlike the DOM/WebAudio
+       clapboard.html which has different internal latencies. -->
+  <video id="v" src="clapboard_clip.mp4" autoplay loop playsinline></video>
+  <div id="label">video clapboard</div>
+<script>
+  const v = document.getElementById("v");
+  v.muted = false;
+  v.volume = 1.0;
+  // Autoplay-with-sound is allowed via --autoplay-policy=no-user-gesture-required.
+  const tryPlay = () => { v.play().catch(() => {}); };
+  tryPlay();
+  v.addEventListener("canplay", tryPlay);
+  // If the loop ever stalls, kick it.
+  setInterval(() => { if (v.paused) tryPlay(); }, 1000);
+</script>
+</body>
+</html>

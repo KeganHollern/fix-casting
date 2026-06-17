@@ -164,6 +164,8 @@ def main(argv: list[str] | None = None) -> int:
         screencaster.start()
         screencaster.wait_until_ready()
         screencaster.enable_capture()
+        if stats is not None:
+            stats.trace("enable_capture")
 
         if capture_audio:
             if not audiotee_available():
@@ -216,6 +218,8 @@ def main(argv: list[str] | None = None) -> int:
                     ):
                         stats.record_audio_warning(text)
 
+                if stats is not None:
+                    stats.trace("audio try_start begin")
                 try:
                     audio_capture = try_start_chrome_audio_capture(
                         screencaster.user_data_dir,
@@ -223,6 +227,8 @@ def main(argv: list[str] | None = None) -> int:
                         on_stderr=on_audio_stderr,
                     )
                     audio_attached = True
+                    if stats is not None:
+                        stats.trace(f"audio attached (pids={audio_capture.pids})")
                     print(
                         "Capturing audio from cast browser only "
                         f"(PIDs: {', '.join(str(pid) for pid in audio_capture.pids)})."
@@ -244,6 +250,8 @@ def main(argv: list[str] | None = None) -> int:
             stats=stats,
         )
         screencaster.on_frame = streamer.publish_frame
+        if stats is not None:
+            stats.trace("on_frame wired to streamer")
 
         audio_mode = "with tab audio" if capture_audio else "video only"
         latency_mode = "buffered (~45s TV delay)" if args.buffered else "low-latency"
@@ -276,6 +284,7 @@ def main(argv: list[str] | None = None) -> int:
         while not shutting_down:
             now = time.monotonic()
             if stats is not None and now >= next_tv_poll_at:
+                streamer.poll_audio_backlog()
                 for event in streamer.poll_hls_stats():
                     print(f"[stats] {event}", flush=True)
                 tv = caster.poll_playback_stats()

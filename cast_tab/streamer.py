@@ -217,6 +217,10 @@ class HLSStreamer:
         playlist.unlink(missing_ok=True)
 
         self._latest = LatestFrame()
+        # Set the first time a captured frame is published. We hold ffmpeg's
+        # spawn until this fires so the audio and video inputs anchor their
+        # PTS=0 to the same moment (see start()).
+        self._first_frame = threading.Event()
         self._ffmpeg: subprocess.Popen[bytes] | None = None
         self._sampler_thread: threading.Thread | None = None
         self._writer_thread: threading.Thread | None = None
@@ -243,9 +247,31 @@ class HLSStreamer:
         port = self._port or (self._http_server.server_port if self._http_server else 0)
         return f"http://{host}:{port}/stream.m3u8"
 
+    # How long to wait for Chrome's screencast to deliver its first frame
+    # before spawning ffmpeg anyway. Chrome's screencast can take several
+    # seconds to warm up; we'd rather wait than anchor audio without video.
+    FIRST_FRAME_TIMEOUT_S = 30.0
+
     def start(self) -> None:
         if shutil.which("ffmpeg") is None:
             raise RuntimeError("ffmpeg is required but was not found in PATH.")
+
+        # Hold ffmpeg until the first frame is captured. ffmpeg stamps both the
+        # audio pipe and the video pipe from their first byte; audio is flowing
+        # the instant ffmpeg opens it, but Chrome's screencast warms up several
+        # seconds later. Spawning early anchors audio PTS=0 to "now" and video
+        # PTS=0 to "now + warmup", baking that whole gap in as audio-ahead skew.
+        # Waiting for the first frame anchors both inputs to the same moment.
+        if not self._first_frame.wait(timeout=self.FIRST_FRAME_TIMEOUT_S):
+            print(
+                "Warning: no captured frame after "
+                f"{self.FIRST_FRAME_TIMEOUT_S:.0f}s; starting ffmpeg anyway "
+                "(audio may lead video).",
+                flush=True,
+            )
+        if self._stopped.is_set():
+            # Shut down before the first frame arrived; don't spawn anything.
+            return
 
         self._start_ffmpeg()
         self._start_sampler_thread()
@@ -255,8 +281,28 @@ class HLSStreamer:
     def publish_frame(self, jpeg_data: bytes) -> None:
         if not self._stopped.is_set():
             self._latest.publish(jpeg_data)
+            self._first_frame.set()
             if self._stats is not None:
+                self._stats.trace("first frame published to streamer", once=True)
                 self._stats.record_publish()
+
+    def poll_audio_backlog(self) -> None:
+        """Sample unread bytes in the audio pipe (ffmpeg's read backlog).
+
+        FIONREAD is a non-destructive ioctl, so checking the backlog from here
+        doesn't disturb the bytes ffmpeg reads off the same pipe. A backlog
+        pinned near 0 means ffmpeg consumes audio as fast as AudioTee makes it;
+        a growing backlog means audio is being buffered (delayed) before mux.
+        """
+        if self._stats is None or self.audio_fd is None:
+            return
+        try:
+            backlog = _pipe_bytes_available(self.audio_fd)
+        except OSError:
+            return
+        self._stats.record_audio_backlog(
+            backlog / self.audio_format.bytes_per_second * 1000
+        )
 
     def poll_hls_stats(self) -> list[str]:
         if self._stats is None:
@@ -300,6 +346,8 @@ class HLSStreamer:
 
     def stop(self) -> None:
         self._stopped.set()
+        # Unblock start() if it's still waiting for the first frame.
+        self._first_frame.set()
         with self._queue_cond:
             self._queue_cond.notify_all()
 
@@ -392,6 +440,8 @@ class HLSStreamer:
         if dropped:
             ms = dropped / self.audio_format.bytes_per_second * 1000
             print(f"A/V sync: dropped {ms:.0f}ms of buffered pre-roll audio.", flush=True)
+            if self._stats is not None:
+                self._stats.trace(f"audio pre-roll drained ({ms:.0f}ms)")
 
     def _kill_ffmpeg(self) -> None:
         if self._ffmpeg is None:
@@ -502,7 +552,11 @@ class HLSStreamer:
             # Drain the pipe right before the child opens it so ffmpeg starts
             # reading at "now" instead of inheriting buffered pre-roll audio.
             self._drain_audio_fd()
+        if self._stats is not None:
+            self._stats.trace("ffmpeg spawn (audio+video PTS=0 anchor)")
         self._ffmpeg = subprocess.Popen(cmd, **popen_kwargs)
+        if self._stats is not None:
+            self._stats.trace("ffmpeg spawned")
 
     def _enqueue_frame(self, frame: bytes) -> None:
         with self._queue_cond:
@@ -551,6 +605,8 @@ class HLSStreamer:
                 frame, published_at, generation = self._latest.peek()
                 if frame is None:
                     continue
+                if self._stats is not None:
+                    self._stats.trace("first sampler tick (video PTS=0 frame)", once=True)
 
                 # One frame per tick holds a constant input rate. When capture
                 # produced nothing new, re-enqueue the latest; skipping it would
@@ -600,6 +656,7 @@ class HLSStreamer:
                     continue
 
                 if self._stats is not None:
+                    self._stats.trace("first frame written to ffmpeg stdin", once=True)
                     self._stats.record_encode_write(write_s)
                 self._note_encode_backpressure(write_s)
 
