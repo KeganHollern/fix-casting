@@ -1,9 +1,10 @@
 """Measure end-to-end audio/video skew through the real capture pipeline.
 
 Runs the actual TabScreencaster + AudioTee + HLSStreamer path (NO Chromecast)
-against tools/clapboard.html, which flashes the screen white and beeps at the
-same instant every 2s. We then find each flash (luma spike) and each beep
-(silence->sound onset) in the recorded HLS and report the offset between them.
+against tools/clapboard_av_page.html, which plays a clip whose white flash and
+1kHz beep are encoded together every 8s. We then find each flash (luma spike)
+and each beep (silence->sound onset) in the recorded HLS and report the offset
+between them.
 
     offset = beep_time - flash_time
       offset < 0  -> audio is AHEAD of video by |offset| (delay audio to fix)
@@ -19,7 +20,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import subprocess
 import sys
@@ -39,7 +39,7 @@ from cast_tab.browser import TabScreencaster  # noqa: E402
 from cast_tab.stats import PipelineStats  # noqa: E402
 from cast_tab.streamer import HLSStreamer  # noqa: E402
 
-CLAPBOARD = ROOT / "tools" / "clapboard.html"
+CLAPBOARD = ROOT / "tools" / "clapboard_av_page.html"
 WORK_DIR = Path("/tmp/cast-skew-measure")
 
 
@@ -190,13 +190,7 @@ def capture(seconds: float, offset_ms: int, page: Path, no_audio: bool = False) 
         )
         screencaster.on_frame = streamer.publish_frame
         streamer.start()
-        raw_out = os.environ.get("CAST_RAW_MPEGTS")
-        if raw_out:
-            # No HLS playlist/segments in raw mode; just give ffmpeg a beat to
-            # open its inputs, then record.
-            time.sleep(2.0)
-        else:
-            streamer.wait_until_ready()
+        streamer.wait_until_ready()
 
         print(f"Recording {seconds:.0f}s of clapboard…")
         time.sleep(seconds)
@@ -212,13 +206,6 @@ def capture(seconds: float, offset_ms: int, page: Path, no_audio: bool = False) 
     print(stats.format_timeseries())
     print(stats.format_report(seconds))
     print("------------------------------------------------")
-
-    raw_out = os.environ.get("CAST_RAW_MPEGTS")
-    if raw_out:
-        combined = Path(raw_out)
-        if not combined.exists():
-            raise SystemExit(f"Raw mpegts file not produced: {raw_out}")
-        return combined
 
     segments = sorted(WORK_DIR.glob("seg*.ts"))
     if not segments:

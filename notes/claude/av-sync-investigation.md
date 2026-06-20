@@ -211,16 +211,18 @@ this investigation was wrong. Only the instrumented, single-variable bisection �
 plus being able to drive the real Chrome+AudioTee runs directly and read the
 queue-depth time-series — found the truth.
 
-## Tools added for driving/measuring (all under tools/)
+## Regression tooling kept (under tools/)
 
-- `measure_source_skew.py` — full real pipeline; per-pulse A/V offset + per-2s
-  queue-depth/write-stall table + lifecycle traces. `--no-audio`, `--page`.
-- `test_pipeline_skew.py` — Chrome-free: synced clip through the real
-  `HLSStreamer`. `--clip/--width/--height/--audio-period` (burst test).
-- `serve_synced_hls.py` — serves the synced clip through the real path over HTTP
-  to eyeball sync in VLC (`--offset-ms` proves the harness is sensitive).
-- `probe_input_skew.py` — records CDP video + AudioTee audio separately and
-  measures skew at the input boundary (no mux).
-- `test_cdp_delay.py`, `cdp_clock.html` — CDP capture-delay eyeball test.
-- clapboard assets: `clapboard_clip*.mp4` (flash+beep, 8s period),
-  `clapboard_av_page.html`, `timecode_clip.mp4`.
+The lean harness for re-verifying A/V sync after any future change. One-off
+diagnostics from the investigation (CDP-delay eyeball, input-boundary probe,
+VLC-serve, DOM clapboard) were removed once their conclusions were recorded
+above; recover them from git history if ever needed.
+
+- `measure_source_skew.py` — full real CDP+AudioTee→HLS pipeline (no Chromecast);
+  per-pulse A/V offset + per-2s queue-depth/write-stall table + lifecycle traces.
+  `--no-audio` isolates the video side; `--page` overrides the test page.
+- `test_pipeline_skew.py` — Chrome-free: a synced clip through the real
+  `HLSStreamer`. `--clip/--width/--height/--audio-period`.
+- clapboard assets: `clapboard_clip.mp4` / `clapboard_clip_1080.mp4` (flash+beep
+  encoded together, 8s period) and `clapboard_av_page.html` (plays the clip in a
+  `<video>` element, the page `measure_source_skew.py` casts by default).
