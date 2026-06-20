@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -100,7 +101,7 @@ def find_beeps(input_path: Path) -> list[float]:
 
 
 def match_offsets(
-    flashes: list[float], beeps: list[float], *, max_pair_s: float = 1.4
+    flashes: list[float], beeps: list[float], *, max_pair_s: float = 3.9
 ) -> list[float]:
     """Signed offset (beep - flash) for each paired pulse.
 
@@ -135,8 +136,8 @@ def match_offsets(
     return best or []
 
 
-def capture(seconds: float, offset_ms: int, page: Path) -> Path:
-    if not audiotee_available():
+def capture(seconds: float, offset_ms: int, page: Path, no_audio: bool = False) -> Path:
+    if not no_audio and not audiotee_available():
         raise SystemExit("AudioTee not found — build it first (see install.sh).")
 
     WORK_DIR.mkdir(parents=True, exist_ok=True)
@@ -166,27 +167,36 @@ def capture(seconds: float, offset_ms: int, page: Path) -> Path:
         screencaster.wait_until_ready()
         screencaster.enable_capture()
 
-        print("Attaching audio…")
-        audio_capture = try_start_chrome_audio_capture(
-            screencaster.user_data_dir,
-            on_retry=screencaster.nudge_playback,
-        )
-        print(f"Audio attached (pids={audio_capture.pids}).")
+        if no_audio:
+            print("VIDEO ONLY (no AudioTee) — isolating video-side backpressure.")
+        else:
+            print("Attaching audio…")
+            audio_capture = try_start_chrome_audio_capture(
+                screencaster.user_data_dir,
+                on_retry=screencaster.nudge_playback,
+            )
+            print(f"Audio attached (pids={audio_capture.pids}).")
 
         streamer = HLSStreamer(
             width=1920,
             height=1080,
             fps=30,
             buffered=True,
-            audio_fd=audio_capture.read_fd,
-            audio_format=audio_capture.audio_format,
+            audio_fd=audio_capture.read_fd if audio_capture else None,
+            audio_format=audio_capture.audio_format if audio_capture else None,
             audio_offset_ms=offset_ms,
             work_dir=WORK_DIR,
             stats=stats,
         )
         screencaster.on_frame = streamer.publish_frame
         streamer.start()
-        streamer.wait_until_ready()
+        raw_out = os.environ.get("CAST_RAW_MPEGTS")
+        if raw_out:
+            # No HLS playlist/segments in raw mode; just give ffmpeg a beat to
+            # open its inputs, then record.
+            time.sleep(2.0)
+        else:
+            streamer.wait_until_ready()
 
         print(f"Recording {seconds:.0f}s of clapboard…")
         time.sleep(seconds)
@@ -202,6 +212,13 @@ def capture(seconds: float, offset_ms: int, page: Path) -> Path:
     print(stats.format_timeseries())
     print(stats.format_report(seconds))
     print("------------------------------------------------")
+
+    raw_out = os.environ.get("CAST_RAW_MPEGTS")
+    if raw_out:
+        combined = Path(raw_out)
+        if not combined.exists():
+            raise SystemExit(f"Raw mpegts file not produced: {raw_out}")
+        return combined
 
     segments = sorted(WORK_DIR.glob("seg*.ts"))
     if not segments:
@@ -236,9 +253,17 @@ def main() -> int:
         help="Page to cast (default: DOM clapboard; use tools/clapboard_video.html "
         "for the <video>-element path that matches YouTube).",
     )
+    parser.add_argument(
+        "--no-audio",
+        action="store_true",
+        help="Skip AudioTee (video only) to isolate whether audio mux causes the "
+        "queue backpressure. No A/V offset is measured; read the queue table.",
+    )
     args = parser.parse_args()
 
-    combined = args.analyze or capture(args.seconds, args.offset_ms, args.page)
+    combined = args.analyze or capture(
+        args.seconds, args.offset_ms, args.page, no_audio=args.no_audio
+    )
     print(f"\nAnalyzing {combined} …")
     flashes = find_flashes(combined)
     beeps = find_beeps(combined)

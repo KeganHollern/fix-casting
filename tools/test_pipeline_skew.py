@@ -85,6 +85,15 @@ def main() -> int:
     parser.add_argument("--clip", type=Path, default=CLIP)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
+    parser.add_argument(
+        "--buffered", action=argparse.BooleanOptionalAction, default=True,
+        help="HLSStreamer buffered mode (hls_time 4 vs 1).",
+    )
+    parser.add_argument(
+        "--audio-period", type=float, default=0.1,
+        help="Seconds per audio write (default 0.1 = smooth; larger = bursty, "
+        "to test whether jittery audio delivery reproduces the stall).",
+    )
     args = parser.parse_args()
 
     clip = args.clip
@@ -110,7 +119,7 @@ def main() -> int:
         width=args.width,
         height=args.height,
         fps=fps,
-        buffered=True,
+        buffered=args.buffered,
         audio_fd=audio_r,
         audio_format=fmt,
         audio_offset_ms=0,
@@ -121,11 +130,12 @@ def main() -> int:
     stop = threading.Event()
 
     def pump_audio() -> None:
-        # Write PCM at real-time pace in 100ms chunks, like AudioTee does, so
-        # the pipe fills/drains exactly as in production (incl. pre-roll drain).
-        # Loop the clip's audio so it lasts the whole recording; close the write
-        # end only when we stop, so ffmpeg keeps reading until then.
-        chunk = int(fmt.bytes_per_second * 0.1)
+        # Write PCM at real-time pace. Default 100ms chunks (metronomic, like an
+        # ideal feed). --audio-period N writes one N-second chunk every N
+        # seconds instead, to test whether a bursty/jittery audio feed (closer
+        # to how AudioTee may deliver) reproduces the production stall.
+        period = args.audio_period
+        chunk = int(fmt.bytes_per_second * period)
         pos = 0
         next_t = time.monotonic()
         try:
@@ -138,7 +148,7 @@ def main() -> int:
                     os.write(audio_w, piece)
                 except (BrokenPipeError, OSError):
                     break
-                next_t += 0.1
+                next_t += period
                 delay = next_t - time.monotonic()
                 if delay > 0:
                     stop.wait(delay)

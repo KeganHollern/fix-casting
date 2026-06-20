@@ -236,10 +236,14 @@ class HLSStreamer:
         # Frames sampled at an even cadence wait here for the writer thread to
         # push them into ffmpeg. Decoupling the two keeps sampling perfectly
         # paced even when an ffmpeg write stalls (HLS segment flush, keyframe),
-        # which is what otherwise distorts motion into judder.
+        # which is what otherwise distorts motion into judder. Bounded so a
+        # sustained stall can't grow latency without limit; when full,
+        # _enqueue_frame drops the oldest frame. In normal operation the queue
+        # sits at depth ~1 (ffmpeg drains immediately), so dropping never
+        # happens — see the analyzeduration note in _start_ffmpeg.
         self._frame_queue: deque[bytes] = deque()
         self._queue_cond = threading.Condition()
-        self._queue_maxlen = max(1, self.fps * 3)
+        self._queue_maxlen = max(1, self.fps)
 
     @property
     def playlist_url(self) -> str:
@@ -368,6 +372,15 @@ class HLSStreamer:
             return [
                 "-thread_queue_size",
                 "4096",
+                # The PCM format is fully specified below, so ffmpeg needs no
+                # stream analysis. Without these, ffmpeg waits to accumulate
+                # ~analyzeduration (5s default) of audio before it starts — and
+                # since audio arrives at real-time, that is a multi-second
+                # startup stall that backs video up and desyncs A/V.
+                "-probesize",
+                "32",
+                "-analyzeduration",
+                "0",
                 # Match AudioTee's actual native PCM format exactly so ffmpeg
                 # never misreads the bytes (wrong format == white noise) and
                 # nothing resamples.
@@ -496,6 +509,22 @@ class HLSStreamer:
             "-hide_banner",
             "-loglevel",
             "error",
+            # THE A/V SYNC FIX: don't let ffmpeg spend its default ~5s
+            # analyzeduration probing the MJPEG pipe before it starts. During
+            # that window ffmpeg doesn't drain pipe:0, so our frame queue fills
+            # and starts dropping frames; because video PTS is frame-count-based
+            # (-framerate below), every dropped frame shifts the video timeline
+            # earlier against the audio, producing a ~1s audio-ahead skew. The
+            # MJPEG format is fully known, so skip the probe and start at once —
+            # the queue then stays at depth ~1 and never drops. A buffered demux
+            # thread on the pipe (matching the audio input) keeps video flowing
+            # even if the transcode loop briefly waits on the real-time audio fd.
+            "-thread_queue_size",
+            "1024",
+            "-probesize",
+            "32",
+            "-analyzeduration",
+            "0",
             "-f",
             "image2pipe",
             "-vcodec",

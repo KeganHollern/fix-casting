@@ -1,7 +1,26 @@
 # A/V sync investigation — audio plays ~1s ahead of video on the cast
 
-_Status: root cause found and confirmed by measurement. Fix proposed, not yet
-applied._
+_Status: SOLVED. Root cause = ffmpeg's default 5s `analyzeduration` on the MJPEG
+video pipe. Fix applied and confirmed (offset ~0ms, no drops, no judder)._
+
+## TL;DR (the answer)
+
+ffmpeg spent its default ~5s `analyzeduration` probing the MJPEG `image2pipe`
+input before producing any output. During that window it did **not** drain our
+video pipe, so the frame queue filled and began **dropping** frames. Because
+video PTS is frame-count-based (`-framerate 30`), every dropped frame shifts the
+video timeline earlier relative to audio → ~1s audio-ahead skew.
+
+**Fix:** add `-probesize 32 -analyzeduration 0` to the **video** input in
+`_start_ffmpeg` (the format is fully known, so the probe is pure startup stall).
+With it, the queue stays at depth ~1, never drops, and output is synced (~0ms,
+measured +51/-8/+38/+52 across runs) with no judder. A `-thread_queue_size 1024`
+on the video pipe (matching the audio input) was kept as belt-and-suspenders.
+
+Everything below is the investigation trail, including several **wrong**
+conclusions reached by reasoning before the instrumented bisection found the
+real cause. The queue-depth theory in the later sections was a *symptom*, not the
+root cause — read the TL;DR above as the truth.
 
 ## The system (what we're debugging)
 
@@ -156,3 +175,52 @@ based on frame age rather than a fixed maxlen.
 - AudioTee delivers audio in 100 ms chunks, so audio arrives ~100 ms granular.
 - The source-side skew scales nothing here; the offset is content-independent
   because it's our queue depth, not anything about the media.
+
+---
+
+## FINAL bisection (how the real root cause was found)
+
+After the queue-depth theory failed to fully fix it, a systematic elimination —
+all run through the real CDP+AudioTee pipeline via
+`tools/measure_source_skew.py --page tools/clapboard_av_page.html`, reading the
+per-2s queue-depth + write-stall table — ruled out, by measurement:
+
+| Hypothesis tested | Result | Verdict |
+|---|---|---|
+| Queue too deep (drop-oldest) | offset tracked queue size but never hit 0 | symptom, not root |
+| `max_muxing_queue_size` (1024→9999) | no change | not it |
+| videotoolbox `-realtime 1` | no change | not it |
+| Encoder (forced libx264) | identical stalls | encoder-independent |
+| Video input `-thread_queue_size` | no change alone | not sufficient alone |
+| HLS segmenter (raw mpegts output) | identical stalls | output side innocent |
+| GOP change (keyframe-locked?) | stall period unchanged | not keyframe-locked |
+| Audio `analyzeduration 0` only | no change | wrong input |
+| Audio feed burstiness (file harness) | no change | not delivery cadence |
+| **Video `analyzeduration 0` + `probesize 32`** | **stall gone, queue=1, synced** | **ROOT CAUSE** |
+
+Key tell that cracked it: every real run was healthy (queue depth 1) for ~5s
+after ffmpeg spawn, then **one ~4s stall** filled the queue permanently. ~5s =
+ffmpeg's default `analyzeduration`. The stall was ffmpeg analyzing the **video**
+pipe (not audio, not the encoder, not HLS). The `--no-audio` run looked clean
+only because its `anullsrc` fallback is instantly available, so the queue had
+slack to absorb the analysis window without dropping — which misdirected the
+investigation toward "audio causes it" when audio was only the amplifier.
+
+Process lesson (stated honestly): every conclusion reached by *reasoning* during
+this investigation was wrong. Only the instrumented, single-variable bisection —
+plus being able to drive the real Chrome+AudioTee runs directly and read the
+queue-depth time-series — found the truth.
+
+## Tools added for driving/measuring (all under tools/)
+
+- `measure_source_skew.py` — full real pipeline; per-pulse A/V offset + per-2s
+  queue-depth/write-stall table + lifecycle traces. `--no-audio`, `--page`.
+- `test_pipeline_skew.py` — Chrome-free: synced clip through the real
+  `HLSStreamer`. `--clip/--width/--height/--audio-period` (burst test).
+- `serve_synced_hls.py` — serves the synced clip through the real path over HTTP
+  to eyeball sync in VLC (`--offset-ms` proves the harness is sensitive).
+- `probe_input_skew.py` — records CDP video + AudioTee audio separately and
+  measures skew at the input boundary (no mux).
+- `test_cdp_delay.py`, `cdp_clock.html` — CDP capture-delay eyeball test.
+- clapboard assets: `clapboard_clip*.mp4` (flash+beep, 8s period),
+  `clapboard_av_page.html`, `timecode_clip.mp4`.
