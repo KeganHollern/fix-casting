@@ -144,7 +144,10 @@ def capture(seconds: float, offset_ms: int, page: Path, no_audio: bool = False) 
 
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     for old in WORK_DIR.glob("*"):
-        old.unlink()
+        if old.is_dir():
+            shutil.rmtree(old, ignore_errors=True)
+        else:
+            old.unlink(missing_ok=True)
 
     url = page.resolve().as_uri()
     print(f"Capturing {url}")
