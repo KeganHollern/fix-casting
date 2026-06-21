@@ -259,6 +259,29 @@ def capture(seconds: float, offset_ms: int, page: Path, no_audio: bool = False) 
     return combined
 
 
+def find_silence_gaps(
+    input_path: Path, noise_db: float = -50.0, min_dur: float = 0.3
+) -> list[tuple[float, float]]:
+    """(start, duration) of every silence gap in the audio. For a CONTINUOUS-
+    audio source any gap is a dropout/choppiness — the thing a timing-only
+    check misses. Returns [] for clean continuous audio."""
+    stderr = _run_ffmpeg_filter(
+        input_path, ["-af", f"silencedetect=noise={noise_db}dB:d={min_dur}"]
+    )
+    gaps: list[tuple[float, float]] = []
+    start: float | None = None
+    for line in stderr.splitlines():
+        m = re.search(r"silence_start:\s*(-?[0-9.]+)", line)
+        if m:
+            start = float(m.group(1))
+            continue
+        m = re.search(r"silence_duration:\s*([0-9.]+)", line)
+        if m and start is not None:
+            gaps.append((start, float(m.group(1))))
+            start = None
+    return gaps
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seconds", type=float, default=30.0)
@@ -288,12 +311,36 @@ def main() -> int:
         help="Skip AudioTee (video only) to isolate whether audio mux causes the "
         "queue backpressure. No A/V offset is measured; read the queue table.",
     )
+    parser.add_argument(
+        "--continuity",
+        action="store_true",
+        help="Continuity mode: scan the output for silence gaps (audio "
+        "dropouts/choppiness) instead of flash/beep timing. Use with a "
+        "CONTINUOUS-audio source (tools/continuous_tone_page.html); any gap is "
+        "a dropout. This is the check a timing-only test misses.",
+    )
     args = parser.parse_args()
 
     combined = args.analyze or capture(
         args.seconds, args.offset_ms, args.page, no_audio=args.no_audio
     )
     print(f"\nAnalyzing {combined} …")
+
+    if args.continuity:
+        gaps = find_silence_gaps(combined)
+        total = sum(d for _, d in gaps)
+        print(
+            f"\nContinuity check: {len(gaps)} silence gap(s) ≥0.3s, "
+            f"total {total:.1f}s of dropout."
+        )
+        for s, d in gaps[:25]:
+            print(f"  gap at {s:6.1f}s for {d:.2f}s")
+        if not gaps:
+            print("=> AUDIO CONTINUOUS over the run — no dropouts. PASS.")
+            return 0
+        print(f"=> AUDIO HAS {len(gaps)} DROPOUT(S) — choppy. FAIL.")
+        return 1
+
     flashes = find_flashes(combined)
     beeps = find_beeps(combined)
     print(f"Detected {len(flashes)} flashes, {len(beeps)} beeps.")
@@ -333,6 +380,19 @@ def main() -> int:
             f"\ndrift check: first-half {first:+.0f}ms → second-half {last:+.0f}ms "
             f"(delta {delta:+.0f}ms across the run)"
         )
+        # The two half-medians are centred at ~1/4 and ~3/4 of the run, so they
+        # are separated by ~half the flash-time span. Turn that into a drift
+        # rate and a clock-error ppm — the number that sizes a constant-rate
+        # resample correction (negative delta = audio leading = device fast).
+        span_s = (flashes[-1] - flashes[0]) if len(flashes) >= 2 else args.seconds
+        if span_s > 0:
+            rate_ms_per_min = delta / (span_s / 2) * 60
+            ppm = delta / (span_s / 2) * 1000  # 1 ms/s == 1000 ppm
+            print(
+                f"   drift rate ≈ {rate_ms_per_min:+.1f} ms/min "
+                f"(clock error ≈ {ppm:+.0f} ppm; "
+                f"audio {'leads' if delta < 0 else 'lags'})"
+            )
         if abs(delta) > 80:
             print("=> OFFSET IS DRIFTING over the run (not a fixed baseline).")
         else:

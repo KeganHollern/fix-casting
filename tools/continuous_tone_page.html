@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>continuity test — continuous tone</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+    #bar { position: absolute; top: 45%; width: 80px; height: 80px; background: #0f0; }
+    #label { position: absolute; left: 12px; bottom: 12px; color: #0f0;
+             font: 20px monospace; }
+  </style>
+</head>
+<body>
+  <div id="bar"></div>
+  <div id="label">continuity: continuous 330 Hz</div>
+  <script>
+    // A continuous Web Audio tone — never silent — so any silence in the
+    // captured HLS output is a real audio dropout (choppiness), not content.
+    // Captured by AudioTee exactly like a <video>/<audio> element's output.
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    const ctx = new Ctx();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = "sine";
+    osc.frequency.value = 330;
+    gain.gain.value = 0.2;
+    osc.connect(gain).connect(ctx.destination);
+    osc.start();
+
+    function resume() { if (ctx.state !== "running") ctx.resume(); }
+    resume();
+    // Autoplay flags usually let it start; nudge on any gesture as a fallback
+    // (the capture harness clicks the page while attaching audio).
+    ["click", "keydown", "pointerdown", "visibilitychange"].forEach((e) =>
+      document.addEventListener(e, resume)
+    );
+
+    // Moving bar gives the screencast real motion (so the video path behaves
+    // like normal content while we test audio continuity).
+    const bar = document.getElementById("bar");
+    function tick() {
+      const x = (performance.now() / 6) % (window.innerWidth - 80);
+      bar.style.left = x + "px";
+      requestAnimationFrame(tick);
+    }
+    tick();
+  </script>
+</body>
+</html>
