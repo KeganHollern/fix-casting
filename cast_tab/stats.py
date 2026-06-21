@@ -28,6 +28,60 @@ class _Window:
 
 
 @dataclass
+class StatsSnapshot:
+    """One interval's worth of metrics, grouped by pipeline segment.
+
+    Produced by PipelineStats.snapshot(); consumed by both the text report and
+    the TUI so there is a single collect-and-reset path.
+    """
+
+    interval_s: float
+    target_fps: float
+    # --- Capture (CDP screencast + AudioTee, incoming) ---
+    capture_fps: float
+    capture_ms: float
+    capture_peak_ms: float
+    behind: int
+    errors: int
+    timeouts: int
+    screencast_lag_ms: float
+    screencast_lag_peak_ms: float
+    screencast_lag_count: int
+    audio_backlog_ms: float | None
+    audio_backlog_peak_ms: float
+    audio_warnings: int
+    audio_last_warning: str | None
+    # --- Encode pipeline (sampler -> queue -> ffmpeg stdin, internal) ---
+    encode_fps: float
+    frame_age_ms: float
+    frame_age_peak_ms: float
+    write_ms: float
+    write_peak_ms: float
+    queue_peak: int
+    queue_dropped: int
+    repeats: int
+    resyncs: int
+    ffmpeg_restarts: int
+    # --- Sync (cumulative) ---
+    dropped_total: int
+    restarts_total: int
+    drift_ms: float
+    # --- HLS (outgoing) ---
+    hls_count: int
+    hls_age: float | None
+    hls_deleted: int
+    # --- TV / Chromecast (playback) ---
+    tv_state: str
+    tv_pos: float | None
+    tv_idle: str | None
+    tv_polls: int
+    tv_non_playing: int
+    tv_non_playing_states: dict
+    pos_delta: float | None
+    stall_accum: float
+
+
+@dataclass
 class PipelineStats:
     """Thread-safe counters for each stage of the cast pipeline."""
 
@@ -261,50 +315,63 @@ class PipelineStats:
 
         return events
 
-    def format_report(self, interval_s: float) -> str:
+    def snapshot(self, interval_s: float) -> StatsSnapshot:
+        """Collect this interval's metrics into a struct and reset the windows.
+
+        Single collect-and-reset path shared by the text report and the TUI.
+        """
         with self._lock:
-            capture_fps = self._capture.count / interval_s if interval_s > 0 else 0.0
-            encode_fps = self._encode.count / interval_s if interval_s > 0 else 0.0
-
-            capture_ms = self._capture.avg() * 1000
-            capture_peak_ms = self._capture.peak * 1000
-            screencast_lag_ms = self._screencast_lag.avg() * 1000
-            screencast_lag_peak_ms = self._screencast_lag.peak * 1000
-            screencast_lag_count = self._screencast_lag.count
-            audio_backlog_ms = self._audio_backlog_ms
-            audio_backlog_peak_ms = self._audio_backlog_peak_ms
-            frame_age_ms = self._frame_age.avg() * 1000
-            frame_age_peak_ms = self._frame_age.peak * 1000
-            write_ms = self._encode_write.avg() * 1000
-            write_peak_ms = self._encode_write.peak * 1000
-
-            behind = self._capture_behind
-            errors = self._capture_errors
-            timeouts = self._capture_timeouts
-            repeats = self._encode_repeats
-            resyncs = self._encode_resyncs
-            queue_peak = self._queue_peak
-            queue_dropped = self._queue_dropped
-            ffmpeg_restarts = self._ffmpeg_restarts
-            dropped_total = self._queue_dropped_total
-            restarts_total = self._ffmpeg_restarts_total
-            audio_warnings = self._audio_warnings
-            audio_last_warning = self._audio_last_warning
-            hls_count = self._hls_segment_count
-            hls_age = self._hls_segment_age_s
-            hls_deleted = self._hls_segments_deleted
-            tv_state = self._tv_state or "unknown"
             tv_pos = self._tv_position_s
-            tv_idle = self._tv_idle_reason
-            tv_polls = self._tv_polls
-            tv_non_playing = self._tv_non_playing_polls
-            tv_non_playing_states = dict(self._tv_non_playing_states)
             interval_start_pos = self._tv_interval_start_pos_s
-            stall_accum = self._tv_stall_accum_s
-
             pos_delta: float | None = None
             if tv_pos is not None and interval_start_pos is not None:
                 pos_delta = tv_pos - interval_start_pos
+            dropped_total = self._queue_dropped_total
+            drift_ms = (
+                dropped_total / self.target_fps * 1000 if self.target_fps else 0.0
+            )
+
+            snap = StatsSnapshot(
+                interval_s=interval_s,
+                target_fps=self.target_fps,
+                capture_fps=self._capture.count / interval_s if interval_s > 0 else 0.0,
+                capture_ms=self._capture.avg() * 1000,
+                capture_peak_ms=self._capture.peak * 1000,
+                behind=self._capture_behind,
+                errors=self._capture_errors,
+                timeouts=self._capture_timeouts,
+                screencast_lag_ms=self._screencast_lag.avg() * 1000,
+                screencast_lag_peak_ms=self._screencast_lag.peak * 1000,
+                screencast_lag_count=self._screencast_lag.count,
+                audio_backlog_ms=self._audio_backlog_ms,
+                audio_backlog_peak_ms=self._audio_backlog_peak_ms,
+                audio_warnings=self._audio_warnings,
+                audio_last_warning=self._audio_last_warning,
+                encode_fps=self._encode.count / interval_s if interval_s > 0 else 0.0,
+                frame_age_ms=self._frame_age.avg() * 1000,
+                frame_age_peak_ms=self._frame_age.peak * 1000,
+                write_ms=self._encode_write.avg() * 1000,
+                write_peak_ms=self._encode_write.peak * 1000,
+                queue_peak=self._queue_peak,
+                queue_dropped=self._queue_dropped,
+                repeats=self._encode_repeats,
+                resyncs=self._encode_resyncs,
+                ffmpeg_restarts=self._ffmpeg_restarts,
+                dropped_total=dropped_total,
+                restarts_total=self._ffmpeg_restarts_total,
+                drift_ms=drift_ms,
+                hls_count=self._hls_segment_count,
+                hls_age=self._hls_segment_age_s,
+                hls_deleted=self._hls_segments_deleted,
+                tv_state=self._tv_state or "unknown",
+                tv_pos=tv_pos,
+                tv_idle=self._tv_idle_reason,
+                tv_polls=self._tv_polls,
+                tv_non_playing=self._tv_non_playing_polls,
+                tv_non_playing_states=dict(self._tv_non_playing_states),
+                pos_delta=pos_delta,
+                stall_accum=self._tv_stall_accum_s,
+            )
 
             self._capture.reset()
             self._capture_behind = 0
@@ -330,52 +397,52 @@ class PipelineStats:
             if tv_pos is not None:
                 self._tv_interval_start_pos_s = tv_pos
 
+        return snap
+
+    def format_report(self, interval_s: float) -> str:
+        s = self.snapshot(interval_s)
+
         capture_line = (
-            f"capture {capture_fps:.1f}/{self.target_fps:.0f} fps, "
-            f"capture avg {capture_ms:.0f}ms peak {capture_peak_ms:.0f}ms"
-            + (f", behind {behind}x" if behind else "")
-            + (f", timeouts {timeouts}" if timeouts else "")
-            + (f", errors {errors}" if errors else "")
+            f"capture {s.capture_fps:.1f}/{s.target_fps:.0f} fps, "
+            f"capture avg {s.capture_ms:.0f}ms peak {s.capture_peak_ms:.0f}ms"
+            + (f", behind {s.behind}x" if s.behind else "")
+            + (f", timeouts {s.timeouts}" if s.timeouts else "")
+            + (f", errors {s.errors}" if s.errors else "")
         )
-        if screencast_lag_count:
+        if s.screencast_lag_count:
             capture_line += (
-                f", chrome→app lag avg {screencast_lag_ms:.0f}ms "
-                f"peak {screencast_lag_peak_ms:.0f}ms"
+                f", chrome→app lag avg {s.screencast_lag_ms:.0f}ms "
+                f"peak {s.screencast_lag_peak_ms:.0f}ms"
             )
 
         lines = [
             capture_line,
             (
-                f"encode  {encode_fps:.1f}/{self.target_fps:.0f} fps to ffmpeg, "
-                f"frame age avg {frame_age_ms:.0f}ms peak {frame_age_peak_ms:.0f}ms, "
-                f"stdin write avg {write_ms:.1f}ms peak {write_peak_ms:.1f}ms"
-                + (f", queue peak {queue_peak}" if queue_peak else "")
-                + (f", dropped {queue_dropped}" if queue_dropped else "")
-                + (f", repeats {repeats}" if repeats else "")
-                + (f", resyncs {resyncs}" if resyncs else "")
-                + (f", ffmpeg restarts {ffmpeg_restarts}" if ffmpeg_restarts else "")
+                f"encode  {s.encode_fps:.1f}/{s.target_fps:.0f} fps to ffmpeg, "
+                f"frame age avg {s.frame_age_ms:.0f}ms peak {s.frame_age_peak_ms:.0f}ms, "
+                f"stdin write avg {s.write_ms:.1f}ms peak {s.write_peak_ms:.1f}ms"
+                + (f", queue peak {s.queue_peak}" if s.queue_peak else "")
+                + (f", dropped {s.queue_dropped}" if s.queue_dropped else "")
+                + (f", repeats {s.repeats}" if s.repeats else "")
+                + (f", resyncs {s.resyncs}" if s.resyncs else "")
+                + (f", ffmpeg restarts {s.ffmpeg_restarts}" if s.ffmpeg_restarts else "")
             ),
         ]
 
-        hls_line = f"hls     {hls_count} segments"
-        if hls_age is not None:
-            hls_line += f", newest segment {hls_age:.1f}s old"
-        if hls_deleted:
-            hls_line += f", deleted {hls_deleted}"
+        hls_line = f"hls     {s.hls_count} segments"
+        if s.hls_age is not None:
+            hls_line += f", newest segment {s.hls_age:.1f}s old"
+        if s.hls_deleted:
+            hls_line += f", deleted {s.hls_deleted}"
         lines.append(hls_line)
 
-        # Cumulative A/V drift estimate: each dropped video frame removes a
-        # frame of timeline under frame-count PTS, pulling audio permanently
-        # ahead. ffmpeg restarts are reported separately — they re-anchor A/V
-        # (resetting drift) but cause a visible playback glitch. fps==target.
-        drift_ms = dropped_total / self.target_fps * 1000 if self.target_fps else 0.0
-        if dropped_total or restarts_total:
+        if s.dropped_total or s.restarts_total:
             sync_line = (
-                f"sync    est. audio lead ~{drift_ms:.0f}ms "
-                f"({dropped_total} frames dropped since start)"
+                f"sync    est. audio lead ~{s.drift_ms:.0f}ms "
+                f"({s.dropped_total} frames dropped since start)"
                 + (
-                    f", {restarts_total} ffmpeg restarts (glitch+re-anchor)"
-                    if restarts_total
+                    f", {s.restarts_total} ffmpeg restarts (glitch+re-anchor)"
+                    if s.restarts_total
                     else ""
                 )
             )
@@ -384,42 +451,44 @@ class PipelineStats:
         lines.append(sync_line)
 
         audio_bits: list[str] = []
-        if audio_backlog_ms is not None:
+        if s.audio_backlog_ms is not None:
             audio_bits.append(
-                f"pipe backlog {audio_backlog_ms:.0f}ms peak {audio_backlog_peak_ms:.0f}ms"
+                f"pipe backlog {s.audio_backlog_ms:.0f}ms "
+                f"peak {s.audio_backlog_peak_ms:.0f}ms"
             )
-        if audio_warnings:
-            warn = f"{audio_warnings} warnings this interval"
-            if audio_last_warning:
-                warn += f' (last: "{audio_last_warning}")'
+        if s.audio_warnings:
+            warn = f"{s.audio_warnings} warnings this interval"
+            if s.audio_last_warning:
+                warn += f' (last: "{s.audio_last_warning}")'
             audio_bits.append(warn)
         if audio_bits:
             lines.append("audio   " + ", ".join(audio_bits))
 
-        tv_line = f"tv      {tv_state}"
-        if tv_idle and tv_state != "PLAYING":
-            tv_line += f", idle {tv_idle}"
-        if tv_pos is not None:
-            tv_line += f", playback position {tv_pos:.0f}s"
-        if pos_delta is not None:
-            tv_line += f", position +{pos_delta:.0f}s/{interval_s:.0f}s"
-            interval_stall = max(0.0, interval_s - pos_delta)
+        tv_line = f"tv      {s.tv_state}"
+        if s.tv_idle and s.tv_state != "PLAYING":
+            tv_line += f", idle {s.tv_idle}"
+        if s.tv_pos is not None:
+            tv_line += f", playback position {s.tv_pos:.0f}s"
+        if s.pos_delta is not None:
+            tv_line += f", position +{s.pos_delta:.0f}s/{interval_s:.0f}s"
+            interval_stall = max(0.0, interval_s - s.pos_delta)
             if interval_stall >= 2.0:
                 tv_line += f", stall ~{interval_stall:.0f}s"
-            elif pos_delta > interval_s + 2.0:
-                tv_line += f", catch-up +{pos_delta - interval_s:.0f}s"
-        if stall_accum >= 2.0:
-            tv_line += f", micro-stalls ~{stall_accum:.0f}s"
-        if tv_polls:
-            tv_line += f", polls {tv_polls}"
-        if tv_non_playing:
+            elif s.pos_delta > interval_s + 2.0:
+                tv_line += f", catch-up +{s.pos_delta - interval_s:.0f}s"
+        if s.stall_accum >= 2.0:
+            tv_line += f", micro-stalls ~{s.stall_accum:.0f}s"
+        if s.tv_polls:
+            tv_line += f", polls {s.tv_polls}"
+        if s.tv_non_playing:
             reasons = ", ".join(
                 f"{label} x{count}"
                 for label, count in sorted(
-                    tv_non_playing_states.items(), key=lambda item: (-item[1], item[0])
+                    s.tv_non_playing_states.items(),
+                    key=lambda item: (-item[1], item[0]),
                 )
             )
-            tv_line += f", non-playing {tv_non_playing}/{tv_polls} ({reasons})"
+            tv_line += f", non-playing {s.tv_non_playing}/{s.tv_polls} ({reasons})"
         lines.append(tv_line)
 
         return "\n".join(f"[stats] {line}" for line in lines)

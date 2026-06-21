@@ -502,6 +502,22 @@ class HLSStreamer:
                 self._ffmpeg.wait(timeout=3)
         self._ffmpeg = None
 
+    def set_audio_offset_ms(self, offset_ms: int) -> int:
+        """Change the A/V audio delay live and apply it.
+
+        The delay is an adelay filter baked into the ffmpeg command, so applying
+        a new value means relaunching ffmpeg (a brief glitch + buffer refill).
+        Returns the value actually applied (unchanged → no relaunch). Negative
+        values are clamped to 0 (audio is only ever ahead, never behind).
+        """
+        offset_ms = max(0, int(offset_ms))
+        if offset_ms == self.audio_offset_ms:
+            return offset_ms
+        self.audio_offset_ms = offset_ms
+        if not self._stopped.is_set():
+            self._relaunch_ffmpeg()
+        return offset_ms
+
     def _relaunch_ffmpeg(self) -> None:
         with self._ffmpeg_lock:
             self._kill_ffmpeg()

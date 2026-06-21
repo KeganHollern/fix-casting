@@ -78,6 +78,7 @@ cast <url> [options]
   --stats                 Print pipeline timing stats every 10s (diagnose lag)
   --stats-interval SEC    Seconds between stats reports (default: 10)
   --tv-poll-interval SEC  Seconds between Chromecast status polls when --stats is set (default: 2)
+  --tui                   Live full-screen dashboard of all stats + audio-offset knob
 ```
 
 Video is always encoded as H.264 (universally supported on Chromecast) and
@@ -120,6 +121,32 @@ Dial in lip-sync if audio leads video (positive delays audio):
 ```bash
 cast --audio-offset-ms 200 "https://example.com"
 ```
+
+Live dashboard with a real-time audio-offset knob:
+
+```bash
+cast --tui "https://example.com"
+```
+
+### Live dashboard (`--tui`)
+
+`--tui` replaces the scrolling `--stats` text with a full-screen
+[Textual](https://textual.textualize.io/) dashboard. Every metric shows a
+number, a sparkline of its recent history, and a one-line description, grouped
+by pipeline segment:
+
+- **① Capture** — CDP screencast + AudioTee (incoming): capture FPS,
+  Chrome→app frame lag, decode time, audio pipe backlog, audio warnings.
+- **② Encode pipeline** (internal): encode FPS, frame age, queue depth, ffmpeg
+  stdin-write time, repeats/resyncs.
+- **③ HLS stream** (outgoing): segment count, newest-segment age, rotation.
+- **④ TV / Chromecast** (playback): state, position, advance-vs-wall-clock,
+  micro-stalls, non-playing polls.
+- **⑤ A/V sync**: cumulative audio-lead drift, frames dropped, ffmpeg restarts.
+
+The **audio-offset knob** at the bottom (`-100 / -10 / +10 / +100` ms) adjusts
+lip-sync live; changes apply after presses settle (one quick ffmpeg re-sync, so
+expect a brief glitch). Press `q` to stop the cast and exit.
 
 ### Finding your max quality (bitrate vs. network)
 

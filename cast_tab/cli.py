@@ -128,6 +128,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=2.0,
         help="Seconds between Chromecast status polls when --stats is set (default: 2)",
     )
+    parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="Show a live full-screen dashboard of all pipeline stats with a "
+        "real-time audio-offset knob (instead of the scrolling --stats text).",
+    )
     args = parser.parse_args(argv)
     if args.video_bitrate is not None and args.video_bitrate <= 0:
         parser.error("--video-bitrate must be greater than 0 (Mbps)")
@@ -152,7 +158,9 @@ def main(argv: list[str] | None = None) -> int:
         else default_jpeg_quality(args.width, args.height)
     )
     capture_audio = not args.no_audio
-    stats = PipelineStats(target_fps=float(encode_fps)) if args.stats else None
+    # The TUI is a live view of the same stats, so it needs them collected too.
+    collect_stats = args.stats or args.tui
+    stats = PipelineStats(target_fps=float(encode_fps)) if collect_stats else None
 
     screencaster = TabScreencaster(
         args.url,
@@ -300,6 +308,21 @@ def main(argv: list[str] | None = None) -> int:
 
         caster.connect()
         caster.play_hls(streamer.playlist_url)
+
+        if args.tui:
+            # Full-screen dashboard owns the terminal and its own poll loop.
+            from cast_tab.tui import run_tui
+
+            run_tui(
+                stats=stats,
+                streamer=streamer,
+                caster=caster,
+                initial_offset_ms=args.audio_offset_ms,
+                tv_poll_interval=args.tv_poll_interval,
+                playlist_url=streamer.playlist_url,
+            )
+            shutdown()
+            return 0
 
         print("Casting. Press Ctrl+C to stop.")
         print(f"Source page: {args.url}")
