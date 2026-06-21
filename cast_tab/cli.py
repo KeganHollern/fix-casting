@@ -93,6 +93,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Disable tab audio capture (video only)",
     )
     parser.add_argument(
+        "--adblock",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Block ads/trackers in the captured tab using uBlock Origin's "
+            "default filter lists + EasyList (default: on). Use --no-adblock "
+            "to disable."
+        ),
+    )
+    parser.add_argument(
         "--audio-offset-ms",
         type=int,
         default=0,
@@ -175,6 +185,13 @@ def main(argv: list[str] | None = None) -> int:
     collect_stats = args.stats or args.tui
     stats = PipelineStats(target_fps=float(encode_fps)) if collect_stats else None
 
+    adblock_engine = None
+    if args.adblock:
+        from cast_tab.adblocking import build_engine
+
+        print("Loading ad-block filter lists...")
+        adblock_engine = build_engine()
+
     screencaster = TabScreencaster(
         args.url,
         width=args.width,
@@ -186,6 +203,7 @@ def main(argv: list[str] | None = None) -> int:
         headless=args.headless,
         capture_audio=capture_audio,
         stats=stats,
+        adblock_engine=adblock_engine,
     )
     streamer: HLSStreamer | None = None
     audio_capture: AudioCapture | None = None

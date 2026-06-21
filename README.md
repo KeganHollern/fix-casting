@@ -73,6 +73,8 @@ cast <url> [options]
                           Buffered mode for quality vs latency (default: buffered)
   --no-audio              Video only, skip tab audio capture
   --audio-offset-ms MS    Manual A/V trim; positive delays audio (default: 0)
+  --adblock / --no-adblock
+                          Block ads/trackers in the captured tab (default: on)
   --headless              Hide the local browser window (may break some players)
   --discovery-timeout SEC Seconds to search for devices (default: 5)
   --stats                 Print pipeline timing stats every 10s (diagnose lag)
@@ -158,6 +160,17 @@ The **audio-offset knob** at the bottom adjusts lip-sync live. Use the
 Changes apply after presses settle (one quick ffmpeg re-sync, so expect a brief
 glitch). Note that the buffered HLS delay means an offset change takes ~the
 buffer length to become visible on the TV — adjust in small steps.
+
+### Ad blocking (`--adblock`)
+
+On by default: the captured tab runs ad/tracker blocking so ads don't appear in
+what you cast (and don't waste bitrate). It uses [`adblock`](https://github.com/brave/adblock-rust)
+(Brave's adblock-rust engine — the same family as `@ghostery/adblocker`) driven
+by **uBlock Origin's default filter lists + EasyList/EasyPrivacy**, applied via
+Playwright request interception (network blocking) plus per-page cosmetic hiding.
+Lists are fetched once and cached for a day in `~/.cache/fix-casting/adblock`.
+Use `--no-adblock` to turn it off. Effectiveness on any given site depends on its
+ad setup; network-level ads/trackers are blocked reliably.
 
 ### Finding your max quality (bitrate vs. network)
 
