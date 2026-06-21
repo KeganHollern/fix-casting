@@ -398,15 +398,7 @@ class HLSStreamer:
 
     def _audio_input_args(self) -> list[str]:
         if self.audio_fd is not None:
-            # Clock-drift fix: stamp the audio pipe with wall-clock read times so
-            # ffmpeg has a real-time reference to resample against (see
-            # _audio_delay_filter_args). A raw pipe otherwise has no real clock,
-            # so ffmpeg trusts the nominal 48000 Hz and AudioTee's true device
-            # rate (~100ppm off) drifts audio ahead of video over long runs —
-            # measured ~1s of audio-lead over 18min without this; flat with it.
             return [
-                "-use_wallclock_as_timestamps",
-                "1",
                 "-thread_queue_size",
                 "4096",
                 # The PCM format is fully specified below, so ffmpeg needs no
@@ -450,28 +442,18 @@ class HLSStreamer:
         filter graph instead. adelay only adds delay, which is all we need: the
         skew is always audio-ahead.
         """
-        if self.audio_fd is None:
+        if self.audio_fd is None or self.audio_offset_ms == 0:
             return []
-        # Clock-drift fix: with wall-clock input timestamps (set in
-        # _audio_input_args), rebase audio to start at 0 (asetpts) so it still
-        # anchors with video frame 0, then async-resample so the sample data is
-        # stretched/squeezed to match the real-time stamps — locking audio to
-        # the system clock and cancelling the device-clock drift. async=1000
-        # caps the correction well above the observed ~5 samples/s drift.
-        chain: list[str] = ["asetpts=PTS-STARTPTS", "aresample=async=1000"]
         if self.audio_offset_ms < 0:
             print(
                 "A/V sync: negative --audio-offset-ms is not supported "
                 "(audio is structurally ahead, never behind); ignoring.",
                 flush=True,
             )
-        elif self.audio_offset_ms > 0:
-            delay_ms = min(self.audio_offset_ms, int(MAX_AUTO_AV_OFFSET_S * 1000))
-            print(f"A/V sync: delaying audio {delay_ms}ms (adelay).", flush=True)
-            chain.append(f"adelay={delay_ms}:all=1")
-        if not chain:
             return []
-        return ["-af", ",".join(chain)]
+        delay_ms = min(self.audio_offset_ms, int(MAX_AUTO_AV_OFFSET_S * 1000))
+        print(f"A/V sync: delaying audio {delay_ms}ms (adelay).", flush=True)
+        return ["-af", f"adelay={delay_ms}:all=1"]
 
     def _drain_audio_fd(self) -> None:
         """Discard PCM that buffered in the pipe before ffmpeg attaches.
