@@ -132,8 +132,9 @@ cast --tui "https://example.com"
 
 `--tui` replaces the scrolling `--stats` text with a full-screen
 [Textual](https://textual.textualize.io/) dashboard. Every metric shows a
-number, a sparkline of its recent history, and a one-line description, grouped
-by pipeline segment:
+number, a sparkline of its recent history, and a one-line description, and turns
+**yellow → red** as it degrades. A status bar at the top gives an at-a-glance
+health dot per segment. Metrics are grouped by pipeline segment:
 
 - **① Capture** — CDP screencast + AudioTee (incoming): capture FPS,
   Chrome→app frame lag, decode time, audio pipe backlog, audio warnings.
@@ -144,9 +145,19 @@ by pipeline segment:
   micro-stalls, non-playing polls.
 - **⑤ A/V sync**: cumulative audio-lead drift, frames dropped, ffmpeg restarts.
 
-The **audio-offset knob** at the bottom (`-100 / -10 / +10 / +100` ms) adjusts
-lip-sync live; changes apply after presses settle (one quick ffmpeg re-sync, so
-expect a brief glitch). Press `q` to stop the cast and exit.
+The **audio-offset knob** at the bottom adjusts lip-sync live. Use the
+`-100 / -10 / +10 / +100` ms buttons or the keyboard:
+
+| Key | Action |
+|---|---|
+| `[` / `]` | audio offset −10 / +10 ms |
+| `{` / `}` | audio offset −100 / +100 ms |
+| `r` | reset offset to 0 |
+| `q` | stop the cast and exit |
+
+Changes apply after presses settle (one quick ffmpeg re-sync, so expect a brief
+glitch). Note that the buffered HLS delay means an offset change takes ~the
+buffer length to become visible on the TV — adjust in small steps.
 
 ### Finding your max quality (bitrate vs. network)
 
