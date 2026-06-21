@@ -55,9 +55,9 @@ def codec_label() -> str:
 
 
 def default_jpeg_quality(width: int, height: int) -> int:
-    if width * height >= 1920 * 1080:
-        return 75
-    return 80
+    # 92 keeps the capture crisp so the (mostly local-CPU) JPEG stage isn't the
+    # quality bottleneck when there's H.264 bitrate to carry the detail.
+    return 92
 
 
 def _target_bitrate(
@@ -81,7 +81,7 @@ def _target_bitrate(
         return (f"{v:g}M", f"{v * 1.1:g}M", f"{v * 1.1:g}M")
     pixels = width * height
     if pixels >= 1920 * 1080:
-        return ("5M", "6M", "12M") if buffered else ("4.5M", "5M", "5M")
+        return ("15M", "18M", "36M") if buffered else ("15M", "16.5M", "16.5M")
     if pixels >= 1280 * 720:
         return ("3M", "3.5M", "8M") if buffered else ("2.5M", "3M", "3M")
     return ("1.5M", "2M", "4M") if buffered else ("1.5M", "2M", "2M")

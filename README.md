@@ -67,8 +67,8 @@ cast <url> [options]
   --width WIDTH           Viewport width (default: 1920)
   --height HEIGHT         Viewport height (default: 1080)
   --fps FPS               Encode frame rate (default: 30 buffered, 23–24 unbuffered)
-  --jpeg-quality Q        Tab-capture JPEG quality 1–100 (default: 75 at 1080p+, 80 otherwise)
-  --video-bitrate MBPS    Override H.264 target bitrate in Mbps (default: by resolution, ~5 at 1080p)
+  --jpeg-quality Q        Tab-capture JPEG quality 1–100 (default: 92)
+  --video-bitrate MBPS    Override H.264 target bitrate in Mbps (default: by resolution, 15 at 1080p)
   --buffered / --no-buffered
                           Buffered mode for quality vs latency (default: buffered)
   --no-audio              Video only, skip tab audio capture

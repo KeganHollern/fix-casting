@@ -61,8 +61,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         metavar="Q",
         help=(
-            "JPEG quality (1-100) for tab capture (default: 75 at 1080p+, 80 "
-            "otherwise). Higher = sharper but more CPU/bandwidth."
+            "JPEG quality (1-100) for tab capture (default: 92). Higher = "
+            "sharper but more CPU/bandwidth."
         ),
     )
     parser.add_argument(
@@ -72,8 +72,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="MBPS",
         help=(
             "Override the H.264 target bitrate in Mbps (default: chosen by "
-            "resolution, e.g. 5 at 1080p). Raise it with --stats to find how "
-            "high your Chromecast's network sustains before it buffers."
+            "resolution, 15 at 1080p). Raise it with --stats to find how high "
+            "your Chromecast's network sustains before it buffers."
         ),
     )
     parser.add_argument(
