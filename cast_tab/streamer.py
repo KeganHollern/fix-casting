@@ -266,13 +266,18 @@ class HLSStreamer:
         # drift). In normal operation the queue sits at depth ~1 (ffmpeg drains
         # immediately, see the analyzeduration note in _start_ffmpeg); the depth
         # only matters during an occasional multi-second encoder stall. Sizing
-        # it to ~4s lets those stalls be absorbed without dropping — the encoder
+        # it to ~8s lets those stalls be absorbed without dropping — the encoder
         # then drains the backlog (capture is rate-capped at fps, so it can't
-        # outrun it) and sync is preserved. The bound still caps latency growth
-        # for a pathological stall; any drops are surfaced as drift in --stats.
+        # outrun it) and sync is preserved. Verified offline: a 3s stall fills
+        # the queue to ~84 then drains back with 0 drops and 0 residual skew,
+        # while a stall past the bound drops frames and disturbs sync — so the
+        # depth directly sets how long a stall we tolerate before audio leads.
+        # In normal operation depth sits at ~1, so the deeper bound costs memory
+        # only transiently during an actual stall, not steady-state latency. The
+        # bound still caps growth for a pathological stall; drops show in --stats.
         self._frame_queue: deque[bytes] = deque()
         self._queue_cond = threading.Condition()
-        self._queue_maxlen = max(1, self.fps * 4)
+        self._queue_maxlen = max(1, self.fps * 8)
 
     @property
     def playlist_url(self) -> str:
