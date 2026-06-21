@@ -128,7 +128,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=2.0,
         help="Seconds between Chromecast status polls when --stats is set (default: 2)",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.video_bitrate is not None and args.video_bitrate <= 0:
+        parser.error("--video-bitrate must be greater than 0 (Mbps)")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
