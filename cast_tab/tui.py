@@ -15,7 +15,7 @@ from collections import deque
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Button, Footer, Header, Label, Sparkline
+from textual.widgets import Button, Footer, Header, Label, Sparkline, Static
 
 from cast_tab.stats import PipelineStats, StatsSnapshot
 
@@ -47,9 +47,17 @@ class MetricCard(Vertical):
             yield self._spark
         yield Label(self._description, classes="metric-desc")
 
-    def set(self, value_text: str, sample: float | None = None, *, warn: bool = False) -> None:
+    def set(
+        self,
+        value_text: str,
+        sample: float | None = None,
+        *,
+        level: str = "ok",
+    ) -> None:
+        """Update the value (level: 'ok' | 'warn' | 'bad' colors it) + sparkline."""
         self._value.update(value_text)
-        self._value.set_class(warn, "warn")
+        self._value.set_class(level == "warn", "warn")
+        self._value.set_class(level == "bad", "bad")
         if self._show_spark and sample is not None:
             self._series.append(float(sample))
             self._spark.data = list(self._series) or [0.0]
@@ -87,9 +95,14 @@ class CastTUI(App):
     }
     .metric-title { color: $text-muted; text-style: bold; }
     .metric-value { color: $text; text-style: bold; }
-    .metric-value.warn { color: $error; }
+    .metric-value.warn { color: $warning; }
+    .metric-value.bad { color: $error; }
     .metric-spark { height: 3; color: $success; margin: 0; }
     .metric-desc { color: $text-disabled; }
+    #status-bar {
+        height: 1; padding: 0 2; background: $panel; color: $text;
+        content-align: left middle;
+    }
     #knob-row { height: auto; padding: 1 1 0 1; align-horizontal: left; }
     #knob-row Button { min-width: 8; margin: 0 1 0 0; }
     #knob-value { width: auto; min-width: 22; content-align: left middle; text-style: bold; }
@@ -99,6 +112,11 @@ class CastTUI(App):
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("ctrl+c", "quit", "Quit"),
+        ("right_square_bracket", "offset(10)", "audio +10ms"),
+        ("left_square_bracket", "offset(-10)", "audio -10ms"),
+        ("right_curly_bracket", "offset(100)", "audio +100ms"),
+        ("left_curly_bracket", "offset(-100)", "audio -100ms"),
+        ("r", "offset_reset", "audio 0"),
     ]
 
     def __init__(
@@ -135,6 +153,7 @@ class CastTUI(App):
     # --- layout -----------------------------------------------------------
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
+        yield Static("", id="status-bar")
         with VerticalScroll():
             yield Section(
                 "①  Capture — CDP screencast + AudioTee (incoming)",
@@ -253,59 +272,92 @@ class CastTUI(App):
                 continue
             self.call_from_thread(self._render, snap)
 
+    @staticmethod
+    def _lvl(warn: bool, bad: bool = False) -> str:
+        return "bad" if bad else ("warn" if warn else "ok")
+
     def _render(self, s: StatsSnapshot) -> None:
         def card(cid: str) -> MetricCard:
             return self.query_one(f"#card-{cid}", MetricCard)
 
+        lvl = self._lvl
+
         # ① Capture
+        cap_lo = s.capture_fps < s.target_fps * 0.9
         card("cap_fps").set(f"{s.capture_fps:.1f} / {s.target_fps:.0f}", s.capture_fps,
-                            warn=s.capture_fps < s.target_fps * 0.8)
+                            level=lvl(cap_lo, s.capture_fps < s.target_fps * 0.5))
         if s.screencast_lag_count:
             card("cap_lag").set(f"{s.screencast_lag_ms:.0f} ms  (peak {s.screencast_lag_peak_ms:.0f})",
-                                s.screencast_lag_ms, warn=s.screencast_lag_ms > 200)
+                                s.screencast_lag_ms,
+                                level=lvl(s.screencast_lag_ms > 150, s.screencast_lag_ms > 400))
         else:
             card("cap_lag").set("—", 0.0)
         card("cap_decode").set(f"{s.capture_ms:.0f} ms  (peak {s.capture_peak_ms:.0f})", s.capture_ms)
         if s.audio_backlog_ms is not None:
             card("aud_backlog").set(f"{s.audio_backlog_ms:.0f} ms  (peak {s.audio_backlog_peak_ms:.0f})",
-                                    s.audio_backlog_ms, warn=s.audio_backlog_ms > 500)
+                                    s.audio_backlog_ms,
+                                    level=lvl(s.audio_backlog_ms > 250, s.audio_backlog_ms > 500))
         else:
             card("aud_backlog").set("no audio", 0.0)
-        card("aud_warn").set(str(s.audio_warnings), warn=s.audio_warnings > 0)
+        card("aud_warn").set(str(s.audio_warnings), level=lvl(s.audio_warnings > 0))
 
         # ② Encode pipeline
+        enc_lo = s.encode_fps < s.target_fps * 0.9
         card("enc_fps").set(f"{s.encode_fps:.1f} / {s.target_fps:.0f}", s.encode_fps,
-                            warn=s.encode_fps < s.target_fps * 0.8)
+                            level=lvl(enc_lo, s.encode_fps < s.target_fps * 0.5))
         card("frame_age").set(f"{s.frame_age_ms:.0f} ms  (peak {s.frame_age_peak_ms:.0f})", s.frame_age_ms)
-        card("queue").set(f"{s.queue_peak}", float(s.queue_peak), warn=s.queue_dropped > 0)
+        card("queue").set(f"{s.queue_peak}", float(s.queue_peak),
+                          level=lvl(s.queue_peak >= s.target_fps, s.queue_dropped > 0))
         card("write").set(f"{s.write_ms:.1f} ms  (peak {s.write_peak_ms:.1f})", s.write_ms,
-                          warn=s.write_peak_ms > 500)
-        card("repeats").set(f"{s.repeats} / {s.resyncs}", warn=s.resyncs > 0)
+                          level=lvl(s.write_peak_ms > 250, s.write_peak_ms > 1000))
+        card("repeats").set(f"{s.repeats} / {s.resyncs}", level=lvl(s.resyncs > 0))
 
         # ③ HLS
         card("hls_segs").set(str(s.hls_count))
         if s.hls_age is not None:
-            card("hls_age").set(f"{s.hls_age:.1f} s", s.hls_age, warn=s.hls_age > 8)
+            card("hls_age").set(f"{s.hls_age:.1f} s", s.hls_age, level=lvl(s.hls_age > 6, s.hls_age > 12))
         else:
             card("hls_age").set("—", 0.0)
         card("hls_del").set(str(s.hls_deleted))
 
         # ④ TV
-        card("tv_state").set(s.tv_state, warn=s.tv_state not in ("PLAYING", "unknown"))
+        tv_bad = s.tv_state not in ("PLAYING", "unknown")
+        card("tv_state").set(s.tv_state, level=lvl(False, tv_bad))
         card("tv_pos").set("—" if s.tv_pos is None else f"{s.tv_pos:.0f} s")
         if s.pos_delta is not None:
             card("tv_delta").set(f"+{s.pos_delta:.0f}s / {s.interval_s:.0f}s", s.pos_delta,
-                                 warn=s.pos_delta + 1.0 < s.interval_s)
+                                 level=lvl(s.pos_delta + 1.0 < s.interval_s,
+                                           s.pos_delta + 2.0 < s.interval_s))
         else:
             card("tv_delta").set("—", 0.0)
-        card("tv_stall").set(f"~{s.stall_accum:.0f} s", warn=s.stall_accum >= 2.0)
+        card("tv_stall").set(f"~{s.stall_accum:.0f} s", level=lvl(s.stall_accum >= 2.0))
         card("tv_nonplay").set(f"{s.tv_non_playing} / {s.tv_polls}",
-                               warn=s.tv_non_playing > 0)
+                               level=lvl(s.tv_non_playing > 0))
 
         # ⑤ Sync
-        card("drift").set(f"~{s.drift_ms:.0f} ms", warn=s.drift_ms >= 100)
-        card("dropped").set(str(s.dropped_total), warn=s.dropped_total > 0)
-        card("restarts").set(str(s.restarts_total), warn=s.restarts_total > 0)
+        card("drift").set(f"~{s.drift_ms:.0f} ms", level=lvl(s.drift_ms >= 80, s.drift_ms >= 250))
+        card("dropped").set(str(s.dropped_total), level=lvl(s.dropped_total > 0))
+        card("restarts").set(str(s.restarts_total), level=lvl(s.restarts_total > 0))
+
+        self._render_status_bar(s, cap_lo, enc_lo)
+
+    def _render_status_bar(self, s: StatsSnapshot, cap_lo: bool, enc_lo: bool) -> None:
+        """One-line at-a-glance health summary with colored dots per segment."""
+        def dot(label: str, bad: bool, warn: bool = False) -> str:
+            color = "red" if bad else ("yellow" if warn else "green")
+            return f"[{color}]●[/] {label}"
+
+        synced = s.dropped_total == 0
+        tv_ok = s.tv_state in ("PLAYING", "unknown")
+        parts = [
+            dot(f"capture {s.capture_fps:.0f}fps", False, cap_lo),
+            dot(f"encode {s.encode_fps:.0f}fps", False, enc_lo),
+            dot(f"hls {s.hls_count}seg", False, (s.hls_age or 0) > 6),
+            dot(f"tv {s.tv_state.lower()}", not tv_ok, s.stall_accum >= 2.0),
+            dot(f"sync {'ok' if synced else f'~{s.drift_ms:.0f}ms'}",
+                s.drift_ms >= 250, not synced),
+        ]
+        self.query_one("#status-bar", Static).update("   ".join(parts))
 
     # --- audio-offset knob ------------------------------------------------
     _OFFSET_STEP_BY_ID = {
@@ -314,9 +366,22 @@ class CastTUI(App):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         step = self._OFFSET_STEP_BY_ID.get(event.button.id or "")
-        if step is None:
-            return
-        self._offset_pending = max(0, self._offset_pending + step)
+        if step is not None:
+            self._nudge_offset(step)
+
+    def action_offset(self, step: int) -> None:
+        """Keyboard: nudge the audio offset (bound to [ ] { })."""
+        self._nudge_offset(step)
+
+    def action_offset_reset(self) -> None:
+        """Keyboard: snap the audio offset back to 0 (bound to r)."""
+        self._nudge_offset(-self._offset_pending)
+
+    def _nudge_offset(self, step: int) -> None:
+        new_pending = max(0, self._offset_pending + step)
+        if new_pending == self._offset_pending and step != 0:
+            return  # already clamped at 0
+        self._offset_pending = new_pending
         self._refresh_knob()
         # Debounce: apply once presses settle, so we relaunch ffmpeg only once.
         if self._apply_timer is not None:
@@ -352,7 +417,7 @@ class CastTUI(App):
         )
         status = (
             "applying… (brief glitch)" if self._applying
-            else "delay audio to match video (lip-sync)"
+            else "lip-sync — keys: [ ] ±10   { } ±100   r reset"
         )
         self.query_one("#knob-status", Label).update(status)
 
