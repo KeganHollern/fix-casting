@@ -64,6 +64,13 @@ class PipelineStats:
     _queue_peak: int = 0
     _queue_dropped: int = 0
     _ffmpeg_restarts: int = 0
+    # Cumulative (never reset) — these track A/V drift over the whole session.
+    # Each dropped video frame and each ffmpeg relaunch (which clears the queue)
+    # removes one frame of video timeline; with frame-count-based PTS that pulls
+    # video behind audio permanently, so the running total estimates how far
+    # audio leads video.
+    _queue_dropped_total: int = 0
+    _ffmpeg_restarts_total: int = 0
     _audio_warnings: int = 0
     _audio_last_warning: str | None = None
     _hls_segment_age_s: float | None = None
@@ -163,6 +170,7 @@ class PipelineStats:
         with self._lock:
             self._queue_peak = max(self._queue_peak, depth)
             self._queue_dropped += dropped
+            self._queue_dropped_total += dropped
             if self._ts_enabled:
                 self._ts_queue.append(
                     (time.monotonic() - self._ts_start, depth, dropped)
@@ -201,6 +209,7 @@ class PipelineStats:
     def record_ffmpeg_restart(self) -> None:
         with self._lock:
             self._ffmpeg_restarts += 1
+            self._ffmpeg_restarts_total += 1
 
     def record_hls(
         self,
@@ -277,6 +286,8 @@ class PipelineStats:
             queue_peak = self._queue_peak
             queue_dropped = self._queue_dropped
             ffmpeg_restarts = self._ffmpeg_restarts
+            dropped_total = self._queue_dropped_total
+            restarts_total = self._ffmpeg_restarts_total
             audio_warnings = self._audio_warnings
             audio_last_warning = self._audio_last_warning
             hls_count = self._hls_segment_count
@@ -352,6 +363,25 @@ class PipelineStats:
         if hls_deleted:
             hls_line += f", deleted {hls_deleted}"
         lines.append(hls_line)
+
+        # Cumulative A/V drift estimate: each dropped video frame removes a
+        # frame of timeline under frame-count PTS, pulling audio permanently
+        # ahead. ffmpeg restarts are reported separately — they re-anchor A/V
+        # (resetting drift) but cause a visible playback glitch. fps==target.
+        drift_ms = dropped_total / self.target_fps * 1000 if self.target_fps else 0.0
+        if dropped_total or restarts_total:
+            sync_line = (
+                f"sync    est. audio lead ~{drift_ms:.0f}ms "
+                f"({dropped_total} frames dropped since start)"
+                + (
+                    f", {restarts_total} ffmpeg restarts (glitch+re-anchor)"
+                    if restarts_total
+                    else ""
+                )
+            )
+        else:
+            sync_line = "sync    in sync (0 frames dropped since start)"
+        lines.append(sync_line)
 
         audio_bits: list[str] = []
         if audio_backlog_ms is not None:

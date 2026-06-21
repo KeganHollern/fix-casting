@@ -258,14 +258,21 @@ class HLSStreamer:
         # Frames sampled at an even cadence wait here for the writer thread to
         # push them into ffmpeg. Decoupling the two keeps sampling perfectly
         # paced even when an ffmpeg write stalls (HLS segment flush, keyframe),
-        # which is what otherwise distorts motion into judder. Bounded so a
-        # sustained stall can't grow latency without limit; when full,
-        # _enqueue_frame drops the oldest frame. In normal operation the queue
-        # sits at depth ~1 (ffmpeg drains immediately), so dropping never
-        # happens — see the analyzeduration note in _start_ffmpeg.
+        # which is what otherwise distorts motion into judder.
+        #
+        # Depth matters for A/V sync: when the queue overflows it drops the
+        # oldest frame, and under frame-count-based PTS every dropped frame
+        # pulls video permanently behind audio (the long-run "audio leads"
+        # drift). In normal operation the queue sits at depth ~1 (ffmpeg drains
+        # immediately, see the analyzeduration note in _start_ffmpeg); the depth
+        # only matters during an occasional multi-second encoder stall. Sizing
+        # it to ~4s lets those stalls be absorbed without dropping — the encoder
+        # then drains the backlog (capture is rate-capped at fps, so it can't
+        # outrun it) and sync is preserved. The bound still caps latency growth
+        # for a pathological stall; any drops are surfaced as drift in --stats.
         self._frame_queue: deque[bytes] = deque()
         self._queue_cond = threading.Condition()
-        self._queue_maxlen = max(1, self.fps)
+        self._queue_maxlen = max(1, self.fps * 4)
 
     @property
     def playlist_url(self) -> str:
