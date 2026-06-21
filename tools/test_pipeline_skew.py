@@ -94,6 +94,11 @@ def main() -> int:
         help="Seconds per audio write (default 0.1 = smooth; larger = bursty, "
         "to test whether jittery audio delivery reproduces the stall).",
     )
+    parser.add_argument(
+        "--inject-stall", type=float, default=0.0,
+        help="Freeze ffmpeg this many seconds mid-run (SIGSTOP) to test that the "
+        "frame queue absorbs a stall without dropping frames.",
+    )
     args = parser.parse_args()
 
     clip = args.clip
@@ -182,7 +187,22 @@ def main() -> int:
     streamer.wait_until_ready()
 
     print(f"Recording {args.seconds:.0f}s through the production HLS path…")
-    time.sleep(args.seconds)
+    if args.inject_stall > 0:
+        # Freeze ffmpeg mid-run to simulate a multi-second encoder stall, then
+        # resume — the exact condition that overflowed the old queue and dropped
+        # frames. Verifies the deeper queue absorbs it with 0 drops.
+        import signal as _signal
+        time.sleep(args.seconds / 2)
+        ff = streamer._ffmpeg
+        if ff is not None:
+            print(f"  >> injecting {args.inject_stall:.1f}s ffmpeg stall (SIGSTOP)…")
+            os.kill(ff.pid, _signal.SIGSTOP)
+            time.sleep(args.inject_stall)
+            os.kill(ff.pid, _signal.SIGCONT)
+            print("  >> ffmpeg resumed")
+        time.sleep(args.seconds / 2)
+    else:
+        time.sleep(args.seconds)
 
     stop.set()
     audio_thread.join(timeout=2)

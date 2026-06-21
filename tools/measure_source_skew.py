@@ -21,8 +21,10 @@ from __future__ import annotations
 
 import argparse
 import re
+import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from statistics import median
@@ -192,8 +194,42 @@ def capture(seconds: float, offset_ms: int, page: Path, no_audio: bool = False) 
         streamer.start()
         streamer.wait_until_ready()
 
+        # Buffered HLS deletes old segments, so the live work dir only ever
+        # holds the last ~48s. Archive every segment before it's deleted so we
+        # can analyze the WHOLE run (and compare start-vs-end for drift).
+        archive = WORK_DIR / "archive"
+        archive.mkdir(exist_ok=True)
+        for old in archive.glob("*.ts"):
+            old.unlink()
+        archived: set[str] = set()
+        stop_archiver = threading.Event()
+
+        def archiver() -> None:
+            while not stop_archiver.is_set():
+                for seg in sorted(WORK_DIR.glob("seg*.ts")):
+                    if seg.name not in archived:
+                        try:
+                            shutil.copy2(seg, archive / seg.name)
+                            archived.add(seg.name)
+                        except OSError:
+                            pass
+                stop_archiver.wait(0.5)
+
+        arch_thread = threading.Thread(target=archiver, daemon=True)
+        arch_thread.start()
+
         print(f"Recording {seconds:.0f}s of clapboard…")
         time.sleep(seconds)
+        stop_archiver.set()
+        arch_thread.join(timeout=2)
+        # Final sweep for anything created right at the end.
+        for seg in sorted(WORK_DIR.glob("seg*.ts")):
+            if seg.name not in archived:
+                try:
+                    shutil.copy2(seg, archive / seg.name)
+                    archived.add(seg.name)
+                except OSError:
+                    pass
     finally:
         screencaster.stop()
         if streamer is not None:
@@ -207,9 +243,12 @@ def capture(seconds: float, offset_ms: int, page: Path, no_audio: bool = False) 
     print(stats.format_report(seconds))
     print("------------------------------------------------")
 
-    segments = sorted(WORK_DIR.glob("seg*.ts"))
+    # Prefer the archive (full run); fall back to live segments if not present.
+    archive = WORK_DIR / "archive"
+    segments = sorted(archive.glob("seg*.ts")) or sorted(WORK_DIR.glob("seg*.ts"))
     if not segments:
         raise SystemExit("No HLS segments were produced.")
+    print(f"Archived {len(segments)} segments (full run).")
     combined = WORK_DIR / "all.ts"
     with combined.open("wb") as out:
         for seg in segments:
@@ -278,6 +317,23 @@ def main() -> int:
         print(f"=> audio is BEHIND video by ~{med:.0f} ms.")
     else:
         print("=> audio and video are within ~40 ms (effectively synced).")
+
+    # Drift vs baseline: compare the first half of the run to the second half.
+    # A fixed baseline offset is harmless (dial it out once); a growing delta
+    # means the A/V relationship is drifting over the run — the thing the
+    # long-run goal must rule out.
+    if len(ms) >= 6:
+        h = len(ms) // 2
+        first, last = median(ms[:h]), median(ms[h:])
+        delta = last - first
+        print(
+            f"\ndrift check: first-half {first:+.0f}ms → second-half {last:+.0f}ms "
+            f"(delta {delta:+.0f}ms across the run)"
+        )
+        if abs(delta) > 80:
+            print("=> OFFSET IS DRIFTING over the run (not a fixed baseline).")
+        else:
+            print("=> offset is STABLE across the run — fixed baseline, no drift.")
     return 0
 
 
