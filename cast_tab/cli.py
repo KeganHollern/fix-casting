@@ -66,6 +66,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--video-bitrate",
+        type=float,
+        default=None,
+        metavar="MBPS",
+        help=(
+            "Override the H.264 target bitrate in Mbps (default: chosen by "
+            "resolution, e.g. 5 at 1080p). Raise it with --stats to find how "
+            "high your Chromecast's network sustains before it buffers."
+        ),
+    )
+    parser.add_argument(
         "--discovery-timeout",
         type=float,
         default=5.0,
@@ -261,6 +272,7 @@ def main(argv: list[str] | None = None) -> int:
             audio_fd=audio_capture.read_fd if audio_capture else None,
             audio_format=audio_capture.audio_format if audio_capture else None,
             audio_offset_ms=args.audio_offset_ms,
+            video_bitrate_mbps=args.video_bitrate,
             stats=stats,
         )
         screencaster.on_frame = streamer.publish_frame
@@ -269,10 +281,15 @@ def main(argv: list[str] | None = None) -> int:
 
         audio_mode = "with tab audio" if capture_audio else "video only"
         latency_mode = "buffered (~45s TV delay)" if args.buffered else "low-latency"
+        bitrate_note = (
+            f", {args.video_bitrate:g}M video bitrate"
+            if args.video_bitrate is not None
+            else ""
+        )
         print(
             f"Streaming at {args.width}x{args.height} {encode_fps} fps "
-            f"(capture=screencast (paint-driven), jpeg q={jpeg_quality}) {audio_mode} "
-            f"using {codec_label()}, {latency_mode}."
+            f"(capture=screencast (paint-driven), jpeg q={jpeg_quality}{bitrate_note}) "
+            f"{audio_mode} using {codec_label()}, {latency_mode}."
         )
 
         streamer.start()

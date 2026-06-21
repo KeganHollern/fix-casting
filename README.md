@@ -68,6 +68,7 @@ cast <url> [options]
   --height HEIGHT         Viewport height (default: 1080)
   --fps FPS               Encode frame rate (default: 30 buffered, 23–24 unbuffered)
   --jpeg-quality Q        Tab-capture JPEG quality 1–100 (default: 75 at 1080p+, 80 otherwise)
+  --video-bitrate MBPS    Override H.264 target bitrate in Mbps (default: by resolution, ~5 at 1080p)
   --buffered / --no-buffered
                           Buffered mode for quality vs latency (default: buffered)
   --no-audio              Video only, skip tab audio capture
@@ -119,6 +120,30 @@ Dial in lip-sync if audio leads video (positive delays audio):
 ```bash
 cast --audio-offset-ms 200 "https://example.com"
 ```
+
+### Finding your max quality (bitrate vs. network)
+
+The Chromecast pulls HLS segments over your LAN; if the stream's bitrate exceeds
+what the network/TV sustains, its buffer drains and playback stalls. To find the
+ceiling, sweep `--video-bitrate` upward with `--stats` and watch the `tv` line:
+
+```bash
+cast --stats --stats-interval 5 --video-bitrate 8 "https://example.com"
+```
+
+Read the `tv` stats line:
+
+- **`position +5s/5s`** (playback keeping pace with wall-clock) and state
+  `PLAYING` → that bitrate is sustainable.
+- **`stall ~Ns`**, **`micro-stalls ~Ns`**, or **`non-playing … (BUFFERING …)`** →
+  the network can't keep up at that bitrate; back it off.
+
+Step up (e.g. 6 → 8 → 10 → 12 Mbps) and stay at each setting a few minutes — with
+the default ~45s buffer, an over-high bitrate takes that long to drain the buffer
+before it stalls. For faster feedback use `--no-buffered` (small buffer, fails
+fast), then re-confirm your chosen bitrate in normal buffered mode. The highest
+setting that stays `PLAYING` with no stalls is your ceiling; back off ~20% for
+headroom against network jitter.
 
 ## How it works
 

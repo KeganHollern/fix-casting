@@ -60,8 +60,25 @@ def default_jpeg_quality(width: int, height: int) -> int:
     return 80
 
 
-def _target_bitrate(width: int, height: int, *, buffered: bool) -> tuple[str, str, str]:
-    """Pick H.264 bitrate targets (bitrate, maxrate, bufsize)."""
+def _target_bitrate(
+    width: int,
+    height: int,
+    *,
+    buffered: bool,
+    override_mbps: float | None = None,
+) -> tuple[str, str, str]:
+    """Pick H.264 bitrate targets (bitrate, maxrate, bufsize).
+
+    override_mbps forces the average bitrate (in Mbps) and derives maxrate /
+    bufsize from it using the same ratios as the resolution presets — a roomy
+    VBV (2.4x) when buffered, a tight one (1.1x) when not. Used to sweep
+    bitrate against a Chromecast's network headroom.
+    """
+    if override_mbps is not None:
+        v = override_mbps
+        if buffered:
+            return (f"{v:g}M", f"{v * 1.2:g}M", f"{v * 2.4:g}M")
+        return (f"{v:g}M", f"{v * 1.1:g}M", f"{v * 1.1:g}M")
     pixels = width * height
     if pixels >= 1920 * 1080:
         return ("5M", "6M", "12M") if buffered else ("4.5M", "5M", "5M")
@@ -76,8 +93,11 @@ def _video_encoder_args(
     height: int,
     *,
     buffered: bool,
+    bitrate_mbps: float | None = None,
 ) -> list[str]:
-    bitrate, maxrate, bufsize = _target_bitrate(width, height, buffered=buffered)
+    bitrate, maxrate, bufsize = _target_bitrate(
+        width, height, buffered=buffered, override_mbps=bitrate_mbps
+    )
     gop = fps * (2 if buffered else 1)
 
     if _ffmpeg_supports_encoder("h264_videotoolbox"):
@@ -197,6 +217,7 @@ class HLSStreamer:
         audio_fd: int | None = None,
         audio_format: AudioFormat | None = None,
         audio_offset_ms: int = 0,
+        video_bitrate_mbps: float | None = None,
         port: int = 0,
         work_dir: Path | None = None,
         stats: PipelineStats | None = None,
@@ -208,6 +229,7 @@ class HLSStreamer:
         self.audio_fd = audio_fd
         self.audio_format = audio_format or DEFAULT_AUDIO_FORMAT
         self.audio_offset_ms = audio_offset_ms
+        self.video_bitrate_mbps = video_bitrate_mbps
         self.work_dir = work_dir or Path("/tmp/cast-tab-stream")
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -549,6 +571,7 @@ class HLSStreamer:
                 self.width,
                 self.height,
                 buffered=self.buffered,
+                bitrate_mbps=self.video_bitrate_mbps,
             ),
             *self._audio_delay_filter_args(),
             "-c:a",
