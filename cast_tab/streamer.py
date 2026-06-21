@@ -217,6 +217,7 @@ class HLSStreamer:
         audio_fd: int | None = None,
         audio_format: AudioFormat | None = None,
         audio_offset_ms: int = 0,
+        audio_drift_ppm: float = 0.0,
         video_bitrate_mbps: float | None = None,
         port: int = 0,
         work_dir: Path | None = None,
@@ -229,6 +230,7 @@ class HLSStreamer:
         self.audio_fd = audio_fd
         self.audio_format = audio_format or DEFAULT_AUDIO_FORMAT
         self.audio_offset_ms = audio_offset_ms
+        self.audio_drift_ppm = audio_drift_ppm
         self.video_bitrate_mbps = video_bitrate_mbps
         self.work_dir = work_dir or Path("/tmp/cast-tab-stream")
         self.work_dir.mkdir(parents=True, exist_ok=True)
@@ -401,6 +403,16 @@ class HLSStreamer:
         if self._http_thread and self._http_thread.is_alive():
             self._http_thread.join(timeout=3)
 
+    def _input_sample_rate(self) -> int:
+        """Device's true PCM rate = nominal + measured drift. ppm>0 means the
+        device clock runs fast (audio leads over time); declaring the higher
+        input rate makes ffmpeg resample the surplus back down to the forced
+        nominal output rate, locking audio to real time. ppm=0 is a no-op."""
+        nominal = self.audio_format.sample_rate
+        if not self.audio_drift_ppm:
+            return nominal
+        return max(1, round(nominal * (1.0 + self.audio_drift_ppm / 1_000_000.0)))
+
     def _audio_input_args(self) -> list[str]:
         if self.audio_fd is not None:
             return [
@@ -416,12 +428,19 @@ class HLSStreamer:
                 "-analyzeduration",
                 "0",
                 # Match AudioTee's actual native PCM format exactly so ffmpeg
-                # never misreads the bytes (wrong format == white noise) and
-                # nothing resamples.
+                # never misreads the bytes (wrong format == white noise).
                 "-f",
                 self.audio_format.ffmpeg_format,
+                # Declare the input at the device's TRUE rate (nominal + drift).
+                # The output is forced to the nominal rate (_audio_encoder args),
+                # so ffmpeg does ONE constant resample of the drift ratio. This
+                # is the clock-drift fix: AudioTee's device clock runs slightly
+                # fast vs the system clock that paces 30fps video, so audio leads
+                # over long runs; resampling the true rate down to nominal locks
+                # audio back to real time. A constant ratio (unlike async) adds
+                # no silence and no jitter — it is inaudible (~100ppm).
                 "-ar",
-                str(self.audio_format.sample_rate),
+                str(self._input_sample_rate()),
                 "-ac",
                 str(self.audio_format.channels),
                 "-i",

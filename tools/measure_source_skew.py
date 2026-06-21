@@ -138,7 +138,13 @@ def match_offsets(
     return best or []
 
 
-def capture(seconds: float, offset_ms: int, page: Path, no_audio: bool = False) -> Path:
+def capture(
+    seconds: float,
+    offset_ms: int,
+    page: Path,
+    no_audio: bool = False,
+    drift_ppm: float = 0.0,
+) -> Path:
     if not no_audio and not audiotee_available():
         raise SystemExit("AudioTee not found — build it first (see install.sh).")
 
@@ -190,6 +196,7 @@ def capture(seconds: float, offset_ms: int, page: Path, no_audio: bool = False) 
             audio_fd=audio_capture.read_fd if audio_capture else None,
             audio_format=audio_capture.audio_format if audio_capture else None,
             audio_offset_ms=offset_ms,
+            audio_drift_ppm=drift_ppm,
             work_dir=WORK_DIR,
             stats=stats,
         )
@@ -312,6 +319,13 @@ def main() -> int:
         "queue backpressure. No A/V offset is measured; read the queue table.",
     )
     parser.add_argument(
+        "--drift-ppm",
+        type=float,
+        default=0.0,
+        help="Pass through to HLSStreamer --audio-drift-ppm to test a constant-"
+        "rate clock-drift correction (positive = device runs fast / audio leads).",
+    )
+    parser.add_argument(
         "--continuity",
         action="store_true",
         help="Continuity mode: scan the output for silence gaps (audio "
@@ -322,7 +336,11 @@ def main() -> int:
     args = parser.parse_args()
 
     combined = args.analyze or capture(
-        args.seconds, args.offset_ms, args.page, no_audio=args.no_audio
+        args.seconds,
+        args.offset_ms,
+        args.page,
+        no_audio=args.no_audio,
+        drift_ppm=args.drift_ppm,
     )
     print(f"\nAnalyzing {combined} …")
 

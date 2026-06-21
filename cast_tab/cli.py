@@ -103,6 +103,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--audio-drift-ppm",
+        type=float,
+        default=0.0,
+        metavar="PPM",
+        help=(
+            "Correct slow audio clock drift in parts-per-million (default: 0). "
+            "If audio drifts AHEAD of video over a long session, set this "
+            "positive; ffmpeg constant-resamples audio to lock it to real time "
+            "(smooth, inaudible). Measure your value with "
+            "tools/measure_source_skew.py (prints 'clock error ≈ N ppm')."
+        ),
+    )
+    parser.add_argument(
         "--buffered",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -283,6 +296,7 @@ def main(argv: list[str] | None = None) -> int:
             audio_fd=audio_capture.read_fd if audio_capture else None,
             audio_format=audio_capture.audio_format if audio_capture else None,
             audio_offset_ms=args.audio_offset_ms,
+            audio_drift_ppm=args.audio_drift_ppm,
             video_bitrate_mbps=args.video_bitrate,
             stats=stats,
         )
