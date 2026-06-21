@@ -67,6 +67,7 @@ cast <url> [options]
   --width WIDTH           Viewport width (default: 1920)
   --height HEIGHT         Viewport height (default: 1080)
   --fps FPS               Encode frame rate (default: 30 buffered, 23–24 unbuffered)
+  --jpeg-quality Q        Tab-capture JPEG quality 1–100 (default: 75 at 1080p+, 80 otherwise)
   --buffered / --no-buffered
                           Buffered mode for quality vs latency (default: buffered)
   --no-audio              Video only, skip tab audio capture
@@ -75,6 +76,7 @@ cast <url> [options]
   --discovery-timeout SEC Seconds to search for devices (default: 5)
   --stats                 Print pipeline timing stats every 10s (diagnose lag)
   --stats-interval SEC    Seconds between stats reports (default: 10)
+  --tv-poll-interval SEC  Seconds between Chromecast status polls when --stats is set (default: 2)
 ```
 
 Video is always encoded as H.264 (universally supported on Chromecast) and
@@ -92,6 +94,12 @@ cast --no-buffered "https://example.com"
 
 ```bash
 cast --width 1280 --height 720 "https://example.com"
+```
+
+Lower capture quality to cut CPU/bandwidth (or raise it for a sharper image):
+
+```bash
+cast --jpeg-quality 60 "https://example.com"
 ```
 
 Video only (no audio tap):
@@ -148,7 +156,7 @@ If audio still fails, start playback in the local Chrome window (click Play). Th
 Try `--no-buffered` to rule out buffer-related delay, or lower resolution with `--width 1280 --height 720`.
 
 **High CPU**  
-Lower `--fps`, resolution, or use `--no-buffered`.
+Lower `--fps`, resolution, `--jpeg-quality`, or use `--no-buffered`.
 
 **Lag builds up over time**  
 Run with `--stats` and watch which stage drifts:

@@ -56,6 +56,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Encode frame rate (default: 30 buffered, 23 at 1080p / 24 at 720p otherwise)",
     )
     parser.add_argument(
+        "--jpeg-quality",
+        type=int,
+        default=None,
+        metavar="Q",
+        help=(
+            "JPEG quality (1-100) for tab capture (default: 75 at 1080p+, 80 "
+            "otherwise). Higher = sharper but more CPU/bandwidth."
+        ),
+    )
+    parser.add_argument(
         "--discovery-timeout",
         type=float,
         default=5.0,
@@ -122,7 +132,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     # Oversample capture so a fresh frame is ready at every encoder tick.
     capture_fps = max(encode_fps, round(encode_fps * 1.5))
-    jpeg_quality = default_jpeg_quality(args.width, args.height)
+    jpeg_quality = (
+        max(1, min(100, args.jpeg_quality))
+        if args.jpeg_quality is not None
+        else default_jpeg_quality(args.width, args.height)
+    )
     capture_audio = not args.no_audio
     stats = PipelineStats(target_fps=float(encode_fps)) if args.stats else None
 
