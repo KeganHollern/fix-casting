@@ -163,14 +163,22 @@ buffer length to become visible on the TV — adjust in small steps.
 
 ### Ad blocking (`--adblock`)
 
-On by default: the captured tab runs ad/tracker blocking so ads don't appear in
-what you cast (and don't waste bitrate). It uses [`adblock`](https://github.com/brave/adblock-rust)
-(Brave's adblock-rust engine — the same family as `@ghostery/adblocker`) driven
-by **uBlock Origin's default filter lists + EasyList/EasyPrivacy**, applied via
-Playwright request interception (network blocking) plus per-page cosmetic hiding.
-Lists are fetched once and cached for a day in `~/.cache/fix-casting/adblock`.
-Use `--no-adblock` to turn it off. Effectiveness on any given site depends on its
-ad setup; network-level ads/trackers are blocked reliably.
+On by default: the captured tab blocks ad/tracker requests so ads don't appear
+in what you cast (and don't waste bitrate). It derives an ad/tracker **domain**
+list from **uBlock Origin's network filter lists + Peter Lowe's ad-server list**
+and blocks them **natively in Chrome** via CDP `Network.setBlockedURLs` — no
+per-request Python work, so it doesn't steal CPU from the encoder (an earlier
+per-request interception approach did, causing video stutter). Lists are fetched
+once and cached for a day in `~/.cache/fix-casting/adblock`. Use `--no-adblock`
+to turn it off.
+
+It's a deliberately **focused** set (~6.5k domains): the full EasyList/
+EasyPrivacy carries ~50k domains, and `setBlockedURLs` matching cost grows with
+that, enough to contend for CPU. This set blocks the major ad/tracker servers
+(measured: googlesyndication, doubleclick, analytics, GTM, scorecard, taboola)
+while leaving legit CDNs alone. It blocks at the domain level only — no
+element-hiding or path rules — so some first-party ads on a given site may slip
+through.
 
 ### Finding your max quality (bitrate vs. network)
 

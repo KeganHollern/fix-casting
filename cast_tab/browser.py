@@ -31,7 +31,7 @@ class TabScreencaster:
         headless: bool = False,
         capture_audio: bool = False,
         stats: PipelineStats | None = None,
-        adblock_engine=None,
+        adblock_patterns: list[str] | None = None,
     ) -> None:
         self.url = url
         self.width = width
@@ -46,7 +46,7 @@ class TabScreencaster:
         self.headless = headless
         self.capture_audio = capture_audio
         self._stats = stats
-        self._adblock_engine = adblock_engine
+        self._adblock_patterns = adblock_patterns
 
         self.user_data_dir = Path(tempfile.mkdtemp(prefix="cast-tab-chrome-"))
         self._thread: threading.Thread | None = None
@@ -116,11 +116,13 @@ class TabScreencaster:
                 )
 
             context.grant_permissions(["notifications", "geolocation"])
-            if self._adblock_engine is not None:
-                from cast_tab.adblocking import attach_to_context
-
-                attach_to_context(context, self._adblock_engine)
             page = context.pages[0] if context.pages else context.new_page()
+            if self._adblock_patterns:
+                # Native CDP blocking on a dedicated session, set before the
+                # navigation so the page's requests are filtered from the start.
+                from cast_tab.adblocking import apply_to_page
+
+                apply_to_page(context.new_cdp_session(page), self._adblock_patterns)
             print(f"Loading {self.url} ...")
             page.goto(self.url, wait_until="load", timeout=120_000)
             page.add_style_tag(

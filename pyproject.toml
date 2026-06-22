@@ -12,7 +12,6 @@ dependencies = [
     "playwright>=1.40.0",
     "zeroconf>=0.131.0",
     "textual>=0.80",
-    "adblock>=0.6.0",
 ]
 
 [project.scripts]

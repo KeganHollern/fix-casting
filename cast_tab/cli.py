@@ -185,12 +185,12 @@ def main(argv: list[str] | None = None) -> int:
     collect_stats = args.stats or args.tui
     stats = PipelineStats(target_fps=float(encode_fps)) if collect_stats else None
 
-    adblock_engine = None
+    adblock_patterns = None
     if args.adblock:
-        from cast_tab.adblocking import build_engine
+        from cast_tab.adblocking import build_block_patterns
 
         print("Loading ad-block filter lists...")
-        adblock_engine = build_engine()
+        adblock_patterns = build_block_patterns()
 
     screencaster = TabScreencaster(
         args.url,
@@ -203,7 +203,7 @@ def main(argv: list[str] | None = None) -> int:
         headless=args.headless,
         capture_audio=capture_audio,
         stats=stats,
-        adblock_engine=adblock_engine,
+        adblock_patterns=adblock_patterns,
     )
     streamer: HLSStreamer | None = None
     audio_capture: AudioCapture | None = None
