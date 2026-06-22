@@ -118,11 +118,11 @@ class PipelineStats:
     _queue_peak: int = 0
     _queue_dropped: int = 0
     _ffmpeg_restarts: int = 0
-    # Cumulative (never reset) — these track A/V drift over the whole session.
-    # Each dropped video frame and each ffmpeg relaunch (which clears the queue)
-    # removes one frame of video timeline; with frame-count-based PTS that pulls
-    # video behind audio permanently, so the running total estimates how far
-    # audio leads video.
+    # Cumulative (never reset). Each dropped video frame is a brief skip/freeze
+    # in the video (the encoder couldn't keep up for a moment). Measured A/B
+    # (tools/measure_source_skew.py with induced drops) shows this does NOT
+    # accumulate into A/V desync — the muxed output stays synced — so the total
+    # estimates accumulated *video stutter time* (dropped/fps), not an audio lead.
     _queue_dropped_total: int = 0
     _ffmpeg_restarts_total: int = 0
     _audio_warnings: int = 0
@@ -438,8 +438,8 @@ class PipelineStats:
 
         if s.dropped_total or s.restarts_total:
             sync_line = (
-                f"sync    est. audio lead ~{s.drift_ms:.0f}ms "
-                f"({s.dropped_total} frames dropped since start)"
+                f"sync    {s.dropped_total} frames dropped since start "
+                f"(~{s.drift_ms:.0f}ms of brief video stutter; A/V stays synced)"
                 + (
                     f", {s.restarts_total} ffmpeg restarts (glitch+re-anchor)"
                     if s.restarts_total
@@ -447,7 +447,7 @@ class PipelineStats:
                 )
             )
         else:
-            sync_line = "sync    in sync (0 frames dropped since start)"
+            sync_line = "sync    no frames dropped since start"
         lines.append(sync_line)
 
         audio_bits: list[str] = []
