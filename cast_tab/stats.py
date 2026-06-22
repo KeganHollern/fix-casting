@@ -116,6 +116,12 @@ class PipelineStats:
     _encode_resyncs: int = 0
     _encode_write: _Window = field(default_factory=_Window, repr=False)
     _queue_peak: int = 0
+    # Interval running mean of queue depth. Depth IS the live audio lead: a frame
+    # waiting depth/fps seconds in the queue reaches ffmpeg (which timestamps by
+    # arrival) that much later than its audio, so the output plays audio ahead by
+    # ~depth/fps. The mean (not peak) tracks the sustained lead.
+    _queue_depth_sum: float = 0.0
+    _queue_depth_n: int = 0
     _queue_dropped: int = 0
     _ffmpeg_restarts: int = 0
     # Cumulative (never reset). Each dropped video frame is a brief skip/freeze
@@ -223,6 +229,8 @@ class PipelineStats:
     def record_queue(self, *, depth: int, dropped: int = 0) -> None:
         with self._lock:
             self._queue_peak = max(self._queue_peak, depth)
+            self._queue_depth_sum += depth
+            self._queue_depth_n += 1
             self._queue_dropped += dropped
             self._queue_dropped_total += dropped
             if self._ts_enabled:
@@ -327,9 +335,14 @@ class PipelineStats:
             if tv_pos is not None and interval_start_pos is not None:
                 pos_delta = tv_pos - interval_start_pos
             dropped_total = self._queue_dropped_total
-            drift_ms = (
-                dropped_total / self.target_fps * 1000 if self.target_fps else 0.0
+            # Live audio lead = mean queue depth / fps (frames wait in the queue,
+            # ffmpeg timestamps by arrival, so audio plays ahead by that much).
+            avg_depth = (
+                self._queue_depth_sum / self._queue_depth_n
+                if self._queue_depth_n
+                else 0.0
             )
+            drift_ms = avg_depth / self.target_fps * 1000 if self.target_fps else 0.0
 
             snap = StatsSnapshot(
                 interval_s=interval_s,
@@ -386,6 +399,8 @@ class PipelineStats:
             self._encode_resyncs = 0
             self._encode_write.reset()
             self._queue_peak = 0
+            self._queue_depth_sum = 0.0
+            self._queue_depth_n = 0
             self._queue_dropped = 0
             self._ffmpeg_restarts = 0
             self._audio_warnings = 0
@@ -436,19 +451,17 @@ class PipelineStats:
             hls_line += f", deleted {s.hls_deleted}"
         lines.append(hls_line)
 
-        if s.dropped_total or s.restarts_total:
-            sync_line = (
-                f"sync    {s.dropped_total} frames dropped since start "
-                f"(~{s.drift_ms:.0f}ms of brief video stutter; A/V stays synced)"
-                + (
-                    f", {s.restarts_total} ffmpeg restarts (glitch+re-anchor)"
-                    if s.restarts_total
-                    else ""
-                )
-            )
-        else:
-            sync_line = "sync    no frames dropped since start"
-        lines.append(sync_line)
+        lead = (
+            f"audio lead ~{s.drift_ms:.0f}ms (encoder queue)"
+            if s.drift_ms >= 80
+            else f"in sync (~{s.drift_ms:.0f}ms)"
+        )
+        extra = ""
+        if s.dropped_total:
+            extra += f", {s.dropped_total} frames dropped (stutter)"
+        if s.restarts_total:
+            extra += f", {s.restarts_total} ffmpeg restarts"
+        lines.append(f"sync    {lead}{extra}")
 
         audio_bits: list[str] = []
         if s.audio_backlog_ms is not None:

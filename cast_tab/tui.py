@@ -219,13 +219,14 @@ class CastTUI(App):
                 ],
             )
             yield Section(
-                "⑤  Video smoothness (cumulative)",
+                "⑤  A/V sync",
                 [
-                    MetricCard("drift", "Video stutter total",
-                               "Dropped-frame time (brief freezes; A/V stays synced).",
+                    MetricCard("drift", "Est. audio lead",
+                               "Live A/V offset = encoder queue depth / fps. "
+                               "Rises when the encoder backs up; ~0 when it keeps up.",
                                show_spark=False),
                     MetricCard("dropped", "Frames dropped",
-                               "Encoder fell behind for a moment; brief video skip.",
+                               "Brief video skips when the encoder stalled (stutter).",
                                show_spark=False),
                     MetricCard("restarts", "ffmpeg restarts",
                                "Relaunches (each glitches + re-anchors sync).",
@@ -335,7 +336,7 @@ class CastTUI(App):
                                level=lvl(s.tv_non_playing > 0))
 
         # ⑤ Sync
-        card("drift").set(f"~{s.drift_ms:.0f} ms", level=lvl(s.drift_ms >= 250, s.drift_ms >= 1000))
+        card("drift").set(f"~{s.drift_ms:.0f} ms", level=lvl(s.drift_ms >= 150, s.drift_ms >= 400))
         card("dropped").set(str(s.dropped_total), level=lvl(s.dropped_total > 0))
         card("restarts").set(str(s.restarts_total), level=lvl(s.restarts_total > 0))
 
@@ -347,15 +348,13 @@ class CastTUI(App):
             color = "red" if bad else ("yellow" if warn else "green")
             return f"[{color}]●[/] {label}"
 
-        smooth = s.dropped_total == 0
         tv_ok = s.tv_state in ("PLAYING", "unknown")
         parts = [
             dot(f"capture {s.capture_fps:.0f}fps", False, cap_lo),
             dot(f"encode {s.encode_fps:.0f}fps", False, enc_lo),
             dot(f"hls {s.hls_count}seg", False, (s.hls_age or 0) > 6),
             dot(f"tv {s.tv_state.lower()}", not tv_ok, s.stall_accum >= 2.0),
-            dot(f"video {'smooth' if smooth else f'{s.dropped_total} skips'}",
-                s.drift_ms >= 1000, not smooth),
+            dot(f"sync ~{s.drift_ms:.0f}ms", s.drift_ms >= 400, s.drift_ms >= 150),
         ]
         self.query_one("#status-bar", Static).update("   ".join(parts))
 

@@ -231,6 +231,11 @@ class HLSStreamer:
         self.audio_format = audio_format or DEFAULT_AUDIO_FORMAT
         self.audio_offset_ms = audio_offset_ms
         self.audio_drift_ppm = audio_drift_ppm
+        # Test-only: sleep this many ms after each stdin write to simulate a slow
+        # encoder, so the frame queue backs up (reproduces queue-delay lead).
+        self._test_write_delay_s = (
+            float(os.environ.get("CAST_TEST_WRITE_DELAY_MS", "0") or "0") / 1000.0
+        )
         self.video_bitrate_mbps = video_bitrate_mbps
         self.work_dir = work_dir or Path("/tmp/cast-tab-stream")
         self.work_dir.mkdir(parents=True, exist_ok=True)
@@ -262,24 +267,20 @@ class HLSStreamer:
         # paced even when an ffmpeg write stalls (HLS segment flush, keyframe),
         # which is what otherwise distorts motion into judder.
         #
-        # Depth matters for A/V sync: when the queue overflows it drops the
-        # oldest frame, and under frame-count-based PTS every dropped frame
-        # pulls video permanently behind audio (the long-run "audio leads"
-        # drift). In normal operation the queue sits at depth ~1 (ffmpeg drains
-        # immediately, see the analyzeduration note in _start_ffmpeg); the depth
-        # only matters during an occasional multi-second encoder stall. Sizing
-        # it to ~8s lets those stalls be absorbed without dropping — the encoder
-        # then drains the backlog (capture is rate-capped at fps, so it can't
-        # outrun it) and sync is preserved. Verified offline: a 3s stall fills
-        # the queue to ~84 then drains back with 0 drops and 0 residual skew,
-        # while a stall past the bound drops frames and disturbs sync — so the
-        # depth directly sets how long a stall we tolerate before audio leads.
-        # In normal operation depth sits at ~1, so the deeper bound costs memory
-        # only transiently during an actual stall, not steady-state latency. The
-        # bound still caps growth for a pathological stall; drops show in --stats.
+        # Depth IS the audio lead. ffmpeg's image2pipe timestamps frames by the
+        # time they ARRIVE on its stdin, so a frame that waits `depth/fps`
+        # seconds in this queue reaches the muxer that much later than its audio
+        # and the output plays audio ahead by ~depth/fps. (A deep queue was the
+        # real "audio leads over long runtime" — it grew under encoder
+        # contention and the lead grew with it; an earlier 8s bound let the lead
+        # reach 8s.) In normal operation the writer drains the queue to depth ~1
+        # (the encoder has ample headroom), so the lead is ~one frame. Bound it
+        # at ~1s so even a sustained stall caps the audio lead at ~1s (dropping
+        # the oldest frames past that — a brief stutter — rather than letting the
+        # lead grow unbounded). stats exposes the live lead as queue_depth/fps.
         self._frame_queue: deque[bytes] = deque()
         self._queue_cond = threading.Condition()
-        self._queue_maxlen = max(1, self.fps * 8)
+        self._queue_maxlen = max(1, self.fps)
 
     @property
     def playlist_url(self) -> str:
@@ -753,6 +754,9 @@ class HLSStreamer:
                     # lock) and keep streaming from the next queued frame.
                     self._restart_ffmpeg()
                     continue
+
+                if self._test_write_delay_s:
+                    time.sleep(self._test_write_delay_s)
 
                 if self._stats is not None:
                     self._stats.trace("first frame written to ffmpeg stdin", once=True)
