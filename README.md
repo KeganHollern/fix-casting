@@ -22,6 +22,7 @@ Buffered mode is on by default (~45s delay on the TV) for smoother, higher-quali
 |---|---|
 | **macOS 14.2+** | Required for per-tab audio capture via [AudioTee](https://github.com/makeusabrew/audiotee) |
 | **Python 3.10+** | |
+| **[uv](https://docs.astral.sh/uv/)** | Used by `install.sh` to install the `cast` CLI |
 | **Google Chrome** | Used via Playwright (`channel="chrome"`) |
 | **ffmpeg** | With H.264 encoding (`h264_videotoolbox` on Apple Silicon recommended) |
 | **Chromecast / Google TV** | On the same LAN as your Mac |
@@ -29,19 +30,29 @@ Buffered mode is on by default (~45s delay on the TV) for smoother, higher-quali
 
 ## Install
 
+First install [uv](https://docs.astral.sh/uv/) (if you don't have it):
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Then clone and run the installer:
+
 ```bash
 git clone <this-repo>
 cd fix-casting
 ./install.sh
 ```
 
-This creates a virtualenv, installs Python dependencies, downloads Playwright's Chromium (fallback), builds AudioTee when Swift is available, and installs a `cast` command to `~/.local/bin/cast`.
+This uses [`uv tool install`](https://docs.astral.sh/uv/) to install the `cast` command into `~/.local/bin` (in its own isolated environment), downloads Playwright's Chromium (fallback), and builds AudioTee when Swift is available.
 
 Make sure `~/.local/bin` is on your `PATH`:
 
 ```bash
-export PATH="$HOME/.local/bin:$PATH"
+uv tool update-shell    # or: export PATH="$HOME/.local/bin:$PATH"
 ```
+
+To update later, just re-run `./install.sh`. To remove: `uv tool uninstall fix-casting`.
 
 Install ffmpeg if needed:
 
