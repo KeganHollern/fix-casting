@@ -3,26 +3,16 @@
 from __future__ import annotations
 
 import argparse
-import json
 import signal
 import sys
 import time
 
-from cast_tab.audio import (
-    AudioCapture,
-    AudioCaptureError,
-    audiotee_available,
-    install_hint,
-    try_start_chrome_audio_capture,
-    stop_audio_capture,
-)
-from cast_tab.browser import TabScreencaster
 from cast_tab.caster import TabCaster
 from cast_tab.devices import discover_devices, select_device
+from cast_tab.session import CastSession, SessionConfig
 from cast_tab.stats import PipelineStats
 from cast_tab.streamer import (
     DEFAULT_JPEG_QUALITY,
-    HLSStreamer,
     codec_label,
     default_fps_for_resolution,
 )
@@ -178,7 +168,6 @@ def main(argv: list[str] | None = None) -> int:
         if args.jpeg_quality is not None
         else DEFAULT_JPEG_QUALITY
     )
-    capture_audio = not args.no_audio
     # The TUI is a live view of the same stats, so it needs them collected too.
     collect_stats = args.stats or args.tui
     stats = PipelineStats(target_fps=float(encode_fps)) if collect_stats else None
@@ -190,20 +179,23 @@ def main(argv: list[str] | None = None) -> int:
         print("Loading ad-block filter lists...")
         adblock_patterns = build_block_patterns()
 
-    screencaster = TabScreencaster(
-        args.url,
-        width=args.width,
-        height=args.height,
-        fps=encode_fps,
-        jpeg_quality=jpeg_quality,
-        on_frame=lambda _frame: None,
-        headless=args.headless,
-        capture_audio=capture_audio,
+    session = CastSession(
+        SessionConfig(
+            url=args.url,
+            width=args.width,
+            height=args.height,
+            fps=encode_fps,
+            jpeg_quality=jpeg_quality,
+            buffered=args.buffered,
+            headless=args.headless,
+            capture_audio=not args.no_audio,
+            audio_offset_ms=args.audio_offset_ms,
+            audio_drift_ppm=args.audio_drift_ppm,
+            video_bitrate_mbps=args.video_bitrate,
+            adblock_patterns=adblock_patterns,
+        ),
         stats=stats,
-        adblock_patterns=adblock_patterns,
     )
-    streamer: HLSStreamer | None = None
-    audio_capture: AudioCapture | None = None
     caster = TabCaster(device)
 
     shutting_down = False
@@ -217,10 +209,7 @@ def main(argv: list[str] | None = None) -> int:
             return
         shutting_down = True
         print("\nStopping cast...")
-        screencaster.stop()
-        if streamer is not None:
-            streamer.stop()
-        stop_audio_capture(audio_capture)
+        session.stop()
         caster.stop()
 
     def handle_signal(_signum=None, _frame=None) -> None:
@@ -231,101 +220,9 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, handle_signal)
 
     try:
-        screencaster.start()
-        screencaster.wait_until_ready()
-        screencaster.enable_capture()
-        if stats is not None:
-            stats.trace("enable_capture")
+        session.start()
 
-        if capture_audio:
-            if not audiotee_available():
-                print(f"Audio unavailable: AudioTee not found.\n{install_hint()}")
-                capture_audio = False
-            else:
-                print("Waiting for cast browser audio...")
-                audio_attached = False
-
-                def on_audio_stderr(line: str) -> None:
-                    mtype = "log"
-                    text = line
-                    try:
-                        parsed = json.loads(line)
-                        mtype = str(parsed.get("message_type", "log"))
-                        data = parsed.get("data") or {}
-                        text = str(data.get("message", line))
-                        context = data.get("context")
-                        if context:
-                            text += f" {context}"
-                    except (ValueError, AttributeError):
-                        pass
-                    # Debug lines are high-volume (per-PID tap attempts); keep
-                    # them out of the log but still surface info/warning/error.
-                    if mtype == "debug":
-                        return
-                    # AudioTee probes PID candidates that do not tap on modern
-                    # macOS (renderers). "failed to translate" only happens
-                    # during that probing, so it is always search noise; a bare
-                    # "failure" is suppressed only until a tap succeeds, so a
-                    # mid-stream AudioTee death still surfaces.
-                    low = text.strip().lower()
-                    if "failed to translate" in low:
-                        return
-                    if not audio_attached and (
-                        low in ("error: failure", "failure")
-                        or low.startswith("starting audiotee")
-                    ):
-                        return
-                    print(f"[audio:{mtype}] {text}", flush=True)
-                    if stats is not None and (
-                        mtype in ("error", "warning")
-                        or any(
-                            kw in text.lower()
-                            for kw in (
-                                "drop", "underrun", "overrun",
-                                "glitch", "discontinu", "xrun",
-                            )
-                        )
-                    ):
-                        stats.record_audio_warning(text)
-
-                if stats is not None:
-                    stats.trace("audio try_start begin")
-                try:
-                    audio_capture = try_start_chrome_audio_capture(
-                        screencaster.user_data_dir,
-                        on_retry=screencaster.nudge_playback,
-                        on_stderr=on_audio_stderr,
-                    )
-                    audio_attached = True
-                    if stats is not None:
-                        stats.trace(f"audio attached (pids={audio_capture.pids})")
-                    print(
-                        "Capturing audio from cast browser only "
-                        f"(PIDs: {', '.join(str(pid) for pid in audio_capture.pids)})."
-                    )
-                    print("Other Mac apps keep their normal audio output.")
-                except AudioCaptureError as exc:
-                    print(f"Audio unavailable: {exc}")
-                    print(install_hint())
-                    capture_audio = False
-
-        streamer = HLSStreamer(
-            width=args.width,
-            height=args.height,
-            fps=encode_fps,
-            buffered=args.buffered,
-            audio_fd=audio_capture.read_fd if audio_capture else None,
-            audio_format=audio_capture.audio_format if audio_capture else None,
-            audio_offset_ms=args.audio_offset_ms,
-            audio_drift_ppm=args.audio_drift_ppm,
-            video_bitrate_mbps=args.video_bitrate,
-            stats=stats,
-        )
-        screencaster.on_frame = streamer.publish_frame
-        if stats is not None:
-            stats.trace("on_frame wired to streamer")
-
-        audio_mode = "with tab audio" if capture_audio else "video only"
+        audio_mode = "with tab audio" if session.audio_active else "video only"
         latency_mode = "buffered (~45s TV delay)" if args.buffered else "low-latency"
         bitrate_note = (
             f", {args.video_bitrate:g}M video bitrate"
@@ -338,11 +235,8 @@ def main(argv: list[str] | None = None) -> int:
             f"{audio_mode} using {codec_label()}, {latency_mode}."
         )
 
-        streamer.start()
-        streamer.wait_until_ready()
-
         caster.connect()
-        caster.play_hls(streamer.playlist_url)
+        caster.play_hls(session.playlist_url)
 
         if args.tui:
             # Full-screen dashboard owns the terminal and its own poll loop.
@@ -350,11 +244,11 @@ def main(argv: list[str] | None = None) -> int:
 
             run_tui(
                 stats=stats,
-                streamer=streamer,
+                streamer=session.streamer,
                 caster=caster,
                 initial_offset_ms=args.audio_offset_ms,
                 tv_poll_interval=args.tv_poll_interval,
-                playlist_url=streamer.playlist_url,
+                playlist_url=session.playlist_url,
             )
             shutdown()
             return 0
@@ -363,7 +257,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Source page: {args.url}")
         if not args.headless:
             print("A browser window is rendering the page locally.")
-        if capture_audio:
+        if session.audio_active:
             print("Cast browser audio plays on your TV only; other Mac audio is unchanged.")
         if stats is not None:
             print(
@@ -376,8 +270,8 @@ def main(argv: list[str] | None = None) -> int:
         while not shutting_down:
             now = time.monotonic()
             if stats is not None and now >= next_tv_poll_at:
-                streamer.poll_audio_backlog()
-                for event in streamer.poll_hls_stats():
+                session.streamer.poll_audio_backlog()
+                for event in session.streamer.poll_hls_stats():
                     print(f"[stats] {event}", flush=True)
                 tv = caster.poll_playback_stats()
                 for event in stats.record_tv_poll(

@@ -32,14 +32,9 @@ from statistics import median
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from cast_tab.audio import (  # noqa: E402
-    audiotee_available,
-    stop_audio_capture,
-    try_start_chrome_audio_capture,
-)
-from cast_tab.browser import TabScreencaster  # noqa: E402
+from cast_tab.audio import audiotee_available  # noqa: E402
+from cast_tab.session import CastSession, SessionConfig  # noqa: E402
 from cast_tab.stats import PipelineStats  # noqa: E402
-from cast_tab.streamer import HLSStreamer  # noqa: E402
 
 CLAPBOARD = ROOT / "tools" / "clapboard_av_page.html"
 WORK_DIR = Path("/tmp/cast-skew-measure")
@@ -159,49 +154,28 @@ def capture(
     print(f"Capturing {url}")
     stats = PipelineStats(target_fps=30.0)
     stats.enable_timeseries()
-    screencaster = TabScreencaster(
-        url,
-        width=1920,
-        height=1080,
-        fps=30,
-        jpeg_quality=75,
-        on_frame=lambda _f: None,
-        headless=False,
-        capture_audio=True,
-        stats=stats,
-    )
-    streamer: HLSStreamer | None = None
-    audio_capture = None
-    try:
-        screencaster.start()
-        screencaster.wait_until_ready()
-        screencaster.enable_capture()
-
-        if no_audio:
-            print("VIDEO ONLY (no AudioTee) — isolating video-side backpressure.")
-        else:
-            print("Attaching audio…")
-            audio_capture = try_start_chrome_audio_capture(
-                screencaster.user_data_dir,
-                on_retry=screencaster.nudge_playback,
-            )
-            print(f"Audio attached (pids={audio_capture.pids}).")
-
-        streamer = HLSStreamer(
+    # The production pipeline wiring, minus the Chromecast.
+    session = CastSession(
+        SessionConfig(
+            url=url,
             width=1920,
             height=1080,
             fps=30,
+            jpeg_quality=75,
             buffered=True,
-            audio_fd=audio_capture.read_fd if audio_capture else None,
-            audio_format=audio_capture.audio_format if audio_capture else None,
+            headless=False,
+            capture_audio=not no_audio,
+            require_audio=not no_audio,
             audio_offset_ms=offset_ms,
             audio_drift_ppm=drift_ppm,
             work_dir=WORK_DIR,
-            stats=stats,
-        )
-        screencaster.on_frame = streamer.publish_frame
-        streamer.start()
-        streamer.wait_until_ready()
+        ),
+        stats=stats,
+    )
+    try:
+        if no_audio:
+            print("VIDEO ONLY (no AudioTee) — isolating video-side backpressure.")
+        session.start()
 
         # Buffered HLS deletes old segments, so the live work dir only ever
         # holds the last ~48s. Archive every segment before it's deleted so we
@@ -240,10 +214,7 @@ def capture(
                 except OSError:
                     pass
     finally:
-        screencaster.stop()
-        if streamer is not None:
-            streamer.stop()
-        stop_audio_capture(audio_capture)
+        session.stop()
 
     # Show how long video spent in each of our Python stages during this run,
     # so we can see whether the output skew is our pipeline or inside ffmpeg.

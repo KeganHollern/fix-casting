@@ -3,6 +3,36 @@
 Running notes from the automated review/implement loop. Newest entry first.
 Roadmap: [codebase-review.md](codebase-review.md) §6.
 
+## 2026-07-05 — Iteration 5: roadmap item 5 (CastSession extraction)
+
+**Reviewed:** iteration 4 (`697cfe8`, dead code). The fps collapse preserves
+behavior — the `behind` threshold used `pace_fps` (30) before and `fps` (30)
+now at both call sites; nothing imports the removed names. No bugs.
+
+**Implemented — roadmap item 5: extract `CastSession` (M).**
+
+- New `cast_tab/session.py`: `SessionConfig` (one dataclass instead of 12
+  kwargs) + `CastSession` owning the browser → audio tap → streamer lifecycle.
+  `start()` blocks until the HLS stream is ready; `stop()` is idempotent and
+  handles partial init. The AudioTee stderr filter/noise-suppression closure
+  moved here from `cli.py`. New `require_audio` flag: the CLI degrades to
+  video-only, the measurement harness hard-fails (its old behavior).
+- `cli.py` `main()` shrinks ~130 lines: parse → discover → `session.start()`
+  → banner → cast → stats/TUI loop. Banner now prints after the stream is
+  ready (it used to print before `streamer.start()`); message text unchanged.
+- `tools/measure_source_skew.py` drops its hand-rolled duplicate of the same
+  wiring (~45 lines) and uses the session — it now also gets the audio-stderr
+  warning surfacing it previously lacked.
+
+**Verified:** stub test — cli through session error path returns 1,
+`session.stop()` handles partial init; full real 30 s run of
+`measure_source_skew.py` through the session (visible Chrome, AudioTee
+attached, HLS archived): median offset +50 ms / spread 53 ms — within the
+±1–2-frame noise floor at 30 fps, queue depth 1, in sync ~33 ms.
+
+**Next up:** roadmap item 6 — split `streamer.py` into encoder / pacing /
+server (fold the per-instance stderr tail from iteration 2's note into it).
+
 ## 2026-07-05 — Iteration 4: roadmap item 4 (dead code / doc drift)
 
 **Reviewed:** iteration 3 (`e673e51`, temp-dir cleanup). Teardown ordering is
