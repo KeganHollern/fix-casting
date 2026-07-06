@@ -3,6 +3,31 @@
 Running notes from the automated review/implement loop. Newest entry first.
 Roadmap: [codebase-review.md](codebase-review.md) §6.
 
+## 2026-07-05 — Iteration 2: roadmap item 2 (shutdown / exit codes)
+
+**Reviewed:** iteration 1 (`9c48afb`, ffmpeg stderr drain). Holds up: deque appends
+are atomic, one drain thread per ffmpeg instance exiting on EOF, early-exit path
+guarded. One nuance found, not fix-worthy: `_ffmpeg_stderr_tail` is not cleared on
+relaunch, so an early-exit report could in principle include lines from a previous
+ffmpeg instance. Harmless today (`wait_until_ready` runs once, at first startup);
+worth folding into the encoder split (roadmap item 6) as a per-instance tail.
+
+**Implemented — roadmap item 2: fix `shutdown()` / exit-code handling (P0).**
+
+- `cli.py`: `shutdown()` no longer calls `sys.exit(0)` — it only stops components
+  (idempotent). The embedded exit was raising `SystemExit(0)` from inside the
+  `except Exception` handler before its `return 1`, so **failures exited 0**.
+- Signals (SIGINT/SIGTERM) go through a new `handle_signal` wrapper that does
+  `shutdown(); sys.exit(0)` — an intentional stop is still a success exit.
+- Error path (`except Exception`) and TUI path now control their own exit codes.
+
+**Verified:** stub harness (fake device/screencaster raising during startup):
+`main()` returns 1 and teardown still runs. Before the fix the same harness
+died with exit code 0.
+
+**Next up:** roadmap item 3 — temp-dir cleanup (Chrome profile dirs + per-run
+HLS work dir).
+
 ## 2026-07-05 — Iteration 1: roadmap item 1 (ffmpeg stderr drain)
 
 **Reviewed:** `docs/codebase-review.md` (the previous deliverable). No implementation

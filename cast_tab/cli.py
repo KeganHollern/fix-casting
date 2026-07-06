@@ -211,7 +211,10 @@ def main(argv: list[str] | None = None) -> int:
 
     shutting_down = False
 
-    def shutdown(_signum=None, _frame=None) -> None:
+    def shutdown() -> None:
+        """Stop all components (idempotent). Exit codes are the caller's job:
+        an embedded sys.exit(0) here would eat the error path's non-zero exit
+        (SystemExit raised mid-handler preempts its `return 1`)."""
         nonlocal shutting_down
         if shutting_down:
             return
@@ -222,10 +225,13 @@ def main(argv: list[str] | None = None) -> int:
             streamer.stop()
         stop_audio_capture(audio_capture)
         caster.stop()
+
+    def handle_signal(_signum=None, _frame=None) -> None:
+        shutdown()
         sys.exit(0)
 
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
 
     try:
         screencaster.start()
