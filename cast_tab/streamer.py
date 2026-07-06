@@ -251,6 +251,11 @@ class HLSStreamer:
         # PTS=0 to the same moment (see start()).
         self._first_frame = threading.Event()
         self._ffmpeg: subprocess.Popen[bytes] | None = None
+        # Tail of ffmpeg's stderr, fed by a drain thread. ffmpeg blocks (and
+        # the whole encode stalls) if its stderr pipe fills, so it must always
+        # be consumed; the tail doubles as the error report on early exit.
+        self._ffmpeg_stderr_tail: deque[str] = deque(maxlen=50)
+        self._ffmpeg_stderr_thread: threading.Thread | None = None
         self._sampler_thread: threading.Thread | None = None
         self._writer_thread: threading.Thread | None = None
         self._http_server: ThreadingHTTPServer | None = None
@@ -369,18 +374,19 @@ class HLSStreamer:
         return events
 
     def wait_until_ready(self, timeout: float | None = None) -> None:
+        """Block until the HLS playlist and first segment exist."""
         if timeout is None:
             timeout = 60.0 if self.buffered else 30.0
-        """Block until the HLS playlist and first segment exist."""
         playlist = self.work_dir / "stream.m3u8"
         deadline = time.time() + timeout
         while time.time() < deadline:
             if playlist.exists() and list(self.work_dir.glob("seg*.ts")):
                 return
             if self._ffmpeg and self._ffmpeg.poll() is not None:
-                stderr = ""
-                if self._ffmpeg.stderr:
-                    stderr = self._ffmpeg.stderr.read().decode(errors="replace")
+                # Let the drain thread flush the last of stderr, then report it.
+                if self._ffmpeg_stderr_thread is not None:
+                    self._ffmpeg_stderr_thread.join(timeout=1.0)
+                stderr = "\n".join(self._ffmpeg_stderr_tail)
                 raise RuntimeError(f"ffmpeg exited early: {stderr.strip()}")
             time.sleep(0.5)
         raise TimeoutError("Timed out waiting for the HLS stream to become ready.")
@@ -655,8 +661,48 @@ class HLSStreamer:
         if self._stats is not None:
             self._stats.trace("ffmpeg spawn (audio+video PTS=0 anchor)")
         self._ffmpeg = subprocess.Popen(cmd, **popen_kwargs)
+        self._start_ffmpeg_stderr_drain(self._ffmpeg)
         if self._stats is not None:
             self._stats.trace("ffmpeg spawned")
+
+    def _start_ffmpeg_stderr_drain(self, proc: subprocess.Popen[bytes]) -> None:
+        """Continuously drain ffmpeg's stderr into a bounded tail.
+
+        ffmpeg writes errors to stderr for the life of the encode. Left
+        unread, the ~64KB pipe buffer fills and ffmpeg blocks on the write —
+        the encode stalls with no visible cause. Draining keeps ffmpeg
+        running; the tail feeds the early-exit error report and each line is
+        surfaced through stats so encoder errors show up in --stats/--tui
+        instead of disappearing. The thread exits on EOF when ffmpeg dies, so
+        each (re)launch gets its own drain.
+        """
+
+        def run() -> None:
+            try:
+                if proc.stderr is None:
+                    return
+                for raw in proc.stderr:
+                    line = raw.decode(errors="replace").rstrip()
+                    if not line:
+                        continue
+                    self._ffmpeg_stderr_tail.append(line)
+                    if self._stats is not None:
+                        self._stats.record_ffmpeg_stderr(line)
+                    else:
+                        print(f"[ffmpeg] {line}", flush=True)
+            except (OSError, ValueError):
+                pass
+            finally:
+                if proc.stderr is not None:
+                    try:
+                        proc.stderr.close()
+                    except OSError:
+                        pass
+
+        self._ffmpeg_stderr_thread = threading.Thread(
+            target=run, name="ffmpeg-stderr", daemon=True
+        )
+        self._ffmpeg_stderr_thread.start()
 
     def _enqueue_frame(self, frame: bytes) -> None:
         with self._queue_cond:

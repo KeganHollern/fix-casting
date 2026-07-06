@@ -1,0 +1,44 @@
+# Review log — fable-refactor loop
+
+Running notes from the automated review/implement loop. Newest entry first.
+Roadmap: [codebase-review.md](codebase-review.md) §6.
+
+## 2026-07-05 — Iteration 1: roadmap item 1 (ffmpeg stderr drain)
+
+**Reviewed:** `docs/codebase-review.md` (the previous deliverable). No implementation
+existed yet to review; the bugs it lists are all tracked roadmap items (known gaps),
+so per loop policy I implemented the top item instead of ad-hoc fixing.
+
+**Implemented — roadmap item 1: ffmpeg stderr drain + surface in stats (P0).**
+
+- `streamer.py`: each ffmpeg (re)launch now starts a daemon thread that drains
+  stderr into a bounded 50-line tail (`_ffmpeg_stderr_tail`). Previously stderr
+  was piped and never read during a cast, so a chatty-error run could fill the
+  ~64KB pipe and block ffmpeg — an invisible full-pipeline stall.
+- `wait_until_ready()` now reports early-exit errors from the drained tail
+  instead of reading the pipe directly (also fixed its misplaced docstring,
+  which sat after the first statement and was inert).
+- `stats.py`: new `record_ffmpeg_stderr()`; snapshot fields `ffmpeg_errors` /
+  `ffmpeg_last_error`; `--stats` prints an `ffmpeg` line when errors occurred.
+- `tui.py`: new "ffmpeg errors" card in section ② (yellow when non-zero).
+- Without `--stats`/`--tui`, drained lines print as `[ffmpeg] <line>` so errors
+  are never silently discarded.
+
+**Verified:**
+
+- Garbage-MJPEG feed through the real `HLSStreamer`: 13 stderr lines captured,
+  surfaced in the stats snapshot and the tail; early-exit report works.
+- `tools/test_pipeline_skew.py --seconds 30` (real production path, no Chrome):
+  queue depth steady at 1, no drops, A/V offset median −67 ms with 33 ms spread —
+  within the harness's frame-quantization noise floor at 30 fps (±1–2 frames),
+  matching the live queue-depth estimate (~33 ms). No regression.
+
+**Observations for future iterations (not bugs introduced here):**
+
+- ffmpeg only flushes many decode-path errors at EOF/exit, so mid-run counts can
+  read 0 until a restart; the drain still prevents the pipe-fill stall either way.
+- The 15 s harness run can detect flashes/beeps but fail to pair them
+  ("Could not pair flash/beep events") — use ≥30 s runs; worth a guard in the
+  tool when it becomes a pytest (roadmap item 7).
+
+**Next up:** roadmap item 2 — fix `shutdown()` / exit-code handling in `cli.py`.

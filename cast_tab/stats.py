@@ -62,6 +62,8 @@ class StatsSnapshot:
     repeats: int
     resyncs: int
     ffmpeg_restarts: int
+    ffmpeg_errors: int
+    ffmpeg_last_error: str | None
     # --- Sync (cumulative) ---
     dropped_total: int
     restarts_total: int
@@ -131,6 +133,10 @@ class PipelineStats:
     # estimates accumulated *video stutter time* (dropped/fps), not an audio lead.
     _queue_dropped_total: int = 0
     _ffmpeg_restarts_total: int = 0
+    # ffmpeg stderr lines this interval (at -loglevel error these are real
+    # encoder/mux errors); fed by the streamer's stderr drain thread.
+    _ffmpeg_errors: int = 0
+    _ffmpeg_last_error: str | None = None
     _audio_warnings: int = 0
     _audio_last_warning: str | None = None
     _hls_segment_age_s: float | None = None
@@ -273,6 +279,12 @@ class PipelineStats:
             self._ffmpeg_restarts += 1
             self._ffmpeg_restarts_total += 1
 
+    def record_ffmpeg_stderr(self, line: str) -> None:
+        """A line ffmpeg wrote to stderr (an error at -loglevel error)."""
+        with self._lock:
+            self._ffmpeg_errors += 1
+            self._ffmpeg_last_error = line
+
     def record_hls(
         self,
         *,
@@ -370,6 +382,8 @@ class PipelineStats:
                 repeats=self._encode_repeats,
                 resyncs=self._encode_resyncs,
                 ffmpeg_restarts=self._ffmpeg_restarts,
+                ffmpeg_errors=self._ffmpeg_errors,
+                ffmpeg_last_error=self._ffmpeg_last_error,
                 dropped_total=dropped_total,
                 restarts_total=self._ffmpeg_restarts_total,
                 drift_ms=drift_ms,
@@ -403,6 +417,7 @@ class PipelineStats:
             self._queue_depth_n = 0
             self._queue_dropped = 0
             self._ffmpeg_restarts = 0
+            self._ffmpeg_errors = 0
             self._audio_warnings = 0
             self._hls_segments_deleted = 0
             self._tv_polls = 0
@@ -443,6 +458,12 @@ class PipelineStats:
                 + (f", ffmpeg restarts {s.ffmpeg_restarts}" if s.ffmpeg_restarts else "")
             ),
         ]
+
+        if s.ffmpeg_errors:
+            err_line = f"ffmpeg  {s.ffmpeg_errors} stderr lines this interval"
+            if s.ffmpeg_last_error:
+                err_line += f' (last: "{s.ffmpeg_last_error}")'
+            lines.append(err_line)
 
         hls_line = f"hls     {s.hls_count} segments"
         if s.hls_age is not None:

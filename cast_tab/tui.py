@@ -185,6 +185,9 @@ class CastTUI(App):
                     MetricCard("repeats", "Repeats / resync",
                                "Held frames (no new capture) / clock resyncs.",
                                show_spark=False),
+                    MetricCard("ff_err", "ffmpeg errors",
+                               "stderr lines from ffmpeg (encoder/mux errors).",
+                               show_spark=False),
                 ],
             )
             yield Section(
@@ -312,6 +315,7 @@ class CastTUI(App):
         card("write").set(f"{s.write_ms:.1f} ms  (peak {s.write_peak_ms:.1f})", s.write_ms,
                           level=lvl(s.write_peak_ms > 250, s.write_peak_ms > 1000))
         card("repeats").set(f"{s.repeats} / {s.resyncs}", level=lvl(s.resyncs > 0))
+        card("ff_err").set(str(s.ffmpeg_errors), level=lvl(s.ffmpeg_errors > 0))
 
         # ③ HLS
         card("hls_segs").set(str(s.hls_count))
