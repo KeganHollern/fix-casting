@@ -6,6 +6,7 @@ import os
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 from collections import deque
@@ -237,7 +238,11 @@ class HLSStreamer:
             float(os.environ.get("CAST_TEST_WRITE_DELAY_MS", "0") or "0") / 1000.0
         )
         self.video_bitrate_mbps = video_bitrate_mbps
-        self.work_dir = work_dir or Path("/tmp/cast-tab-stream")
+        # Unique per run: a fixed path means two simultaneous casts silently
+        # serve each other's segments. We only remove dirs we created; an
+        # explicit work_dir (the tools harnesses) is the caller's to manage.
+        self._owns_work_dir = work_dir is None
+        self.work_dir = work_dir or Path(tempfile.mkdtemp(prefix="cast-tab-stream-"))
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
         for old in self.work_dir.glob("seg*.ts"):
@@ -409,6 +414,9 @@ class HLSStreamer:
             self._http_server.shutdown()
         if self._http_thread and self._http_thread.is_alive():
             self._http_thread.join(timeout=3)
+
+        if self._owns_work_dir:
+            shutil.rmtree(self.work_dir, ignore_errors=True)
 
     def _input_sample_rate(self) -> int:
         """Device's true PCM rate = nominal + measured drift. ppm>0 means the

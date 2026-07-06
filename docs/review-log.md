@@ -3,6 +3,38 @@
 Running notes from the automated review/implement loop. Newest entry first.
 Roadmap: [codebase-review.md](codebase-review.md) §6.
 
+## 2026-07-05 — Iteration 3: roadmap item 3 (temp-dir cleanup)
+
+**Reviewed:** iteration 2 (`21220b5`, exit codes). Clean: error path returns 1
+(verified last iteration), signal path exits 0 explicitly, `SystemExit` is not
+swallowed by `except Exception`. The Textual/Ctrl+C interaction inside `--tui`
+is pre-existing and untouched. No bugs.
+
+**Implemented — roadmap item 3: temp-dir cleanup (P1).**
+
+- `browser.py`: the whole post-launch flow now sits in `try/finally
+  context.close()` (previously only the screencast was guarded — a `goto`
+  failure leaked a running Chrome), and the browser thread removes its
+  `cast-tab-chrome-*` mkdtemp profile dir on exit. Split `_run` /
+  `_run_browser` so cleanup wraps all paths, including launch failures.
+- `streamer.py`: the HLS work dir is now a unique `cast-tab-stream-*` mkdtemp
+  per run instead of the fixed `/tmp/cast-tab-stream` (two simultaneous casts
+  previously served each other's segments). Removed on `stop()` only when we
+  created it — an explicit `work_dir` (tools harnesses) is the caller's.
+- README updated (no more fixed-path mention).
+
+**Verified:** streamer dirs are unique, owned dirs removed on stop, explicit
+dirs preserved; real headless Chrome run against about:blank confirms the
+profile dir is gone after `stop()`; 15 s pipeline-harness smoke run passes
+through the changed streamer (short-run flash/beep pairing limitation is the
+known one from iteration 1).
+
+**Note:** pre-existing `cast-tab-chrome-*` dirs from older runs still sit in
+$TMPDIR; left alone (user data, OS clears them periodically).
+
+**Next up:** roadmap item 4 — delete dead code/knobs, fix `--adblock` help-text
+drift, drop `requirements.txt`.
+
 ## 2026-07-05 — Iteration 2: roadmap item 2 (shutdown / exit codes)
 
 **Reviewed:** iteration 1 (`9c48afb`, ffmpeg stderr drain). Holds up: deque appends

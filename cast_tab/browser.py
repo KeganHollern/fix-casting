@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import shutil
 import tempfile
 import threading
 import time
@@ -85,6 +86,15 @@ class TabScreencaster:
             self._thread.join(timeout=10)
 
     def _run(self) -> None:
+        try:
+            self._run_browser()
+        finally:
+            # Each run gets a fresh mkdtemp profile; without cleanup they
+            # accumulate in /tmp at tens-to-hundreds of MB per cast. Chrome
+            # has exited by now (context.close() above), so removal is safe.
+            shutil.rmtree(self.user_data_dir, ignore_errors=True)
+
+    def _run_browser(self) -> None:
         with sync_playwright() as playwright:
             launch_args = [
                 "--autoplay-policy=no-user-gesture-required",
@@ -115,29 +125,31 @@ class TabScreencaster:
                     ignore_https_errors=True,
                 )
 
-            context.grant_permissions(["notifications", "geolocation"])
-            page = context.pages[0] if context.pages else context.new_page()
-            if self._adblock_patterns:
-                # Native CDP blocking on a dedicated session, set before the
-                # navigation so the page's requests are filtered from the start.
-                from cast_tab.adblocking import apply_to_page
-
-                apply_to_page(context.new_cdp_session(page), self._adblock_patterns)
-            print(f"Loading {self.url} ...")
-            page.goto(self.url, wait_until="load", timeout=120_000)
-            page.add_style_tag(
-                content="html,body{overflow:hidden!important;margin:0!important;}"
-            )
-            self._try_start_playback(page)
-            page.wait_for_timeout(1_500)
-            print("Page loaded, starting capture.")
-            self._ready.set()
-            self._capture_enabled.wait()
-
-            cdp = context.new_cdp_session(page)
             try:
+                context.grant_permissions(["notifications", "geolocation"])
+                page = context.pages[0] if context.pages else context.new_page()
+                if self._adblock_patterns:
+                    # Native CDP blocking on a dedicated session, set before the
+                    # navigation so the page's requests are filtered from the start.
+                    from cast_tab.adblocking import apply_to_page
+
+                    apply_to_page(context.new_cdp_session(page), self._adblock_patterns)
+                print(f"Loading {self.url} ...")
+                page.goto(self.url, wait_until="load", timeout=120_000)
+                page.add_style_tag(
+                    content="html,body{overflow:hidden!important;margin:0!important;}"
+                )
+                self._try_start_playback(page)
+                page.wait_for_timeout(1_500)
+                print("Page loaded, starting capture.")
+                self._ready.set()
+                self._capture_enabled.wait()
+
+                cdp = context.new_cdp_session(page)
                 self._run_screencast(page, cdp)
             finally:
+                # Close in all paths (goto/setup failures included) so Chrome
+                # is not left running against the profile dir we remove below.
                 context.close()
 
     def _start_screencast(self, cdp) -> None:

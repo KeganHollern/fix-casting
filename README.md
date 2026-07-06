@@ -230,7 +230,7 @@ URL → Chrome tab → JPEG frames + PCM audio
 - **Video capture** uses CDP `Page.startScreencast`: Chrome pushes JPEG frames as the page paints (up to ~60fps), and every frame is acknowledged with `Page.screencastFrameAck` so the stream never stalls.
 - **Even-paced encoding** samples the latest frame at a constant cadence on one thread and feeds ffmpeg on another, with a bounded queue between them. Even sampling keeps motion smooth (no judder) even when an ffmpeg write stalls on an HLS segment flush, while the constant rate keeps the TV buffer from draining. ffmpeg is restarted automatically if it dies or stays backpressured.
 - **Audio capture** uses a vendored [AudioTee](https://github.com/makeusabrew/audiotee) binary to tap only the cast browser's processes. Your other apps are not routed through a virtual audio device.
-- **Streaming** uses ffmpeg to mux H.264 + AAC into an HLS playlist served from `/tmp/cast-tab-stream/`.
+- **Streaming** uses ffmpeg to mux H.264 + AAC into an HLS playlist served from a per-run temp directory (removed on exit).
 - **Casting** uses [pychromecast](https://github.com/home-assistant-libs/pychromecast) to load the HLS URL on the default media receiver.
 
 ## Troubleshooting
