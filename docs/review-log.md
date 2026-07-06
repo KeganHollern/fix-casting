@@ -3,6 +3,36 @@
 Running notes from the automated review/implement loop. Newest entry first.
 Roadmap: [codebase-review.md](codebase-review.md) §6.
 
+## 2026-07-05 — Iteration 12: roadmap item 10 scoped (CPU spike plan)
+
+**Reviewed:** iteration 11 (`4ff5c78`). The priority space binding means space
+never presses a focused button (enter/click still do) — intended; the lockfile
+is a universal resolution so CI's interpreter choice is safe. No bugs.
+
+**Implemented — roadmap item 10, as a scoped plan (the spike itself is L-size
+and belongs in a dedicated session): `docs/cpu-spike-plan.md`.**
+
+- **Measured the baseline first** (40 s live run, steady-state `ps` samples):
+  ffmpeg ~170–210% CPU (peaks 350%) doing the *software MJPEG decode* — the
+  H.264 encode itself is VideoToolbox hardware and nearly free; Chrome 15–50%
+  (JPEG encode); Python 6–20%; AudioTee ~0%. The JPEG round-trip is the
+  dominant cost, which sharpens the spike's thesis considerably.
+- Plan covers: primary approach (getDisplayMedia + MediaRecorder H.264,
+  ffmpeg becomes mux-only, est. ~250% → ~60–80%), WebCodecs fallback, a cheap
+  orthogonal `--capture-scale` option (~44% off the dominant stage, no
+  sync-model change), and the tuning-only stopgap. Biggest named risk: path A
+  replaces the arrival-time A/V sync model this repo spent weeks perfecting —
+  gated on the existing skew harness plus a 30-min drift check per the
+  established methodology (track durations, non-looping source).
+- Five ordered go/no-go gates so the spike fails fast and cheap.
+
+**Verified:** the measurement run stayed synced (+40 ms median) — also a free
+confirmation that the branch's pipeline is healthy end-to-end.
+
+**Roadmap state: all 10 items now done or scoped.** The loop has drained its
+backlog; future iterations will do upkeep (review, small fixes) unless
+redirected.
+
 ## 2026-07-05 — Iteration 11: uv.lock + Python floor fix (+ space-key bug)
 
 **Reviewed:** iteration 10 (`79c1015`, TV controls). Found one real bug, not a
