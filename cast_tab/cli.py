@@ -8,7 +8,7 @@ import sys
 import time
 
 from cast_tab.caster import TabCaster
-from cast_tab.devices import discover_devices, select_device
+from cast_tab.devices import discover_devices, find_device, select_device
 from cast_tab.encoder import tv_delay_s
 from cast_tab.session import CastSession, SessionConfig
 from cast_tab.stats import PipelineStats
@@ -65,6 +65,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Override the H.264 target bitrate in Mbps (default: chosen by "
             "resolution, 15 at 1080p). Raise it with --stats to find how high "
             "your Chromecast's network sustains before it buffers."
+        ),
+    )
+    parser.add_argument(
+        "--device",
+        metavar="NAME",
+        default=None,
+        help=(
+            "Cast to the device with this name, skipping the interactive "
+            "picker (case-insensitive; a unique substring works too)."
         ),
     )
     parser.add_argument(
@@ -159,7 +168,11 @@ def main(argv: list[str] | None = None) -> int:
 
     print("Searching for Chromecast devices...")
     devices = discover_devices(timeout=args.discovery_timeout)
-    device = select_device(devices)
+    if args.device:
+        device = find_device(devices, args.device)
+        print(f"Casting to {device.name}.")
+    else:
+        device = select_device(devices)
 
     encode_fps = args.fps or default_fps_for_resolution(
         args.width, args.height, buffered=args.buffered
@@ -200,6 +213,27 @@ def main(argv: list[str] | None = None) -> int:
     caster = TabCaster(device)
 
     shutting_down = False
+    started_at = time.monotonic()
+
+    def _print_exit_summary() -> None:
+        elapsed = int(time.monotonic() - started_at)
+        hours, rest = divmod(elapsed, 3600)
+        minutes, seconds = divmod(rest, 60)
+        duration = (
+            f"{hours}h{minutes:02d}m{seconds:02d}s" if hours
+            else f"{minutes}m{seconds:02d}s" if minutes
+            else f"{seconds}s"
+        )
+        parts = [f"cast ran {duration}"]
+        if caster.reconnects:
+            parts.append(f"{caster.reconnects} TV re-casts")
+        if stats is not None:
+            snap = stats.snapshot(1.0)
+            if snap.dropped_total:
+                parts.append(f"{snap.dropped_total} frames dropped (stutter)")
+            if snap.restarts_total:
+                parts.append(f"{snap.restarts_total} ffmpeg restarts")
+        print(f"Summary: {', '.join(parts)}.")
 
     def shutdown() -> None:
         """Stop all components (idempotent). Exit codes are the caller's job:
@@ -212,6 +246,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\nStopping cast...")
         session.stop()
         caster.stop()
+        _print_exit_summary()
 
     def handle_signal(_signum=None, _frame=None) -> None:
         shutdown()
@@ -275,8 +310,16 @@ def main(argv: list[str] | None = None) -> int:
         assert streamer is not None  # session.start() succeeded above
         next_stats_at = time.monotonic() + args.stats_interval
         next_tv_poll_at = time.monotonic()
+        # Watchdog: re-cast if the TV stops playing (app killed, stream error).
+        # Grace period so startup buffering never counts as idle.
+        next_ensure_at = time.monotonic() + 15.0
         while not shutting_down:
             now = time.monotonic()
+            if now >= next_ensure_at:
+                event = caster.ensure_playing()
+                if event:
+                    print(f"[recover] {event}", flush=True)
+                next_ensure_at = now + 5.0
             if stats is not None and now >= next_tv_poll_at:
                 streamer.poll_audio_backlog()
                 for event in streamer.poll_hls_stats():

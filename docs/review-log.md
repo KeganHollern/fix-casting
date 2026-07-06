@@ -3,6 +3,41 @@
 Running notes from the automated review/implement loop. Newest entry first.
 Roadmap: [codebase-review.md](codebase-review.md) §6.
 
+## 2026-07-05 — Iteration 8: roadmap item 8 (--device, TV watchdog, summary)
+
+**Reviewed:** iteration 7 (`973377b`, tooling/tests/CI). CI mechanics re-checked:
+`-m slow` on the CLI overrides the addopts deselection, slow tests need no
+display on the macOS runner, and the pipeline test uses `sys.executable` so it
+runs under the CI venv. No bugs.
+
+**Implemented — roadmap item 8: product polish tier 1 (M).**
+
+- `--device NAME` (`devices.find_device`): case-insensitive exact match first,
+  then unique-substring; ambiguous/no-match errors list the discovered names.
+  Also unblocks non-TTY scripting (the picker's `input()` can't run there).
+- **TV watchdog** (`caster.ensure_playing`): after two consecutive idle polls
+  (state not PLAYING/BUFFERING/PAUSED), re-issues `play_media` with the stored
+  playlist URL. Wired into the CLI main loop (every 5 s after a 15 s startup
+  grace → recovers in ~10 s, printed as `[recover] …`) and the TUI poll loop.
+  Transport drops are left to pychromecast's own socket reconnect; status
+  exceptions are swallowed while it does.
+- **Exit summary** on stop: duration, TV re-casts, frames dropped, ffmpeg
+  restarts (stats-dependent parts only with --stats/--tui).
+- README: --device documented, watchdog + summary noted.
+
+**Verified:** ruff + mypy clean; 31 unit tests (11 new: name matching incl.
+exact-beats-substring and ambiguity errors; watchdog counter reset, re-cast
+after threshold with FINISHED reason surfaced, BUFFERING/PAUSED not idle,
+pre-connect no-ops, status-exception swallow). CLI smoke: `--device living`
+matches "Living Room TV", error path exits 1, summary prints.
+
+**Note:** the watchdog's `play_hls` blocks its caller up to ~30 s if the TV is
+truly gone (`block_until_active` + verify loop). In the CLI loop that's fine;
+in the TUI it runs on the poller thread, freezing metric refresh during a
+dead-TV recovery attempt. Cosmetic; revisit if it annoys.
+
+**Next up:** roadmap item 9 — prebuilt AudioTee release + install.sh download.
+
 ## 2026-07-05 — Iteration 7: roadmap item 7 (tests, lint, types, CI)
 
 **Reviewed:** iteration 6 (`3e242e6`, streamer split). Strongest possible check

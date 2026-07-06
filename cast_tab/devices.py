@@ -43,6 +43,25 @@ def discover_devices(timeout: float = 5.0) -> list[CastDevice]:
     return sorted(devices, key=lambda d: d.name.lower())
 
 
+def find_device(devices: list[CastDevice], name: str) -> CastDevice:
+    """Pick a device by name: case-insensitive exact, else unique substring."""
+    if not devices:
+        raise RuntimeError(
+            "No Chromecast devices found on the network. "
+            "Make sure your Chromecast is on and connected to the same LAN."
+        )
+    folded = name.casefold()
+    exact = [d for d in devices if d.name.casefold() == folded]
+    if len(exact) == 1:
+        return exact[0]
+    partial = [d for d in devices if folded in d.name.casefold()]
+    if len(partial) == 1:
+        return partial[0]
+    names = ", ".join(f"'{d.name}'" for d in devices)
+    problem = "is ambiguous" if len(partial) > 1 else "matches no device"
+    raise RuntimeError(f"--device '{name}' {problem}. Devices found: {names}.")
+
+
 def select_device(devices: list[CastDevice]) -> CastDevice:
     """Prompt the user to pick a Chromecast device."""
     if not devices:

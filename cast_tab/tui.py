@@ -272,6 +272,9 @@ class CastTUI(App):
                         position_s=tv.position_s,
                         idle_reason=tv.idle_reason,
                     )
+                    # Re-cast if the TV stopped playing (app killed on the TV,
+                    # stream error); the non-playing card already shows it.
+                    self._caster.ensure_playing()
                 snap = self._stats.snapshot(self._refresh_s)
             except Exception:
                 continue

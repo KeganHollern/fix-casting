@@ -66,9 +66,13 @@ brew install ffmpeg
 cast "https://streamfree.app/embed/soccer/ecuador-vs-ivory-coast?quality=1080p&category=soccer"
 ```
 
-The CLI discovers Chromecast devices on your network and prompts you to pick one. A Chrome window opens locally showing the page; the TV plays the mirrored stream.
+The CLI discovers Chromecast devices on your network and prompts you to pick one (or pass `--device NAME` to skip the prompt). A Chrome window opens locally showing the page; the TV plays the mirrored stream.
 
-Press `Ctrl+C` to stop.
+If the TV stops playing the stream (someone exits the receiver app, a stream
+error), the watchdog re-casts it automatically within ~10s.
+
+Press `Ctrl+C` to stop; a one-line summary (duration, re-casts, dropped
+frames, ffmpeg restarts) prints on exit.
 
 ### Options
 
@@ -87,6 +91,8 @@ cast <url> [options]
   --adblock / --no-adblock
                           Block ads/trackers in the captured tab (default: on)
   --headless              Hide the local browser window (may break some players)
+  --device NAME           Cast to this device by name, skip the picker (case-
+                          insensitive; a unique substring works)
   --discovery-timeout SEC Seconds to search for devices (default: 5)
   --stats                 Print pipeline timing stats every 10s (diagnose lag)
   --stats-interval SEC    Seconds between stats reports (default: 10)
