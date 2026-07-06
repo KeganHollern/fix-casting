@@ -3,6 +3,38 @@
 Running notes from the automated review/implement loop. Newest entry first.
 Roadmap: [codebase-review.md](codebase-review.md) §6.
 
+## 2026-07-05 — Iteration 6: roadmap item 6 (streamer split)
+
+**Reviewed:** iteration 5 (`494d2f3`, CastSession). Failure paths traced: signal
+during `start()` unwinds cleanly, `stop()` is safe on partial init,
+`require_audio` preserves both callers' semantics; the real 30 s harness run
+validated sync. No bugs.
+
+**Implemented — roadmap item 6: split `streamer.py` (M).**
+
+- `encoder.py` — encoder detection (now `lru_cache`d: one subprocess probe per
+  run instead of two per ffmpeg launch), bitrate/GOP tables, HLS args with the
+  segment×list constants factored out, `tv_delay_s()` so the CLI banner derives
+  "~48s TV delay" instead of asserting "~45s", and `FfmpegProcess` — spawn +
+  kill + a **per-instance** stderr tail/drain (closes iteration 2's stale-tail
+  note).
+- `pacing.py` — `LatestFrame` + `BoundedFrameQueue` (put/get/clear/wake_all);
+  the "depth IS the audio lead" analysis moved onto the queue's docstring.
+- `server.py` — `get_local_ip` + `HLSHTTPServer`.
+- `streamer.py` (789 → ~490 lines) keeps `HLSStreamer` as the orchestrator:
+  sampler/writer threads, backpressure watchdog, audio-fd args/drain, and the
+  A/V anchor ordering stay put, delegating to the new modules. Public imports
+  (`DEFAULT_JPEG_QUALITY`, `codec_label`, `default_fps_for_resolution`)
+  re-exported so cli/session/tools are untouched apart from the banner.
+
+**Verified:** compile; garbage-MJPEG drain regression through `FfmpegProcess`
+(13 lines recorded in stats); per-instance tail confirmed on a bad-flag spawn;
+cli stub error path returns 1; full 30 s pipeline harness: **−67 ms median,
+33 ms spread — identical to the pre-refactor baseline from iteration 1**, queue
+depth 1, no drops.
+
+**Next up:** roadmap item 7 — ruff + mypy + pytest unit tests + CI.
+
 ## 2026-07-05 — Iteration 5: roadmap item 5 (CastSession extraction)
 
 **Reviewed:** iteration 4 (`697cfe8`, dead code). The fps collapse preserves

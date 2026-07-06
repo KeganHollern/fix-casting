@@ -9,6 +9,7 @@ import time
 
 from cast_tab.caster import TabCaster
 from cast_tab.devices import discover_devices, select_device
+from cast_tab.encoder import tv_delay_s
 from cast_tab.session import CastSession, SessionConfig
 from cast_tab.stats import PipelineStats
 from cast_tab.streamer import (
@@ -223,7 +224,11 @@ def main(argv: list[str] | None = None) -> int:
         session.start()
 
         audio_mode = "with tab audio" if session.audio_active else "video only"
-        latency_mode = "buffered (~45s TV delay)" if args.buffered else "low-latency"
+        latency_mode = (
+            f"buffered (~{tv_delay_s(buffered=True)}s TV delay)"
+            if args.buffered
+            else "low-latency"
+        )
         bitrate_note = (
             f", {args.video_bitrate:g}M video bitrate"
             if args.video_bitrate is not None

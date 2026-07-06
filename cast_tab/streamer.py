@@ -1,20 +1,40 @@
-"""HLS streaming server and ffmpeg encoder for tab screencast frames."""
+"""HLS streaming orchestrator: paced sampling → ffmpeg encode → HTTP serving.
+
+The pieces live in sibling modules — command construction and the ffmpeg
+process in `encoder`, the frame-pacing primitives in `pacing`, the HTTP
+server in `server`. This module owns the threads and the A/V-sync-critical
+ordering between them.
+"""
 
 from __future__ import annotations
 
 import os
 import shutil
-import socket
-import subprocess
 import tempfile
 import threading
 import time
-from collections import deque
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from cast_tab.audio import DEFAULT_AUDIO_FORMAT, AudioFormat, _pipe_bytes_available
+from cast_tab.encoder import (  # re-exported for callers (cli, tools)
+    DEFAULT_JPEG_QUALITY,
+    FfmpegProcess,
+    codec_label,
+    default_fps_for_resolution,
+    hls_args,
+    video_encoder_args,
+)
+from cast_tab.pacing import BoundedFrameQueue, LatestFrame
+from cast_tab.server import HLSHTTPServer, get_local_ip
 from cast_tab.stats import PipelineStats
+
+__all__ = [
+    "DEFAULT_JPEG_QUALITY",
+    "HLSStreamer",
+    "codec_label",
+    "default_fps_for_resolution",
+    "get_local_ip",
+]
 
 FFMPEG_BACKPRESSURE_WRITE_S = 0.050
 FFMPEG_BACKPRESSURE_DURATION_S = 60.0
@@ -27,181 +47,6 @@ SAMPLER_MAX_CATCHUP_S = 5.0
 # Clamp the manual --audio-offset-ms trim to a sane range; covers the audio
 # pre-roll plus the video frame-queue latency we compensate for.
 MAX_AUTO_AV_OFFSET_S = 3.0
-
-
-def _ffmpeg_supports_encoder(encoder: str) -> bool:
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-encoders"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=5,
-        )
-    except (subprocess.SubprocessError, OSError):
-        return False
-    return encoder in result.stdout
-
-
-def default_fps_for_resolution(width: int, height: int, *, buffered: bool = False) -> int:
-    if buffered:
-        return 30
-    if width * height >= 1920 * 1080:
-        return 23
-    return 24
-
-
-def codec_label() -> str:
-    return "H.264 (VideoToolbox)" if _ffmpeg_supports_encoder("h264_videotoolbox") else "H.264"
-
-
-# 92 keeps the capture crisp so the (mostly local-CPU) JPEG stage isn't the
-# quality bottleneck when there's H.264 bitrate to carry the detail.
-DEFAULT_JPEG_QUALITY = 92
-
-
-def _target_bitrate(
-    width: int,
-    height: int,
-    *,
-    buffered: bool,
-    override_mbps: float | None = None,
-) -> tuple[str, str, str]:
-    """Pick H.264 bitrate targets (bitrate, maxrate, bufsize).
-
-    override_mbps forces the average bitrate (in Mbps) and derives maxrate /
-    bufsize from it using the same ratios as the resolution presets — a roomy
-    VBV (2.4x) when buffered, a tight one (1.1x) when not. Used to sweep
-    bitrate against a Chromecast's network headroom.
-    """
-    if override_mbps is not None:
-        v = override_mbps
-        if buffered:
-            return (f"{v:g}M", f"{v * 1.2:g}M", f"{v * 2.4:g}M")
-        return (f"{v:g}M", f"{v * 1.1:g}M", f"{v * 1.1:g}M")
-    pixels = width * height
-    if pixels >= 1920 * 1080:
-        return ("15M", "18M", "36M") if buffered else ("15M", "16.5M", "16.5M")
-    if pixels >= 1280 * 720:
-        return ("3M", "3.5M", "8M") if buffered else ("2.5M", "3M", "3M")
-    return ("1.5M", "2M", "4M") if buffered else ("1.5M", "2M", "2M")
-
-
-def _video_encoder_args(
-    fps: int,
-    width: int,
-    height: int,
-    *,
-    buffered: bool,
-    bitrate_mbps: float | None = None,
-) -> list[str]:
-    bitrate, maxrate, bufsize = _target_bitrate(
-        width, height, buffered=buffered, override_mbps=bitrate_mbps
-    )
-    gop = fps * (2 if buffered else 1)
-
-    if _ffmpeg_supports_encoder("h264_videotoolbox"):
-        return [
-            "-c:v",
-            "h264_videotoolbox",
-            "-profile:v",
-            "main",
-            "-b:v",
-            bitrate,
-            "-maxrate",
-            maxrate,
-            "-bufsize",
-            bufsize,
-            "-g",
-            str(gop),
-            "-keyint_min",
-            str(fps),
-        ]
-
-    return [
-        "-c:v",
-        "libx264",
-        "-profile:v",
-        "main",
-        "-level",
-        "3.1",
-        "-preset",
-        "medium" if buffered else "veryfast",
-        "-tune",
-        "film" if buffered else "zerolatency",
-        "-pix_fmt",
-        "yuv420p",
-        "-b:v",
-        bitrate,
-        "-maxrate",
-        maxrate,
-        "-bufsize",
-        bufsize,
-        "-g",
-        str(gop),
-        "-keyint_min",
-        str(fps),
-        "-sc_threshold",
-        "0",
-        # No B-frames: avoid frame-reorder latency (video lagging audio).
-        "-bf",
-        "0",
-    ]
-
-
-def _hls_args(*, buffered: bool) -> list[str]:
-    if buffered:
-        return [
-            "-f",
-            "hls",
-            "-hls_time",
-            "4",
-            "-hls_list_size",
-            "12",
-            "-hls_flags",
-            "delete_segments+append_list+omit_endlist+independent_segments",
-            "-hls_segment_type",
-            "mpegts",
-        ]
-    return [
-        "-f",
-        "hls",
-        "-hls_time",
-        "1",
-        "-hls_list_size",
-        "4",
-        "-hls_flags",
-        "delete_segments+append_list+omit_endlist+independent_segments",
-        "-hls_segment_type",
-        "mpegts",
-    ]
-
-
-class LatestFrame:
-    """Thread-safe holder for the most recent captured frame."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._frame: bytes | None = None
-        self._published_at: float | None = None
-        self._generation = 0
-
-    def publish(self, frame: bytes) -> None:
-        with self._lock:
-            self._frame = frame
-            self._published_at = time.monotonic()
-            self._generation += 1
-
-    def peek(self) -> tuple[bytes | None, float | None, int]:
-        with self._lock:
-            return self._frame, self._published_at, self._generation
-
-
-def get_local_ip() -> str:
-    """Return the LAN IP address used for outbound traffic."""
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.connect(("8.8.8.8", 80))
-        return sock.getsockname()[0]
 
 
 class HLSStreamer:
@@ -254,16 +99,10 @@ class HLSStreamer:
         # spawn until this fires so the audio and video inputs anchor their
         # PTS=0 to the same moment (see start()).
         self._first_frame = threading.Event()
-        self._ffmpeg: subprocess.Popen[bytes] | None = None
-        # Tail of ffmpeg's stderr, fed by a drain thread. ffmpeg blocks (and
-        # the whole encode stalls) if its stderr pipe fills, so it must always
-        # be consumed; the tail doubles as the error report on early exit.
-        self._ffmpeg_stderr_tail: deque[str] = deque(maxlen=50)
-        self._ffmpeg_stderr_thread: threading.Thread | None = None
+        self._ffmpeg: FfmpegProcess | None = None
         self._sampler_thread: threading.Thread | None = None
         self._writer_thread: threading.Thread | None = None
-        self._http_server: ThreadingHTTPServer | None = None
-        self._http_thread: threading.Thread | None = None
+        self._http: HLSHTTPServer | None = None
         self._port = port
         self._stopped = threading.Event()
         self._stats = stats
@@ -271,30 +110,14 @@ class HLSStreamer:
         self._backpressure_started_at: float | None = None
         self._last_sampled_generation = -1
         self._known_hls_segments: set[str] = set()
-        # Frames sampled at an even cadence wait here for the writer thread to
-        # push them into ffmpeg. Decoupling the two keeps sampling perfectly
-        # paced even when an ffmpeg write stalls (HLS segment flush, keyframe),
-        # which is what otherwise distorts motion into judder.
-        #
-        # Depth IS the audio lead. ffmpeg's image2pipe timestamps frames by the
-        # time they ARRIVE on its stdin, so a frame that waits `depth/fps`
-        # seconds in this queue reaches the muxer that much later than its audio
-        # and the output plays audio ahead by ~depth/fps. (A deep queue was the
-        # real "audio leads over long runtime" — it grew under encoder
-        # contention and the lead grew with it; an earlier 8s bound let the lead
-        # reach 8s.) In normal operation the writer drains the queue to depth ~1
-        # (the encoder has ample headroom), so the lead is ~one frame. Bound it
-        # at ~1s so even a sustained stall caps the audio lead at ~1s (dropping
-        # the oldest frames past that — a brief stutter — rather than letting the
-        # lead grow unbounded). stats exposes the live lead as queue_depth/fps.
-        self._frame_queue: deque[bytes] = deque()
-        self._queue_cond = threading.Condition()
-        self._queue_maxlen = max(1, self.fps)
+        # Bounded at ~1s of frames: the queue's depth is the live audio lead
+        # (see BoundedFrameQueue's docstring for the full mechanism).
+        self._queue = BoundedFrameQueue(maxlen=max(1, self.fps))
 
     @property
     def playlist_url(self) -> str:
         host = get_local_ip()
-        port = self._port or (self._http_server.server_port if self._http_server else 0)
+        port = self._port or (self._http.port if self._http else 0)
         return f"http://{host}:{port}/stream.m3u8"
 
     # How long to wait for Chrome's screencast to deliver its first frame
@@ -326,7 +149,8 @@ class HLSStreamer:
         self._start_ffmpeg()
         self._start_sampler_thread()
         self._start_writer_thread()
-        self._start_http_server()
+        self._http = HLSHTTPServer(self.work_dir, self._port)
+        self._http.start()
 
     def publish_frame(self, jpeg_data: bytes) -> None:
         if not self._stopped.is_set():
@@ -385,12 +209,11 @@ class HLSStreamer:
         while time.time() < deadline:
             if playlist.exists() and list(self.work_dir.glob("seg*.ts")):
                 return
-            if self._ffmpeg and self._ffmpeg.poll() is not None:
-                # Let the drain thread flush the last of stderr, then report it.
-                if self._ffmpeg_stderr_thread is not None:
-                    self._ffmpeg_stderr_thread.join(timeout=1.0)
-                stderr = "\n".join(self._ffmpeg_stderr_tail)
-                raise RuntimeError(f"ffmpeg exited early: {stderr.strip()}")
+            ffmpeg = self._ffmpeg
+            if ffmpeg is not None and ffmpeg.poll() is not None:
+                raise RuntimeError(
+                    f"ffmpeg exited early: {ffmpeg.stderr_text().strip()}"
+                )
             time.sleep(0.5)
         raise TimeoutError("Timed out waiting for the HLS stream to become ready.")
 
@@ -398,8 +221,7 @@ class HLSStreamer:
         self._stopped.set()
         # Unblock start() if it's still waiting for the first frame.
         self._first_frame.set()
-        with self._queue_cond:
-            self._queue_cond.notify_all()
+        self._queue.wake_all()
 
         for thread in (self._sampler_thread, self._writer_thread):
             if thread and thread.is_alive():
@@ -408,10 +230,8 @@ class HLSStreamer:
         with self._ffmpeg_lock:
             self._kill_ffmpeg()
 
-        if self._http_server:
-            self._http_server.shutdown()
-        if self._http_thread and self._http_thread.is_alive():
-            self._http_thread.join(timeout=3)
+        if self._http is not None:
+            self._http.stop()
 
         if self._owns_work_dir:
             shutil.rmtree(self.work_dir, ignore_errors=True)
@@ -445,10 +265,10 @@ class HLSStreamer:
                 "-f",
                 self.audio_format.ffmpeg_format,
                 # Declare the input at the device's TRUE rate (nominal + drift).
-                # The output is forced to the nominal rate (_audio_encoder args),
-                # so ffmpeg does ONE constant resample of the drift ratio. This
-                # is the clock-drift fix: AudioTee's device clock runs slightly
-                # fast vs the system clock that paces 30fps video, so audio leads
+                # The output is forced to the nominal rate (below), so ffmpeg
+                # does ONE constant resample of the drift ratio. This is the
+                # clock-drift fix: AudioTee's device clock runs slightly fast
+                # vs the system clock that paces 30fps video, so audio leads
                 # over long runs; resampling the true rate down to nominal locks
                 # audio back to real time. A constant ratio (unlike async) adds
                 # no silence and no jitter — it is inaudible (~100ppm).
@@ -525,18 +345,7 @@ class HLSStreamer:
     def _kill_ffmpeg(self) -> None:
         if self._ffmpeg is None:
             return
-        if self._ffmpeg.stdin:
-            try:
-                self._ffmpeg.stdin.close()
-            except OSError:
-                pass
-        if self._ffmpeg.poll() is None:
-            try:
-                self._ffmpeg.terminate()
-                self._ffmpeg.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self._ffmpeg.kill()
-                self._ffmpeg.wait(timeout=3)
+        self._ffmpeg.kill()
         self._ffmpeg = None
 
     def set_audio_offset_ms(self, offset_ms: int) -> int:
@@ -561,8 +370,7 @@ class HLSStreamer:
             # Drop the queued backlog: the sampler keeps producing during the
             # relaunch gap, and a fresh ffmpeg would otherwise inherit and
             # buffer seconds of stale video, inflating the A/V latency.
-            with self._queue_cond:
-                self._frame_queue.clear()
+            self._queue.clear()
             self._start_ffmpeg()
         self._backpressure_started_at = None
 
@@ -626,7 +434,7 @@ class HLSStreamer:
             "0:v",
             "-map",
             "1:a",
-            *_video_encoder_args(
+            *video_encoder_args(
                 self.fps,
                 self.width,
                 self.height,
@@ -643,7 +451,7 @@ class HLSStreamer:
             str(self.audio_format.sample_rate),
             "-ac",
             str(self.audio_format.channels),
-            *_hls_args(buffered=self.buffered),
+            *hls_args(buffered=self.buffered),
             "-hls_segment_filename",
             segment_pattern,
             "-max_muxing_queue_size",
@@ -651,76 +459,20 @@ class HLSStreamer:
             str(playlist),
         ]
 
-        popen_kwargs: dict = {
-            "stdin": subprocess.PIPE,
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.PIPE,
-        }
+        pass_fds: tuple[int, ...] = ()
         if self.audio_fd is not None:
-            # pass_fds keeps only this fd open in the child (close_fds stays
-            # True by default); never inherit the rest of our fds, or ffmpeg
-            # holds pipe write-ends open and never sees EOF on shutdown.
-            popen_kwargs["pass_fds"] = (self.audio_fd,)
+            pass_fds = (self.audio_fd,)
             # Drain the pipe right before the child opens it so ffmpeg starts
             # reading at "now" instead of inheriting buffered pre-roll audio.
             self._drain_audio_fd()
         if self._stats is not None:
             self._stats.trace("ffmpeg spawn (audio+video PTS=0 anchor)")
-        self._ffmpeg = subprocess.Popen(cmd, **popen_kwargs)
-        self._start_ffmpeg_stderr_drain(self._ffmpeg)
+        self._ffmpeg = FfmpegProcess(cmd, pass_fds=pass_fds, stats=self._stats)
         if self._stats is not None:
             self._stats.trace("ffmpeg spawned")
 
-    def _start_ffmpeg_stderr_drain(self, proc: subprocess.Popen[bytes]) -> None:
-        """Continuously drain ffmpeg's stderr into a bounded tail.
-
-        ffmpeg writes errors to stderr for the life of the encode. Left
-        unread, the ~64KB pipe buffer fills and ffmpeg blocks on the write —
-        the encode stalls with no visible cause. Draining keeps ffmpeg
-        running; the tail feeds the early-exit error report and each line is
-        surfaced through stats so encoder errors show up in --stats/--tui
-        instead of disappearing. The thread exits on EOF when ffmpeg dies, so
-        each (re)launch gets its own drain.
-        """
-
-        def run() -> None:
-            try:
-                if proc.stderr is None:
-                    return
-                for raw in proc.stderr:
-                    line = raw.decode(errors="replace").rstrip()
-                    if not line:
-                        continue
-                    self._ffmpeg_stderr_tail.append(line)
-                    if self._stats is not None:
-                        self._stats.record_ffmpeg_stderr(line)
-                    else:
-                        print(f"[ffmpeg] {line}", flush=True)
-            except (OSError, ValueError):
-                pass
-            finally:
-                if proc.stderr is not None:
-                    try:
-                        proc.stderr.close()
-                    except OSError:
-                        pass
-
-        self._ffmpeg_stderr_thread = threading.Thread(
-            target=run, name="ffmpeg-stderr", daemon=True
-        )
-        self._ffmpeg_stderr_thread.start()
-
     def _enqueue_frame(self, frame: bytes) -> None:
-        with self._queue_cond:
-            dropped = 0
-            if len(self._frame_queue) >= self._queue_maxlen:
-                # ffmpeg is sustainably behind; drop the oldest frame so latency
-                # cannot grow without bound. Even sampling is preserved.
-                self._frame_queue.popleft()
-                dropped = 1
-            self._frame_queue.append(frame)
-            depth = len(self._frame_queue)
-            self._queue_cond.notify()
+        depth, dropped = self._queue.put(frame)
         if self._stats is not None:
             self._stats.record_queue(depth=depth, dropped=dropped)
 
@@ -779,12 +531,9 @@ class HLSStreamer:
 
         def run() -> None:
             while not self._stopped.is_set():
-                with self._queue_cond:
-                    while not self._frame_queue and not self._stopped.is_set():
-                        self._queue_cond.wait(timeout=0.5)
-                    if not self._frame_queue:
-                        continue
-                    frame = self._frame_queue.popleft()
+                frame = self._queue.get(self._stopped)
+                if frame is None:
+                    continue
 
                 write_s: float | None = None
                 with self._ffmpeg_lock:
@@ -817,26 +566,3 @@ class HLSStreamer:
 
         self._writer_thread = threading.Thread(target=run, name="hls-writer", daemon=True)
         self._writer_thread.start()
-
-    def _start_http_server(self) -> None:
-        serve_dir = str(self.work_dir)
-
-        class Handler(SimpleHTTPRequestHandler):
-            def __init__(self, *args, **kwargs):
-                super().__init__(*args, directory=serve_dir, **kwargs)
-
-            def log_message(self, _format: str, *_args) -> None:
-                pass
-
-            def end_headers(self) -> None:
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-                super().end_headers()
-
-        self._http_server = ThreadingHTTPServer(("0.0.0.0", self._port), Handler)
-        self._http_thread = threading.Thread(
-            target=self._http_server.serve_forever,
-            name="hls-http",
-            daemon=True,
-        )
-        self._http_thread.start()
