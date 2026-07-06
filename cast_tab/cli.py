@@ -121,7 +121,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Buffer ~45s on the TV for higher quality and smoother playback "
+            "Buffer ~48s on the TV for higher quality and smoother playback "
             "(default: on). Use --no-buffered for lower latency."
         ),
     )
@@ -247,6 +247,7 @@ def main(argv: list[str] | None = None) -> int:
             # Full-screen dashboard owns the terminal and its own poll loop.
             from cast_tab.tui import run_tui
 
+            assert stats is not None  # --tui always collects stats
             run_tui(
                 stats=stats,
                 streamer=session.streamer,
@@ -270,13 +271,15 @@ def main(argv: list[str] | None = None) -> int:
                 f"tv polls every {args.tv_poll_interval:.0f}s)."
             )
 
+        streamer = session.streamer
+        assert streamer is not None  # session.start() succeeded above
         next_stats_at = time.monotonic() + args.stats_interval
         next_tv_poll_at = time.monotonic()
         while not shutting_down:
             now = time.monotonic()
             if stats is not None and now >= next_tv_poll_at:
-                session.streamer.poll_audio_backlog()
-                for event in session.streamer.poll_hls_stats():
+                streamer.poll_audio_backlog()
+                for event in streamer.poll_hls_stats():
                     print(f"[stats] {event}", flush=True)
                 tv = caster.poll_playback_stats()
                 for event in stats.record_tv_poll(

@@ -15,6 +15,7 @@ from collections import deque
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.timer import Timer
 from textual.widgets import Button, Footer, Header, Label, Sparkline, Static
 
 from cast_tab.stats import PipelineStats, StatsSnapshot
@@ -142,7 +143,7 @@ class CastTUI(App):
         # debounce timer applies it (one ffmpeg relaunch) after presses settle.
         self._offset_applied = max(0, int(initial_offset_ms))
         self._offset_pending = self._offset_applied
-        self._apply_timer = None
+        self._apply_timer: Timer | None = None
         self._applying = False
 
         self._poller_stop = threading.Event()
@@ -424,7 +425,7 @@ class CastTUI(App):
         )
         self.query_one("#knob-status", Label).update(status)
 
-    def action_quit(self) -> None:
+    async def action_quit(self) -> None:
         self.exit()
 
 

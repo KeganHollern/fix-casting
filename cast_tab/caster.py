@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 
 import pychromecast
 from pychromecast import Chromecast
-
-from dataclasses import dataclass
 
 from cast_tab.devices import CastDevice
 

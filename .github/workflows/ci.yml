@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main, fable-refactor]
+  pull_request:
+
+jobs:
+  lint-type-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install
+        run: uv sync --group dev
+      - name: Ruff
+        run: uv run ruff check cast_tab tests
+      - name: Mypy
+        run: uv run mypy
+      - name: Unit tests
+        run: uv run pytest -q
+
+  pipeline-sync:
+    # The A/V-sync regression needs ffmpeg with h264 encoding; macOS matches
+    # the platform the tool actually runs on (VideoToolbox path).
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install ffmpeg
+        run: brew install ffmpeg
+      - name: Install
+        run: uv sync --group dev
+      - name: Pipeline tests (slow)
+        run: uv run pytest -q -m slow

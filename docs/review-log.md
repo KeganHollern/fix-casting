@@ -3,6 +3,40 @@
 Running notes from the automated review/implement loop. Newest entry first.
 Roadmap: [codebase-review.md](codebase-review.md) §6.
 
+## 2026-07-05 — Iteration 7: roadmap item 7 (tests, lint, types, CI)
+
+**Reviewed:** iteration 6 (`3e242e6`, streamer split). Strongest possible check
+already ran (identical −67 ms baseline). One drift found and fixed this
+iteration: the banner now derives ~48 s but README/`--buffered` help still said
+~45 s — updated all four spots to ~48 s. No functional bugs.
+
+**Implemented — roadmap item 7: ruff + mypy + pytest + CI (M).**
+
+- `pyproject.toml`: dev dependency group (pytest/ruff/mypy), ruff (line 100,
+  isort), mypy (`check_untyped_defs`, stub-less libs ignored), pytest config —
+  slow tests deselected by default, opt in with `-m slow`.
+- Ruff found 2 issues (unsorted imports, unused `pychromecast` import) — fixed.
+- Mypy found 6 real ones — all fixed: the sloppy `audiotee_path()` return (a
+  roadmap P3), untyped `_apply_timer`, sync `action_quit` overriding textual's
+  async one, and three Optional-flow gaps in `cli.py` now pinned with asserts.
+- `tests/` (24 tests): encoder arg tables incl. a consistency test that the
+  advertised TV delay == hls_time × list_size; pacing (queue bound drops
+  oldest, get/stop semantics); AudioTee metadata parsing; adblock rule
+  filtering (exceptions/element-hiding/scoped rules skipped) with `_cached_list`
+  stubbed; stats snapshot/reset + drift math. Slow (`-m slow`): the garbage-
+  MJPEG stderr-drain regression, work-dir lifecycle, and the **A/V-sync
+  regression** — wraps `tools/test_pipeline_skew.py --seconds 30` and asserts
+  the median flash/beep offset within ±133 ms (4 frames; guards the historical
+  ~700 ms-class skews, not harness noise).
+- `.github/workflows/ci.yml`: ubuntu job (ruff, mypy, unit tests), macOS job
+  (brew ffmpeg + `pytest -m slow`) since VideoToolbox is the production path.
+
+**Verified locally:** ruff clean, mypy clean (14 files), 20 unit tests pass in
+0.1 s, 4 slow tests pass in 42 s (A/V offset within tolerance). No `uv.lock`
+committed yet — CI resolves fresh; consider locking later for reproducibility.
+
+**Next up:** roadmap item 8 — `--device` flag, TV auto-reconnect, exit summary.
+
 ## 2026-07-05 — Iteration 6: roadmap item 6 (streamer split)
 
 **Reviewed:** iteration 5 (`494d2f3`, CastSession). Failure paths traced: signal

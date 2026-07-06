@@ -98,7 +98,8 @@ def audiotee_path() -> Path | None:
     for candidate in AUDIOTEE_CANDIDATES:
         if candidate.exists():
             return candidate
-    return shutil.which("audiotee") and Path(shutil.which("audiotee"))  # type: ignore[arg-type]
+    which = shutil.which("audiotee")
+    return Path(which) if which else None
 
 
 def audiotee_available() -> bool:

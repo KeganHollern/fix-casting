@@ -14,7 +14,7 @@ cast "https://example.com/watch"
 4. Encodes video + audio to HLS with ffmpeg
 5. Tells your Chromecast to play the stream
 
-Buffered mode is on by default (~45s delay on the TV) for smoother, higher-quality playback.
+Buffered mode is on by default (~48s delay on the TV) for smoother, higher-quality playback.
 
 ## Requirements
 
@@ -209,7 +209,7 @@ Read the `tv` stats line:
   the network can't keep up at that bitrate; back it off.
 
 Step up (e.g. 6 → 8 → 10 → 12 Mbps) and stay at each setting a few minutes — with
-the default ~45s buffer, an over-high bitrate takes that long to drain the buffer
+the default ~48s buffer, an over-high bitrate takes that long to drain the buffer
 before it stalls. For faster feedback use `--no-buffered` (small buffer, fails
 fast), then re-confirm your chosen bitrate in normal buffered mode. The highest
 setting that stays `PLAYING` with no stalls is your ceiling; back off ~20% for
@@ -276,7 +276,7 @@ How to read it:
 - **encode fps drops** but capture is fine → ffmpeg encoding is struggling
 - **frame age rises** → encoder is feeding ffmpeg stale frames (usually means capture slowed down)
 - **newest segment age rises** → ffmpeg/HLS segment generation is falling behind
-- **tv position** creeping further behind real time → TV buffer or network (expected ~45s with `--buffered`)
+- **tv position** creeping further behind real time → TV buffer or network (expected ~48s with `--buffered`)
 
 ## Project layout
 
