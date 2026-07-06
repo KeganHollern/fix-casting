@@ -3,6 +3,34 @@
 Running notes from the automated review/implement loop. Newest entry first.
 Roadmap: [codebase-review.md](codebase-review.md) §6.
 
+## 2026-07-05 — Iteration 10: TV controls in the TUI + reconnect-freeze fix
+
+**Reviewed:** iteration 9 (`08357f5`, prebuilt AudioTee). Installer edges hold:
+`curl -f` prevents 404 bodies landing on disk, the Mach-O check catches wrong
+content, curl doesn't quarantine-flag so the binary runs, re-tagging fails
+loudly at `gh release create`. No bugs.
+
+**Implemented — §5 near-term leftovers: TV playback controls + TUI polish.**
+
+- `TabCaster`: `toggle_pause()` (PAUSED is already exempt from the watchdog;
+  a pause longer than the HLS window resumes as a jump to live via re-cast),
+  `volume_step(delta)`, `toggle_mute()` — all None-safe when disconnected.
+- TUI keys: `space` pause/resume, `,`/`.` volume ±5%, `m` mute. All network
+  calls run on worker threads (never the UI thread); results flash in the
+  knob-status line ("TV: volume 55%"). Footer + README key table updated.
+- **Fixed iteration 8's logged gap:** the re-cast watchdog now runs on its own
+  guarded thread in the TUI (`_ensure_playing_bg`), so a dead-TV recovery
+  attempt (~30 s) no longer freezes the metrics poller.
+
+**Verified:** ruff + mypy clean; 35 unit tests (4 new: pause/resume transitions
+with call counts, idle/disconnected no-ops, volume step + device clamp, mute
+flip); binding sanity check (every BINDINGS entry resolves to an action); and a
+**headless Textual pilot run** pressing `space , . m` against a fake caster —
+all four controls fired, confirming the key names.
+
+**Next up:** remaining small items: commit a `uv.lock`, consider volume keys in
+the plain (non-TUI) CLI, or start scoping roadmap item 10 (CPU spike) as notes.
+
 ## 2026-07-05 — Iteration 9: roadmap item 9 (prebuilt AudioTee)
 
 **Reviewed:** iteration 8 (`d48e2d8`). Watchdog failure paths hold: a failed

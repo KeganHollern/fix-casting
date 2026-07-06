@@ -121,6 +121,52 @@ class TabCaster:
         self.reconnects += 1
         return f"TV went {label}; re-cast the stream"
 
+    def toggle_pause(self) -> str | None:
+        """Pause/resume playback on the TV. Returns "paused"/"resumed" or None.
+
+        Note: the stream is live HLS with a rolling window, so a pause longer
+        than the buffer (~48s buffered, ~4s low-latency) will stall on resume —
+        the watchdog then recovers with a re-cast (a jump to live).
+        """
+        if self._chromecast is None:
+            return None
+        mc = self._chromecast.media_controller
+        try:
+            mc.update_status()
+            state = mc.status.player_state if mc.status else None
+            if state == "PAUSED":
+                mc.play()
+                return "resumed"
+            if state == "PLAYING":
+                mc.pause()
+                return "paused"
+        except Exception:
+            return None
+        return None
+
+    def volume_step(self, delta: float) -> float | None:
+        """Nudge the TV volume by delta (-1..1). Returns the new level."""
+        if self._chromecast is None:
+            return None
+        try:
+            if delta >= 0:
+                return self._chromecast.volume_up(delta)
+            return self._chromecast.volume_down(-delta)
+        except Exception:
+            return None
+
+    def toggle_mute(self) -> bool | None:
+        """Flip TV mute. Returns the new muted state, or None if unavailable."""
+        if self._chromecast is None:
+            return None
+        try:
+            status = self._chromecast.status
+            muted = bool(status.volume_muted) if status else False
+            self._chromecast.set_volume_muted(not muted)
+            return not muted
+        except Exception:
+            return None
+
     def poll_playback_stats(self) -> TvPlaybackSnapshot:
         if self._chromecast is None:
             return TvPlaybackSnapshot(None, None, None)

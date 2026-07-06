@@ -118,6 +118,10 @@ class CastTUI(App):
         ("right_curly_bracket", "offset(100)", "audio +100ms"),
         ("left_curly_bracket", "offset(-100)", "audio -100ms"),
         ("r", "offset_reset", "audio 0"),
+        ("space", "toggle_pause", "Pause/Resume TV"),
+        ("comma", "volume(-0.05)", "Vol -"),
+        ("full_stop", "volume(0.05)", "Vol +"),
+        ("m", "toggle_mute", "Mute TV"),
     ]
 
     def __init__(
@@ -150,6 +154,9 @@ class CastTUI(App):
         self._poller: threading.Thread | None = None
         self._last_poll = 0.0
         self._tv_last_poll = 0.0
+        # A dead-TV re-cast can block ~30s (block_until_active + verify), so
+        # recovery runs on its own thread — never on the metrics poller.
+        self._recovering = False
 
     # --- layout -----------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -274,7 +281,7 @@ class CastTUI(App):
                     )
                     # Re-cast if the TV stopped playing (app killed on the TV,
                     # stream error); the non-playing card already shows it.
-                    self._caster.ensure_playing()
+                    self._ensure_playing_bg()
                 snap = self._stats.snapshot(self._refresh_s)
             except Exception:
                 continue
@@ -366,6 +373,55 @@ class CastTUI(App):
         ]
         self.query_one("#status-bar", Static).update("   ".join(parts))
 
+    def _ensure_playing_bg(self) -> None:
+        """Run the TV re-cast watchdog off the poller thread (it can block)."""
+        if self._recovering:
+            return
+        self._recovering = True
+
+        def run() -> None:
+            try:
+                self._caster.ensure_playing()
+            finally:
+                self._recovering = False
+
+        threading.Thread(target=run, name="tv-recover", daemon=True).start()
+
+    # --- TV playback controls (network calls -> worker threads) ------------
+    def _tv_control(self, action) -> None:
+        """Run a caster control off the UI thread and show its result."""
+
+        def run() -> None:
+            result = action()
+            if result is not None:
+                self.call_from_thread(self._show_control_status, result)
+
+        self.run_worker(run, thread=True)
+
+    def _show_control_status(self, text: str) -> None:
+        self.query_one("#knob-status", Label).update(f"TV: {text}")
+
+    def action_toggle_pause(self) -> None:
+        self._tv_control(lambda: self._caster.toggle_pause())
+
+    def action_volume(self, delta: float) -> None:
+        self._tv_control(
+            lambda: (
+                None
+                if (level := self._caster.volume_step(delta)) is None
+                else f"volume {level:.0%}"
+            )
+        )
+
+    def action_toggle_mute(self) -> None:
+        self._tv_control(
+            lambda: (
+                None
+                if (muted := self._caster.toggle_mute()) is None
+                else ("muted" if muted else "unmuted")
+            )
+        )
+
     # --- audio-offset knob ------------------------------------------------
     _OFFSET_STEP_BY_ID = {
         "off_m100": -100, "off_m10": -10, "off_p10": +10, "off_p100": +100,
@@ -424,7 +480,7 @@ class CastTUI(App):
         )
         status = (
             "applying… (brief glitch)" if self._applying
-            else "lip-sync — keys: [ ] ±10   { } ±100   r reset"
+            else "keys: [ ] { } offset   r reset   space pause   , . vol   m mute"
         )
         self.query_one("#knob-status", Label).update(status)
 

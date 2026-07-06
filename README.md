@@ -172,6 +172,9 @@ The **audio-offset knob** at the bottom adjusts lip-sync live. Use the
 | `[` / `]` | audio offset −10 / +10 ms |
 | `{` / `}` | audio offset −100 / +100 ms |
 | `r` | reset offset to 0 |
+| `space` | pause / resume the TV (a pause longer than the buffer resumes as a jump to live) |
+| `,` / `.` | TV volume −5% / +5% |
+| `m` | mute / unmute the TV |
 | `q` | stop the cast and exit |
 
 Changes apply after presses settle (one quick ffmpeg re-sync, so expect a brief
