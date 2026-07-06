@@ -55,10 +55,9 @@ def codec_label() -> str:
     return "H.264 (VideoToolbox)" if _ffmpeg_supports_encoder("h264_videotoolbox") else "H.264"
 
 
-def default_jpeg_quality(width: int, height: int) -> int:
-    # 92 keeps the capture crisp so the (mostly local-CPU) JPEG stage isn't the
-    # quality bottleneck when there's H.264 bitrate to carry the detail.
-    return 92
+# 92 keeps the capture crisp so the (mostly local-CPU) JPEG stage isn't the
+# quality bottleneck when there's H.264 bitrate to carry the detail.
+DEFAULT_JPEG_QUALITY = 92
 
 
 def _target_bitrate(
@@ -335,7 +334,6 @@ class HLSStreamer:
             self._first_frame.set()
             if self._stats is not None:
                 self._stats.trace("first frame published to streamer", once=True)
-                self._stats.record_publish()
 
     def poll_audio_backlog(self) -> None:
         """Sample unread bytes in the audio pipe (ffmpeg's read backlog).

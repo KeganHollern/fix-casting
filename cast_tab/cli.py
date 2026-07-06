@@ -21,10 +21,10 @@ from cast_tab.caster import TabCaster
 from cast_tab.devices import discover_devices, select_device
 from cast_tab.stats import PipelineStats
 from cast_tab.streamer import (
+    DEFAULT_JPEG_QUALITY,
     HLSStreamer,
     codec_label,
     default_fps_for_resolution,
-    default_jpeg_quality,
 )
 
 
@@ -98,8 +98,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=True,
         help=(
             "Block ads/trackers in the captured tab using uBlock Origin's "
-            "default filter lists + EasyList (default: on). Use --no-adblock "
-            "to disable."
+            "network filter lists + Peter Lowe's ad-server list (default: on). "
+            "Use --no-adblock to disable."
         ),
     )
     parser.add_argument(
@@ -173,12 +173,10 @@ def main(argv: list[str] | None = None) -> int:
     encode_fps = args.fps or default_fps_for_resolution(
         args.width, args.height, buffered=args.buffered
     )
-    # Oversample capture so a fresh frame is ready at every encoder tick.
-    capture_fps = max(encode_fps, round(encode_fps * 1.5))
     jpeg_quality = (
         max(1, min(100, args.jpeg_quality))
         if args.jpeg_quality is not None
-        else default_jpeg_quality(args.width, args.height)
+        else DEFAULT_JPEG_QUALITY
     )
     capture_audio = not args.no_audio
     # The TUI is a live view of the same stats, so it needs them collected too.
@@ -196,8 +194,7 @@ def main(argv: list[str] | None = None) -> int:
         args.url,
         width=args.width,
         height=args.height,
-        fps=capture_fps,
-        pace_fps=encode_fps,
+        fps=encode_fps,
         jpeg_quality=jpeg_quality,
         on_frame=lambda _frame: None,
         headless=args.headless,

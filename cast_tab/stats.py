@@ -43,7 +43,6 @@ class StatsSnapshot:
     capture_peak_ms: float
     behind: int
     errors: int
-    timeouts: int
     screencast_lag_ms: float
     screencast_lag_peak_ms: float
     screencast_lag_count: int
@@ -92,7 +91,6 @@ class PipelineStats:
     _capture: _Window = field(default_factory=_Window, repr=False)
     _capture_behind: int = 0
     _capture_errors: int = 0
-    _capture_timeouts: int = 0
     # How stale each frame is when it reaches us: time.time() - the Chrome
     # capture timestamp on the screencast frame. This is the suspected home of
     # the audio-ahead skew (video arriving from Chrome already seconds old).
@@ -111,7 +109,6 @@ class PipelineStats:
     _ts_start: float = field(default_factory=time.monotonic, repr=False)
     _ts_queue: list = field(default_factory=list, repr=False)  # (t, depth, dropped)
     _ts_write: list = field(default_factory=list, repr=False)  # (t, write_s)
-    _publish: _Window = field(default_factory=_Window, repr=False)
     _frame_age: _Window = field(default_factory=_Window, repr=False)
     _encode: _Window = field(default_factory=_Window, repr=False)
     _encode_repeats: int = 0
@@ -189,14 +186,6 @@ class PipelineStats:
     def record_capture_error(self) -> None:
         with self._lock:
             self._capture_errors += 1
-
-    def record_capture_timeout(self) -> None:
-        with self._lock:
-            self._capture_timeouts += 1
-
-    def record_publish(self) -> None:
-        with self._lock:
-            self._publish.add(1.0)
 
     def record_frame_age(self, age_s: float) -> None:
         with self._lock:
@@ -364,7 +353,6 @@ class PipelineStats:
                 capture_peak_ms=self._capture.peak * 1000,
                 behind=self._capture_behind,
                 errors=self._capture_errors,
-                timeouts=self._capture_timeouts,
                 screencast_lag_ms=self._screencast_lag.avg() * 1000,
                 screencast_lag_peak_ms=self._screencast_lag.peak * 1000,
                 screencast_lag_count=self._screencast_lag.count,
@@ -403,10 +391,8 @@ class PipelineStats:
             self._capture.reset()
             self._capture_behind = 0
             self._capture_errors = 0
-            self._capture_timeouts = 0
             self._screencast_lag.reset()
             self._audio_backlog_peak_ms = 0.0
-            self._publish.reset()
             self._frame_age.reset()
             self._encode.reset()
             self._encode_repeats = 0
@@ -436,7 +422,6 @@ class PipelineStats:
             f"capture {s.capture_fps:.1f}/{s.target_fps:.0f} fps, "
             f"capture avg {s.capture_ms:.0f}ms peak {s.capture_peak_ms:.0f}ms"
             + (f", behind {s.behind}x" if s.behind else "")
-            + (f", timeouts {s.timeouts}" if s.timeouts else "")
             + (f", errors {s.errors}" if s.errors else "")
         )
         if s.screencast_lag_count:

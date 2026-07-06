@@ -26,7 +26,6 @@ class TabScreencaster:
         width: int = 1920,
         height: int = 1080,
         fps: int = 24,
-        pace_fps: int | None = None,
         jpeg_quality: int = 75,
         on_frame: Callable[[bytes], None],
         headless: bool = False,
@@ -37,11 +36,10 @@ class TabScreencaster:
         self.url = url
         self.width = width
         self.height = height
+        # The encoder's consumption rate. Capture itself is paint-driven (CDP
+        # screencast has no rate knob); this only sets the "behind" threshold
+        # for capture-latency stats.
         self.fps = fps
-        # The rate the encoder consumes at. Capturing faster than this (fps >
-        # pace_fps) keeps a fresh frame ready at every encoder tick, so the
-        # encoder rarely has to repeat -> smoother constant-rate output.
-        self._pace_fps = pace_fps or fps
         self.jpeg_quality = jpeg_quality
         self._on_frame = on_frame
         self.headless = headless
@@ -172,7 +170,7 @@ class TabScreencaster:
         only enqueues; we ack and publish from this loop so we never re-enter
         Playwright from inside a CDP callback.
         """
-        pace_period = 1.0 / self._pace_fps
+        pace_period = 1.0 / self.fps
         pending: deque[tuple[str | None, str | None, float | None]] = deque()
 
         def on_screencast_frame(params: dict) -> None:

@@ -3,6 +3,37 @@
 Running notes from the automated review/implement loop. Newest entry first.
 Roadmap: [codebase-review.md](codebase-review.md) §6.
 
+## 2026-07-05 — Iteration 4: roadmap item 4 (dead code / doc drift)
+
+**Reviewed:** iteration 3 (`e673e51`, temp-dir cleanup). Teardown ordering is
+sound: sampler/writer joined → ffmpeg killed (waited) → HTTP down → rmtree, so
+nothing writes into a removed dir; the browser rmtrees only after
+`context.close()` returns. Rare edge (close() raising with Chrome alive →
+rmtree under a live process) accepted — close() raising implies the browser is
+already gone. No bugs.
+
+**Implemented — roadmap item 4: delete dead code/knobs, fix doc drift.**
+
+- Removed the inert capture-oversampling knob: `TabScreencaster` collapses
+  `fps`/`pace_fps` into one `fps` (capture is paint-driven; the old capture
+  `fps` was stored and never used). `cli.py` drops the `1.5×` computation;
+  `tools/measure_source_skew.py` updated to the new signature.
+- `stats.py`: removed never-called `record_capture_timeout` (+ its always-zero
+  `timeouts` report field) and write-only `record_publish`/`_publish`.
+- `default_jpeg_quality(w, h)` (ignored its args) → `DEFAULT_JPEG_QUALITY`.
+- `--adblock` help text and `build_block_patterns` docstring said "+ EasyList";
+  the implementation deliberately uses uBO network lists + Peter Lowe's. Fixed.
+- Dropped `requirements.txt` (duplicated `pyproject.toml`, would drift) and the
+  stale `bin/cast` venv shim (superseded by `uv tool install`).
+
+**Verified:** all modules + tools compile; stats report renders with the
+trimmed fields (incl. the new ffmpeg line); cli stub confirms `fps=encode_fps`
+passes through and the error path still returns 1; 15 s pipeline-harness smoke
+run unchanged (queue peak 1, in sync ~33 ms).
+
+**Next up:** roadmap item 5 — extract `CastSession`, de-duplicate the tools
+harness setup.
+
 ## 2026-07-05 — Iteration 3: roadmap item 3 (temp-dir cleanup)
 
 **Reviewed:** iteration 2 (`21220b5`, exit codes). Clean: error path returns 1

@@ -1,4 +1,0 @@
-pychromecast>=14.0.0
-playwright>=1.40.0
-zeroconf>=0.131.0
-textual>=0.80
