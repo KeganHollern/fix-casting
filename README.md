@@ -26,7 +26,7 @@ Buffered mode is on by default (~48s delay on the TV) for smoother, higher-quali
 | **Google Chrome** | Used via Playwright (`channel="chrome"`) |
 | **ffmpeg** | With H.264 encoding (`h264_videotoolbox` on Apple Silicon recommended) |
 | **Chromecast / Google TV** | On the same LAN as your Mac |
-| **Swift** (optional) | Only needed to build AudioTee if not pre-built |
+| **Swift** (optional) | Only needed to build AudioTee when no prebuilt binary is available |
 
 ## Install
 
@@ -44,7 +44,7 @@ cd fix-casting
 ./install.sh
 ```
 
-This uses [`uv tool install`](https://docs.astral.sh/uv/) to install the `cast` command into `~/.local/bin` (in its own isolated environment), downloads Playwright's Chromium (fallback), and builds AudioTee when Swift is available.
+This uses [`uv tool install`](https://docs.astral.sh/uv/) to install the `cast` command into `~/.local/bin` (in its own isolated environment), downloads Playwright's Chromium (fallback), and sets up AudioTee for per-tab audio — preferring a prebuilt binary from this repo's GitHub releases, building from `vendor/audiotee` with Swift only when no prebuilt is available. (Maintainers: push an `audiotee-v*` tag to publish a new prebuilt via the release workflow.)
 
 Make sure `~/.local/bin` is on your `PATH`:
 
@@ -245,7 +245,8 @@ URL → Chrome tab → JPEG frames + PCM audio
 Ensure the TV and Mac are on the same network. Try increasing `--discovery-timeout`.
 
 **No audio on TV**  
-Audio requires AudioTee. Re-run `./install.sh` or build manually:
+Audio requires AudioTee. Re-run `./install.sh` (downloads a prebuilt binary or
+builds one), or build manually:
 
 ```bash
 cd vendor/audiotee && swift build -c release

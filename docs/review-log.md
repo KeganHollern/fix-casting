@@ -3,6 +3,45 @@
 Running notes from the automated review/implement loop. Newest entry first.
 Roadmap: [codebase-review.md](codebase-review.md) §6.
 
+## 2026-07-05 — Iteration 9: roadmap item 9 (prebuilt AudioTee)
+
+**Reviewed:** iteration 8 (`d48e2d8`). Watchdog failure paths hold: a failed
+re-cast resets the counter (retry ~10 s later); the exit summary reads only
+cumulative totals; duplicate device names fall through to the ambiguity error.
+The TUI-poller-freeze-during-recovery note stands as a known cosmetic gap. No
+new bugs.
+
+**Implemented — roadmap item 9: prebuilt AudioTee + install.sh download (M).**
+
+Publishing a GitHub release is outward-facing, so it stays user-triggered:
+
+- `.github/workflows/release-audiotee.yml` — on pushing an `audiotee-v*` tag,
+  builds the vendored fork (stereo-mixdown patch included) on a macOS arm64
+  runner and attaches `audiotee-macos-<arch>` + SHA-256 checksums to a GitHub
+  release. **To publish: `git tag audiotee-v1 && git push origin audiotee-v1`.**
+- `install.sh` resolution order: existing binary → prebuilt download from
+  `releases/latest/download/audiotee-macos-$(uname -m)` (verified as Mach-O
+  before install, partial files cleaned up; URL overridable via
+  `AUDIOTEE_RELEASE_URL`) → `swift build` fallback → actionable warning when
+  neither is possible. Downloads land in `bin/` (already first in
+  `AUDIOTEE_CANDIDATES`, already gitignored).
+- README: Swift is now "only when no prebuilt is available"; maintainer tag
+  instructions included.
+
+**Verified:** `bash -n`; the AudioTee section exercised standalone — happy
+download via a `file://` Mach-O (installed to `bin/audiotee`, executable),
+failed download + swift-less PATH shim (graceful warning, no partial file
+left); full `./install.sh` run is idempotent (section skipped, binaries
+already present); both workflow YAMLs parse.
+
+**Note:** until the user pushes the `audiotee-v1` tag, the download 404s and
+installs behave exactly as before (source build) — no regression window.
+
+**Next up:** roadmap item 10 (CPU-reduction spike) is an L-size research task —
+better suited to a deliberate session than this loop. Remaining smaller
+candidates: `uv.lock` for reproducible installs, TUI reconnect-freeze polish,
+volume/pause passthrough (§5 near-term leftovers).
+
 ## 2026-07-05 — Iteration 8: roadmap item 8 (--device, TV watchdog, summary)
 
 **Reviewed:** iteration 7 (`973377b`, tooling/tests/CI). CI mechanics re-checked:

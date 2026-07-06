@@ -153,7 +153,7 @@ There are zero automated tests, no linter, no type checker, no CI. For a project
 | 6 | Split `streamer.py` into encoder/pacing/server (3.2) | M | ✅ `3e242e6` |
 | 7 | ruff + mypy + pytest unit tests + CI; pipeline-skew test on macOS runner (§4) | M | ✅ |
 | 8 | `--device` flag, TV auto-reconnect, exit summary (§5 near-term) | M | ✅ |
-| 9 | Prebuilt AudioTee release + install.sh download (3.5) | M | |
+| 9 | Prebuilt AudioTee release + install.sh download (3.5) | M | ✅ (tag `audiotee-v1` to publish) |
 | 10 | CPU-reduction spike: Chrome-side encoding via MediaRecorder/WebCodecs | L | |
 
 Items 1–4 are a day of work combined and remove the worst operational risks; 5–7 make the codebase safe to keep evolving; 8–10 are where the product gets meaningfully better for users other than its author.

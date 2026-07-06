@@ -30,17 +30,42 @@ else
 fi
 
 # --- AudioTee (per-tab audio capture, macOS) --------------------------------
-if command -v swift >/dev/null 2>&1; then
-  if [ ! -x "$ROOT/vendor/audiotee/.build/arm64-apple-macosx/release/audiotee" ] \
-    && [ ! -x "$ROOT/vendor/audiotee/.build/release/audiotee" ]; then
+# Resolution order: existing binary → prebuilt download (no Swift needed) →
+# swift build from vendor/. The prebuilt is published by the
+# release-audiotee.yml workflow when an `audiotee-v*` tag is pushed.
+AUDIOTEE_RELEASE_URL="${AUDIOTEE_RELEASE_URL:-https://github.com/KeganHollern/fix-casting/releases/latest/download/audiotee-macos-$(uname -m)}"
+
+have_audiotee() {
+  [ -x "$ROOT/bin/audiotee" ] \
+    || [ -x "$ROOT/vendor/audiotee/.build/arm64-apple-macosx/release/audiotee" ] \
+    || [ -x "$ROOT/vendor/audiotee/.build/release/audiotee" ]
+}
+
+if ! have_audiotee; then
+  echo "Fetching prebuilt AudioTee..."
+  mkdir -p "$ROOT/bin"
+  if curl -fsSL --retry 2 -o "$ROOT/bin/audiotee.tmp" "$AUDIOTEE_RELEASE_URL" 2>/dev/null \
+    && file "$ROOT/bin/audiotee.tmp" | grep -q "Mach-O"; then
+    mv "$ROOT/bin/audiotee.tmp" "$ROOT/bin/audiotee"
+    chmod +x "$ROOT/bin/audiotee"
+    echo "Installed prebuilt AudioTee -> bin/audiotee"
+  else
+    rm -f "$ROOT/bin/audiotee.tmp"
+    echo "No prebuilt AudioTee available; falling back to a source build."
+  fi
+fi
+
+if ! have_audiotee; then
+  if command -v swift >/dev/null 2>&1; then
     echo "Building AudioTee for per-tab audio capture..."
     if [ ! -d "$ROOT/vendor/audiotee" ]; then
       git clone --depth 1 https://github.com/makeusabrew/audiotee.git "$ROOT/vendor/audiotee"
     fi
     (cd "$ROOT/vendor/audiotee" && swift build -c release)
+  else
+    echo "warning: no prebuilt AudioTee and swift not found — per-tab audio capture won't work." >&2
+    echo "         Install Xcode command line tools (xcode-select --install) and re-run." >&2
   fi
-else
-  echo "warning: swift not found — skipping AudioTee build (per-tab audio capture won't work)." >&2
 fi
 
 # --- done -------------------------------------------------------------------

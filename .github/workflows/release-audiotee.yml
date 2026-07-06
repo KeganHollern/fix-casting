@@ -1,0 +1,38 @@
+name: Release AudioTee
+
+# Publishes a prebuilt AudioTee binary (the vendored fork, including the
+# stereo-mixdown patch) so install.sh can download it instead of requiring a
+# Swift toolchain. Trigger by pushing a tag:
+#
+#   git tag audiotee-v1 && git push origin audiotee-v1
+#
+# install.sh resolves releases/latest/download/audiotee-macos-<arch>.
+
+on:
+  push:
+    tags: ["audiotee-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-latest # Apple Silicon (arm64) runners
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build AudioTee
+        run: cd vendor/audiotee && swift build -c release
+      - name: Stage binary with arch suffix
+        run: |
+          BIN=$(find vendor/audiotee/.build -type f -name audiotee -path "*release*" | head -1)
+          cp "$BIN" "audiotee-macos-$(uname -m)"
+          file "audiotee-macos-$(uname -m)"
+          shasum -a 256 "audiotee-macos-$(uname -m)" | tee checksums.txt
+      - name: Create release with binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "AudioTee prebuilt (${{ github.ref_name }})" \
+            --notes "Prebuilt AudioTee for install.sh (vendored fork with the stereo-mixdown patch). SHA-256 in checksums.txt." \
+            "audiotee-macos-$(uname -m)" checksums.txt
