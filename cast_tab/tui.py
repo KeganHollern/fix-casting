@@ -14,6 +14,7 @@ import time
 from collections import deque
 
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.timer import Timer
 from textual.widgets import Button, Footer, Header, Label, Sparkline, Static
@@ -118,7 +119,9 @@ class CastTUI(App):
         ("right_curly_bracket", "offset(100)", "audio +100ms"),
         ("left_curly_bracket", "offset(-100)", "audio -100ms"),
         ("r", "offset_reset", "audio 0"),
-        ("space", "toggle_pause", "Pause/Resume TV"),
+        # priority=True so space pauses the TV even when a knob Button has
+        # focus (a focused Button otherwise consumes space to press itself).
+        Binding("space", "toggle_pause", "Pause/Resume TV", priority=True),
         ("comma", "volume(-0.05)", "Vol -"),
         ("full_stop", "volume(0.05)", "Vol +"),
         ("m", "toggle_mute", "Mute TV"),

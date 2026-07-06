@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - name: Install
-        run: uv sync --group dev
+        run: uv sync --frozen --group dev
       - name: Ruff
         run: uv run ruff check cast_tab tests
       - name: Mypy
@@ -30,6 +30,6 @@ jobs:
       - name: Install ffmpeg
         run: brew install ffmpeg
       - name: Install
-        run: uv sync --group dev
+        run: uv sync --frozen --group dev
       - name: Pipeline tests (slow)
         run: uv run pytest -q -m slow

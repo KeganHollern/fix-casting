@@ -3,6 +3,33 @@
 Running notes from the automated review/implement loop. Newest entry first.
 Roadmap: [codebase-review.md](codebase-review.md) §6.
 
+## 2026-07-05 — Iteration 11: uv.lock + Python floor fix (+ space-key bug)
+
+**Reviewed:** iteration 10 (`79c1015`, TV controls). Found one real bug, not a
+known gap → fixed per loop policy: after clicking a knob Button it keeps focus,
+and a focused Textual Button consumes `space` to press itself — so `space`
+re-nudged the audio offset instead of pausing. Fix: the space binding is now
+`Binding(..., priority=True)`. Verified with a pilot test that focuses the
+`+10` button, presses space, and asserts the TV paused and the offset didn't
+move. Also noted (accepted): `_recovering` is an unlocked bool — a worst-case
+race double-spawns one recovery thread, harmless.
+
+**Implemented — reproducible installs (`uv.lock`).**
+
+- `uv lock` immediately surfaced a real packaging lie: `pychromecast>=14`
+  requires Python ≥3.11, so our declared `>=3.10` was never installable on
+  3.10. Floor bumped honestly: `requires-python >=3.11`, ruff `py311`, mypy
+  `3.11`, README requirements row.
+- `uv.lock` committed (35 packages); CI now installs with
+  `uv sync --frozen --group dev` in both jobs, so PRs fail loudly when the
+  lock is stale instead of silently resolving something new.
+
+**Verified:** `uv sync --frozen --dry-run` resolves cleanly against the lock;
+ruff + mypy clean; 35 unit tests pass; space-key pilot regression test passes.
+
+**Next up:** scope roadmap item 10 (Chrome-side encoding spike) as a written
+design note, or non-TUI volume keys — else the loop's roadmap is drained.
+
 ## 2026-07-05 — Iteration 10: TV controls in the TUI + reconnect-freeze fix
 
 **Reviewed:** iteration 9 (`08357f5`, prebuilt AudioTee). Installer edges hold:

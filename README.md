@@ -21,7 +21,7 @@ Buffered mode is on by default (~48s delay on the TV) for smoother, higher-quali
 | Requirement | Notes |
 |---|---|
 | **macOS 14.2+** | Required for per-tab audio capture via [AudioTee](https://github.com/makeusabrew/audiotee) |
-| **Python 3.10+** | |
+| **Python 3.11+** | |
 | **[uv](https://docs.astral.sh/uv/)** | Used by `install.sh` to install the `cast` CLI |
 | **Google Chrome** | Used via Playwright (`channel="chrome"`) |
 | **ffmpeg** | With H.264 encoding (`h264_videotoolbox` on Apple Silicon recommended) |
