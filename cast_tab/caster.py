@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import pychromecast
@@ -33,6 +35,8 @@ class TabCaster:
         self._playlist_url: str | None = None
         self._idle_polls = 0
         self.reconnects = 0
+        self._watchdog_stop = threading.Event()
+        self._watchdog_thread: threading.Thread | None = None
 
     def connect(self) -> None:
         print(f"Connecting to {self.device.name}...")
@@ -95,10 +99,13 @@ class TabCaster:
         Transport drops are NOT handled here: pychromecast's socket client
         reconnects itself, and update_status just fails until it has.
         """
-        if self._chromecast is None or self._playlist_url is None:
+        # Local snapshot: stop() nulls self._chromecast from another thread;
+        # a local keeps the object alive so we never deref None mid-call.
+        chromecast = self._chromecast
+        if chromecast is None or self._playlist_url is None:
             return None
-        mc = self._chromecast.media_controller
         try:
+            mc = chromecast.media_controller
             mc.update_status()
             status = mc.status
         except Exception:
@@ -128,10 +135,11 @@ class TabCaster:
         than the buffer (~48s buffered, ~4s low-latency) will stall on resume —
         the watchdog then recovers with a re-cast (a jump to live).
         """
-        if self._chromecast is None:
+        chromecast = self._chromecast
+        if chromecast is None:
             return None
-        mc = self._chromecast.media_controller
         try:
+            mc = chromecast.media_controller
             mc.update_status()
             state = mc.status.player_state if mc.status else None
             if state == "PAUSED":
@@ -146,33 +154,65 @@ class TabCaster:
 
     def volume_step(self, delta: float) -> float | None:
         """Nudge the TV volume by delta (-1..1). Returns the new level."""
-        if self._chromecast is None:
+        chromecast = self._chromecast
+        if chromecast is None:
             return None
         try:
             if delta >= 0:
-                return self._chromecast.volume_up(delta)
-            return self._chromecast.volume_down(-delta)
+                return chromecast.volume_up(delta)
+            return chromecast.volume_down(-delta)
         except Exception:
             return None
 
     def toggle_mute(self) -> bool | None:
         """Flip TV mute. Returns the new muted state, or None if unavailable."""
-        if self._chromecast is None:
+        chromecast = self._chromecast
+        if chromecast is None:
             return None
         try:
-            status = self._chromecast.status
+            status = chromecast.status
             muted = bool(status.volume_muted) if status else False
-            self._chromecast.set_volume_muted(not muted)
+            chromecast.set_volume_muted(not muted)
             return not muted
         except Exception:
             return None
 
+    def start_watchdog(
+        self,
+        *,
+        grace_s: float = 15.0,
+        interval_s: float = 5.0,
+        on_event: Callable[[str], None] | None = None,
+    ) -> None:
+        """Run ensure_playing() on a background thread until stop().
+
+        One watchdog serves both the CLI and the TUI: recovery (which can
+        block ~50s re-casting to a dead TV) never runs on a caller's loop.
+        The grace period keeps startup buffering from counting as idle.
+        """
+
+        def run() -> None:
+            if self._watchdog_stop.wait(grace_s):
+                return
+            while not self._watchdog_stop.is_set():
+                event = self.ensure_playing()
+                if event and on_event is not None:
+                    on_event(event)
+                if self._watchdog_stop.wait(interval_s):
+                    return
+
+        self._watchdog_thread = threading.Thread(
+            target=run, name="tv-watchdog", daemon=True
+        )
+        self._watchdog_thread.start()
+
     def poll_playback_stats(self) -> TvPlaybackSnapshot:
-        if self._chromecast is None:
+        chromecast = self._chromecast
+        if chromecast is None:
             return TvPlaybackSnapshot(None, None, None)
         try:
-            self._chromecast.media_controller.update_status()
-            status = self._chromecast.media_controller.status
+            chromecast.media_controller.update_status()
+            status = chromecast.media_controller.status
         except Exception:
             return TvPlaybackSnapshot(None, None, None)
         if status is None:
@@ -185,14 +225,16 @@ class TabCaster:
         )
 
     def stop(self) -> None:
-        if self._chromecast is None:
+        self._watchdog_stop.set()
+        chromecast = self._chromecast
+        self._chromecast = None
+        if chromecast is None:
             return
         try:
-            self._chromecast.media_controller.stop()
+            chromecast.media_controller.stop()
         except Exception:
             pass
         try:
-            self._chromecast.disconnect()
+            chromecast.disconnect()
         except Exception:
             pass
-        self._chromecast = None

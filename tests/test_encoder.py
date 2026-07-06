@@ -1,5 +1,8 @@
 """Unit tests for encoder arg construction (pure, no ffmpeg needed)."""
 
+import subprocess
+
+import cast_tab.encoder as encoder
 from cast_tab.encoder import (
     default_fps_for_resolution,
     hls_args,
@@ -7,6 +10,28 @@ from cast_tab.encoder import (
     tv_delay_s,
     video_encoder_args,
 )
+
+
+def test_encoder_probe_failure_is_not_cached(monkeypatch):
+    """A transient probe failure must not pin False for the whole run."""
+    monkeypatch.setattr(encoder, "_encoder_support", {})
+    calls = {"n": 0}
+
+    def flaky_run(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=5)
+
+        class R:
+            stdout = "... h264_videotoolbox ..."
+
+        return R()
+
+    monkeypatch.setattr(encoder.subprocess, "run", flaky_run)
+    assert encoder.ffmpeg_supports_encoder("h264_videotoolbox") is False
+    assert encoder.ffmpeg_supports_encoder("h264_videotoolbox") is True  # re-probed
+    assert encoder.ffmpeg_supports_encoder("h264_videotoolbox") is True  # cached
+    assert calls["n"] == 2
 
 
 def test_target_bitrate_resolution_tiers():

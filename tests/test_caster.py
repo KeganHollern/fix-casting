@@ -134,6 +134,45 @@ def test_toggle_mute_flips():
     assert TabCaster(device=None).toggle_mute() is None
 
 
+def test_watchdog_recovers_in_background():
+    import time
+
+    caster = _caster([FakeStatus("IDLE", "FINISHED")] * 10)
+    events = []
+    caster.start_watchdog(grace_s=0.05, interval_s=0.05, on_event=events.append)
+    deadline = time.monotonic() + 3.0
+    while not events and time.monotonic() < deadline:
+        time.sleep(0.02)
+    caster.stop()
+    assert events and "re-cast the stream" in events[0]
+    assert caster.reconnects == 1
+    # stop() ends the watchdog thread.
+    caster._watchdog_thread.join(timeout=2)
+    assert not caster._watchdog_thread.is_alive()
+
+
+def test_watchdog_respects_grace_period():
+    import time
+
+    caster = _caster([FakeStatus("IDLE", "FINISHED")] * 10)
+    events = []
+    caster.start_watchdog(grace_s=10.0, interval_s=0.05, on_event=events.append)
+    time.sleep(0.3)  # well past several intervals, still inside grace
+    caster.stop()
+    assert events == []
+    assert caster.reconnects == 0
+
+
+def test_stop_is_safe_during_control_calls():
+    """stop() nulls _chromecast; concurrent control calls must not raise."""
+    caster = _caster([FakeStatus("PLAYING")] * 3)
+    caster.stop()
+    assert caster.ensure_playing() is None
+    assert caster.toggle_pause() is None
+    assert caster.volume_step(0.05) is None
+    assert caster.toggle_mute() is None
+
+
 def test_status_exception_is_swallowed():
     caster = _caster([])
 

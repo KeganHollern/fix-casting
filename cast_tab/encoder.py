@@ -5,7 +5,6 @@ from __future__ import annotations
 import subprocess
 import threading
 from collections import deque
-from functools import lru_cache
 
 from cast_tab.stats import PipelineStats
 
@@ -19,8 +18,15 @@ HLS_TIME_S = {"buffered": 4, "low_latency": 1}
 HLS_LIST_SIZE = {"buffered": 12, "low_latency": 4}
 
 
-@lru_cache(maxsize=None)
+# Memoized by hand instead of lru_cache: only a probe that actually ran gets
+# cached. Caching a transient failure (timeout under startup load) as False
+# would silently downgrade every (re)launch of the whole cast to libx264.
+_encoder_support: dict[str, bool] = {}
+
+
 def ffmpeg_supports_encoder(encoder: str) -> bool:
+    if encoder in _encoder_support:
+        return _encoder_support[encoder]
     try:
         result = subprocess.run(
             ["ffmpeg", "-hide_banner", "-encoders"],
@@ -30,8 +36,10 @@ def ffmpeg_supports_encoder(encoder: str) -> bool:
             timeout=5,
         )
     except (subprocess.SubprocessError, OSError):
-        return False
-    return encoder in result.stdout
+        return False  # transient; re-probe next call
+    supported = encoder in result.stdout
+    _encoder_support[encoder] = supported
+    return supported
 
 
 def default_fps_for_resolution(width: int, height: int, *, buffered: bool = False) -> int:
@@ -221,6 +229,10 @@ class FfmpegProcess:
     def stdin(self):
         return self._proc.stdin
 
+    @property
+    def pid(self) -> int:
+        return self._proc.pid
+
     def poll(self) -> int | None:
         return self._proc.poll()
 
@@ -229,16 +241,37 @@ class FfmpegProcess:
         self._stderr_thread.join(timeout=join_timeout)
         return "\n".join(self.stderr_tail)
 
-    def kill(self) -> None:
-        if self._proc.stdin:
+    def kill(self, *, graceful: bool = False) -> None:
+        """Stop this ffmpeg. graceful=True closes stdin first (EOF) so ffmpeg
+        flushes pending error output and exits on its own — only safe when no
+        thread can be blocked writing to stdin, because a blocked writer holds
+        the buffered file's internal lock (close() would block on it) and only
+        killing the reader unblocks that writer. Default is terminate-first,
+        which is always deadlock-safe.
+        """
+        if graceful and self._proc.stdin and self._proc.poll() is None:
             try:
                 self._proc.stdin.close()
-            except OSError:
+            except (OSError, ValueError):
                 pass
+            try:
+                self._proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass  # didn't exit on EOF; fall through to terminate
         if self._proc.poll() is None:
             try:
                 self._proc.terminate()
                 self._proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self._proc.kill()
-                self._proc.wait(timeout=3)
+                try:
+                    self._proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    # Unreapable (uninterruptible I/O); abandon rather than
+                    # abort the caller's teardown mid-way.
+                    pass
+        if self._proc.stdin:
+            try:
+                self._proc.stdin.close()
+            except (OSError, ValueError):
+                pass

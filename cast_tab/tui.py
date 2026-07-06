@@ -157,9 +157,6 @@ class CastTUI(App):
         self._poller: threading.Thread | None = None
         self._last_poll = 0.0
         self._tv_last_poll = 0.0
-        # A dead-TV re-cast can block ~30s (block_until_active + verify), so
-        # recovery runs on its own thread — never on the metrics poller.
-        self._recovering = False
 
     # --- layout -----------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -282,13 +279,14 @@ class CastTUI(App):
                         position_s=tv.position_s,
                         idle_reason=tv.idle_reason,
                     )
-                    # Re-cast if the TV stopped playing (app killed on the TV,
-                    # stream error); the non-playing card already shows it.
-                    self._ensure_playing_bg()
                 snap = self._stats.snapshot(self._refresh_s)
             except Exception:
                 continue
-            self.call_from_thread(self._render, snap)
+            try:
+                self.call_from_thread(self._render, snap)
+            except RuntimeError:
+                # App began shutting down while this iteration was in flight.
+                break
 
     @staticmethod
     def _lvl(warn: bool, bad: bool = False) -> str:
@@ -375,20 +373,6 @@ class CastTUI(App):
             dot(f"sync ~{s.drift_ms:.0f}ms", s.drift_ms >= 400, s.drift_ms >= 150),
         ]
         self.query_one("#status-bar", Static).update("   ".join(parts))
-
-    def _ensure_playing_bg(self) -> None:
-        """Run the TV re-cast watchdog off the poller thread (it can block)."""
-        if self._recovering:
-            return
-        self._recovering = True
-
-        def run() -> None:
-            try:
-                self._caster.ensure_playing()
-            finally:
-                self._recovering = False
-
-        threading.Thread(target=run, name="tv-recover", daemon=True).start()
 
     # --- TV playback controls (network calls -> worker threads) ------------
     def _tv_control(self, action) -> None:

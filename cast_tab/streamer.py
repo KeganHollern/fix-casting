@@ -227,8 +227,13 @@ class HLSStreamer:
             if thread and thread.is_alive():
                 thread.join(timeout=5)
 
+        # If the writer exited, nothing can be blocked on ffmpeg's stdin, so
+        # a graceful EOF close lets ffmpeg flush its buffered error lines
+        # into the stderr drain before dying. If the writer is still alive
+        # (wedged in a blocked write), terminate-first is the only safe order.
+        writer_done = not (self._writer_thread and self._writer_thread.is_alive())
         with self._ffmpeg_lock:
-            self._kill_ffmpeg()
+            self._kill_ffmpeg(graceful=writer_done)
 
         if self._http is not None:
             self._http.stop()
@@ -342,10 +347,10 @@ class HLSStreamer:
             if self._stats is not None:
                 self._stats.trace(f"audio pre-roll drained ({ms:.0f}ms)")
 
-    def _kill_ffmpeg(self) -> None:
+    def _kill_ffmpeg(self, *, graceful: bool = False) -> None:
         if self._ffmpeg is None:
             return
-        self._ffmpeg.kill()
+        self._ffmpeg.kill(graceful=graceful)
         self._ffmpeg = None
 
     def set_audio_offset_ms(self, offset_ms: int) -> int:
@@ -371,6 +376,12 @@ class HLSStreamer:
             # relaunch gap, and a fresh ffmpeg would otherwise inherit and
             # buffer seconds of stale video, inflating the A/V latency.
             self._queue.clear()
+            # Re-check under the lock: stop() may have completed between our
+            # caller's check and here (e.g. the TUI's debounced offset apply
+            # racing a quit) — spawning now would orphan an ffmpeg pointed at
+            # the already-removed work dir.
+            if self._stopped.is_set():
+                return
             self._start_ffmpeg()
         self._backpressure_started_at = None
 
@@ -535,22 +546,35 @@ class HLSStreamer:
                 if frame is None:
                     continue
 
-                write_s: float | None = None
+                # Snapshot the current instance under the lock, but write
+                # OUTSIDE it: stdin.write blocks indefinitely when ffmpeg
+                # wedges with a full pipe, and holding the lock across that
+                # would deadlock stop()/relaunch (which need the lock to kill
+                # ffmpeg — the only thing that unblocks the write).
                 with self._ffmpeg_lock:
                     ffmpeg = self._ffmpeg
-                    stdin = ffmpeg.stdin if ffmpeg is not None else None
-                    if ffmpeg is not None and ffmpeg.poll() is None and stdin is not None:
-                        try:
-                            write_started = time.monotonic()
-                            stdin.write(frame)
-                            stdin.flush()
-                            write_s = time.monotonic() - write_started
-                        except (BrokenPipeError, OSError):
-                            write_s = None
+
+                write_s: float | None = None
+                stdin = ffmpeg.stdin if ffmpeg is not None else None
+                if ffmpeg is not None and ffmpeg.poll() is None and stdin is not None:
+                    try:
+                        write_started = time.monotonic()
+                        stdin.write(frame)
+                        stdin.flush()
+                        write_s = time.monotonic() - write_started
+                    except (BrokenPipeError, OSError, ValueError):
+                        # ValueError: stdin closed under us by a kill/relaunch.
+                        write_s = None
 
                 if write_s is None:
                     if self._stopped.is_set():
                         break
+                    with self._ffmpeg_lock:
+                        replaced = self._ffmpeg is not ffmpeg
+                    if replaced:
+                        # A relaunch (offset change, restart) swapped instances
+                        # mid-write; the new ffmpeg is healthy — don't kill it.
+                        continue
                     # ffmpeg died or the pipe broke; respawn it (outside the
                     # lock) and keep streaming from the next queued frame.
                     self._restart_ffmpeg()

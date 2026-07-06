@@ -84,13 +84,17 @@ class TabScreencaster:
             self._thread.join(timeout=10)
 
     def _run(self) -> None:
+        # Each run gets a fresh mkdtemp profile; without cleanup they
+        # accumulate in /tmp at tens-to-hundreds of MB per cast. Only remove
+        # it when Chrome is known dead — if context.close() itself failed,
+        # a live Chrome may still be using the dir, and deleting it out from
+        # under the process is worse than leaking one profile.
+        self._chrome_may_be_alive = False
         try:
             self._run_browser()
         finally:
-            # Each run gets a fresh mkdtemp profile; without cleanup they
-            # accumulate in /tmp at tens-to-hundreds of MB per cast. Chrome
-            # has exited by now (context.close() above), so removal is safe.
-            shutil.rmtree(self.user_data_dir, ignore_errors=True)
+            if not self._chrome_may_be_alive:
+                shutil.rmtree(self.user_data_dir, ignore_errors=True)
 
     def _run_browser(self) -> None:
         with sync_playwright() as playwright:
@@ -123,6 +127,7 @@ class TabScreencaster:
                     ignore_https_errors=True,
                 )
 
+            self._chrome_may_be_alive = True
             try:
                 context.grant_permissions(["notifications", "geolocation"])
                 page = context.pages[0] if context.pages else context.new_page()
@@ -147,8 +152,9 @@ class TabScreencaster:
                 self._run_screencast(page, cdp)
             finally:
                 # Close in all paths (goto/setup failures included) so Chrome
-                # is not left running against the profile dir we remove below.
+                # is not left running against the profile dir we remove after.
                 context.close()
+                self._chrome_may_be_alive = False
 
     def _start_screencast(self, cdp) -> None:
         cdp.send(

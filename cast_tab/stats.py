@@ -87,7 +87,10 @@ class PipelineStats:
     """Thread-safe counters for each stage of the cast pipeline."""
 
     target_fps: float = 30.0
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # RLock, not Lock: the CLI's signal handler reads stats from the same
+    # main thread that may be holding the lock mid-report when SIGINT lands;
+    # a non-reentrant lock deadlocks that path.
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _capture: _Window = field(default_factory=_Window, repr=False)
     _capture_behind: int = 0
     _capture_errors: int = 0
@@ -323,6 +326,16 @@ class PipelineStats:
                 self._tv_last_poll_at = now
 
         return events
+
+    def totals(self) -> tuple[int, int]:
+        """Cumulative (dropped frames, ffmpeg restarts) — read-only, no reset.
+
+        The exit summary uses this instead of snapshot(): snapshot resets the
+        interval windows as a side effect, which is wrong at exit time and can
+        race a still-running poller.
+        """
+        with self._lock:
+            return self._queue_dropped_total, self._ffmpeg_restarts_total
 
     def snapshot(self, interval_s: float) -> StatsSnapshot:
         """Collect this interval's metrics into a struct and reset the windows.

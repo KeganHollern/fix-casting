@@ -3,6 +3,57 @@
 Running notes from the automated review/implement loop. Newest entry first.
 Roadmap: [codebase-review.md](codebase-review.md) §6.
 
+## 2026-07-06 — Full-codebase review fixes (post-PR#2 review)
+
+An 8-angle multi-agent review of the whole branch confirmed 12 correctness
+bugs and 12 cleanup findings (1 candidate refuted empirically). Fixed in this
+pass — chosen triage: everything that can hang, orphan, crash a thread, or
+silently degrade quality; consolidation over point-patches; 2 one-liners.
+
+**Shutdown/threading correctness:**
+- Ctrl+C stats deadlock: `PipelineStats` lock → RLock, and the exit summary
+  reads a new `totals()` accessor instead of a resetting `snapshot()`.
+- Writer-lock deadlock: the writer now snapshots the ffmpeg instance under
+  the lock but writes **outside** it, with an instance-identity check before
+  restarting (a relaunch mid-write no longer gets its fresh ffmpeg killed).
+- `FfmpegProcess.kill()`: terminate-first (killing the reader is what
+  unblocks a wedged writer; closing the buffered stdin first can block on
+  the writer's own buffer lock), with `graceful=True` EOF-close used by
+  normal `stop()` after the writer has joined — preserving the EOF error
+  flush the stderr-drain test caught me regressing. Post-SIGKILL wait
+  guarded. Verified live both ways with a wedged `sleep` child.
+- Relaunch-after-stop race: `_relaunch_ffmpeg` re-checks `_stopped` under
+  the lock — no more orphan ffmpeg spawned into a deleted work dir.
+- `TabCaster`: all control/status methods snapshot `self._chromecast` into
+  a local (stop() nulling it mid-call can no longer AttributeError a
+  daemon thread); `stop()` nulls before disconnecting.
+- TUI poller: `call_from_thread` wrapped — a quit mid-iteration exits the
+  poller instead of tracebacking over the restored terminal.
+- Browser: profile dir removed only when Chrome is known dead
+  (`context.close()` succeeded or launch failed) — no rmtree under a
+  possibly-live Chrome.
+- Encoder probe: hand memo replaces `lru_cache` so a transient probe
+  failure is re-probed instead of pinning libx264 for the whole cast.
+
+**Consolidation (fixes 4 findings at once):** the TV re-cast watchdog now
+lives in `TabCaster.start_watchdog()` (grace 15s, 5s cadence, background
+thread, stopped by `caster.stop()`); the CLI's blocking inline check and the
+TUI's per-poll thread-spawner are both gone. `FfmpegProcess` gained `pid`,
+un-breaking `tools/test_pipeline_skew.py --inject-stall`.
+
+**One-liners:** `--audio-offset-ms` help no longer promises negative offsets;
+`SessionConfig.jpeg_quality` uses `DEFAULT_JPEG_QUALITY`.
+
+**Verified:** ruff + mypy clean; 43 tests (4 new: watchdog recovery/grace/
+stop-safety, probe-cache); both kill orderings exercised against a live
+wedged writer; bad `--device` exits 1 with a one-line error; full slow suite
+incl. the 30 s A/V-sync regression passes after the writer-lock restructure.
+
+**Deferred (logged, not merge blockers):** stderr-drain and AudioTee-JSON
+parse dedup, install.sh path unification with `AUDIOTEE_CANDIDATES`, volume
+keypress coalescing, unused `port` param, `CAST_TEST_WRITE_DELAY_MS`,
+`__all__` drift, status-poll idiom dedup in TabCaster.
+
 ## 2026-07-05 — Iteration 12: roadmap item 10 scoped (CPU spike plan)
 
 **Reviewed:** iteration 11 (`4ff5c78`). The priority space binding means space

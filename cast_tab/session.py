@@ -23,6 +23,7 @@ from cast_tab.audio import (
     try_start_chrome_audio_capture,
 )
 from cast_tab.browser import TabScreencaster
+from cast_tab.encoder import DEFAULT_JPEG_QUALITY
 from cast_tab.stats import PipelineStats
 from cast_tab.streamer import HLSStreamer
 
@@ -35,7 +36,7 @@ class SessionConfig:
     width: int = 1920
     height: int = 1080
     fps: int = 30  # encode rate; capture itself is paint-driven
-    jpeg_quality: int = 92
+    jpeg_quality: int = DEFAULT_JPEG_QUALITY
     buffered: bool = True
     headless: bool = False
     capture_audio: bool = True

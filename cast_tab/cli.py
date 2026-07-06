@@ -107,9 +107,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "Manual A/V trim in ms (default: 0). Positive delays audio (use if "
-            "audio is ahead of video); negative advances it. Use to dial in "
-            "lip-sync."
+            "Manual A/V trim in ms (default: 0). Positive delays audio (use "
+            "if audio is ahead of video); the skew is structurally always "
+            "audio-ahead, so negative values are ignored."
         ),
     )
     parser.add_argument(
@@ -167,12 +167,17 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
     print("Searching for Chromecast devices...")
-    devices = discover_devices(timeout=args.discovery_timeout)
-    if args.device:
-        device = find_device(devices, args.device)
-        print(f"Casting to {device.name}.")
-    else:
-        device = select_device(devices)
+    try:
+        devices = discover_devices(timeout=args.discovery_timeout)
+        if args.device:
+            device = find_device(devices, args.device)
+            print(f"Casting to {device.name}.")
+        else:
+            device = select_device(devices)
+    except RuntimeError as exc:
+        # No devices / bad --device: a clean one-line error, not a traceback.
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
     encode_fps = args.fps or default_fps_for_resolution(
         args.width, args.height, buffered=args.buffered
@@ -228,11 +233,11 @@ def main(argv: list[str] | None = None) -> int:
         if caster.reconnects:
             parts.append(f"{caster.reconnects} TV re-casts")
         if stats is not None:
-            snap = stats.snapshot(1.0)
-            if snap.dropped_total:
-                parts.append(f"{snap.dropped_total} frames dropped (stutter)")
-            if snap.restarts_total:
-                parts.append(f"{snap.restarts_total} ffmpeg restarts")
+            dropped_total, restarts_total = stats.totals()
+            if dropped_total:
+                parts.append(f"{dropped_total} frames dropped (stutter)")
+            if restarts_total:
+                parts.append(f"{restarts_total} ffmpeg restarts")
         print(f"Summary: {', '.join(parts)}.")
 
     def shutdown() -> None:
@@ -277,6 +282,15 @@ def main(argv: list[str] | None = None) -> int:
 
         caster.connect()
         caster.play_hls(session.playlist_url)
+        # Background watchdog: re-casts if the TV stops playing (app killed,
+        # stream error). Off-loop so a ~50s dead-TV recovery never blocks
+        # stats/TUI. In TUI mode the non-playing card shows the state, so no
+        # print callback (it would write over the full-screen UI).
+        caster.start_watchdog(
+            on_event=None if args.tui else (
+                lambda event: print(f"[recover] {event}", flush=True)
+            )
+        )
 
         if args.tui:
             # Full-screen dashboard owns the terminal and its own poll loop.
@@ -310,16 +324,8 @@ def main(argv: list[str] | None = None) -> int:
         assert streamer is not None  # session.start() succeeded above
         next_stats_at = time.monotonic() + args.stats_interval
         next_tv_poll_at = time.monotonic()
-        # Watchdog: re-cast if the TV stops playing (app killed, stream error).
-        # Grace period so startup buffering never counts as idle.
-        next_ensure_at = time.monotonic() + 15.0
         while not shutting_down:
             now = time.monotonic()
-            if now >= next_ensure_at:
-                event = caster.ensure_playing()
-                if event:
-                    print(f"[recover] {event}", flush=True)
-                next_ensure_at = now + 5.0
             if stats is not None and now >= next_tv_poll_at:
                 streamer.poll_audio_backlog()
                 for event in streamer.poll_hls_stats():
