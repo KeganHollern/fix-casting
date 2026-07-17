@@ -214,7 +214,10 @@ class FfmpegProcess:
                 self.stderr_tail.append(line)
                 if self._stats is not None:
                     self._stats.record_ffmpeg_stderr(line)
-                else:
+                # Quiet/default mode still carries cumulative stats for the
+                # exit summary. Preserve its immediate ffmpeg diagnostics;
+                # --stats and --tui surface the recorded errors themselves.
+                if self._stats is None or not self._stats.trace_enabled:
                     print(f"[ffmpeg] {line}", flush=True)
         except (OSError, ValueError):
             pass

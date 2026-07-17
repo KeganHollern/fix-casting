@@ -13,15 +13,19 @@ import subprocess
 import termios
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+from cast_tab.paths import AUDIOTEE_INSTALL_PATH
 
 ROOT = Path(__file__).resolve().parents[1]
 AUDIOTEE_CANDIDATES = (
     ROOT / "bin" / "audiotee",
     ROOT / "vendor" / "audiotee" / ".build" / "release" / "audiotee",
     ROOT / "vendor" / "audiotee" / ".build" / "arm64-apple-macosx" / "release" / "audiotee",
+    AUDIOTEE_INSTALL_PATH,
 )
 
 
@@ -92,11 +96,12 @@ class AudioCapture:
     read_fd: int
     pids: tuple[int, ...]
     audio_format: AudioFormat
+    stderr_thread: threading.Thread | None = None
 
 
 def audiotee_path() -> Path | None:
     for candidate in AUDIOTEE_CANDIDATES:
-        if candidate.exists():
+        if candidate.is_file() and os.access(candidate, os.X_OK):
             return candidate
     which = shutil.which("audiotee")
     return Path(which) if which else None
@@ -213,11 +218,7 @@ def start_chrome_audio_capture(
     """
     binary = audiotee_path()
     if binary is None:
-        raise AudioCaptureError(
-            "AudioTee is not installed. Build it with:\n"
-            "  git clone https://github.com/makeusabrew/audiotee.git vendor/audiotee\n"
-            "  cd vendor/audiotee && swift build -c release"
-        )
+        raise AudioCaptureError(f"AudioTee is not installed.\n{install_hint()}")
     if not pids:
         raise AudioCaptureError("No Chrome process IDs found for tab audio capture.")
 
@@ -234,17 +235,24 @@ def start_chrome_audio_capture(
     # Only pin a rate if explicitly asked; otherwise pass native through.
     if sample_rate is not None:
         command += ["--sample-rate", str(sample_rate)]
-    process = subprocess.Popen(
-        command,
-        stdout=tap_write,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=tap_write,
+            stderr=subprocess.PIPE,
+        )
+    except BaseException:
+        os.close(tap_read)
+        os.close(tap_write)
+        raise
     os.close(tap_write)
 
     # Continuously drain AudioTee stderr: it surfaces capture warnings
     # (under-runs/drops) and, left unread, its pipe fills and deadlocks
     # AudioTee. Lines are buffered so error paths can report them.
-    stderr_lines: list[str] = []
+    # Only the tail is needed for startup errors. Keeping every diagnostic for
+    # a multi-hour cast makes a noisy AudioTee process an unbounded memory leak.
+    stderr_lines: deque[str] = deque(maxlen=100)
     detected_format: dict[str, AudioFormat] = {}
     format_ready = threading.Event()
 
@@ -263,7 +271,12 @@ def start_chrome_audio_capture(
                         format_ready.set()
                 stderr_lines.append(line)
                 if on_stderr is not None:
-                    on_stderr(line)
+                    try:
+                        on_stderr(line)
+                    except Exception:
+                        # A reporting callback must never stop the stderr drain;
+                        # an undrained pipe eventually deadlocks AudioTee.
+                        pass
         except (OSError, ValueError):
             pass
 
@@ -272,12 +285,32 @@ def start_chrome_audio_capture(
     )
     stderr_thread.start()
 
-    def _fail_exited_early() -> AudioCaptureError:
-        stderr_thread.join(timeout=0.3)
-        os.close(tap_read)
-        return AudioCaptureError(
-            f"AudioTee exited early: {' '.join(stderr_lines).strip()}"
-        )
+    cleaned_up = False
+
+    def cleanup_failed_start() -> None:
+        """Close every resource and reap AudioTee on every non-success path."""
+        nonlocal cleaned_up
+        if cleaned_up:
+            return
+        cleaned_up = True
+        try:
+            os.close(tap_read)
+        except OSError:
+            pass
+        _terminate_and_reap(process)
+        stderr_thread.join(timeout=1.0)
+        if process.stderr:
+            try:
+                process.stderr.close()
+            except (OSError, ValueError):
+                pass
+
+    def exited_early_error() -> AudioCaptureError:
+        if process.poll() is not None:
+            stderr_thread.join(timeout=0.3)
+        details = " ".join(list(stderr_lines)).strip()
+        suffix = f": {details}" if details else ""
+        return AudioCaptureError(f"AudioTee exited early{suffix}")
 
     # Wait until AudioTee actually has audio bytes ready, without consuming
     # them (ffmpeg reads the pipe from the first byte). A pipe read end goes
@@ -285,29 +318,61 @@ def start_chrome_audio_capture(
     # confirm with FIONREAD that bytes are really queued before declaring
     # success — otherwise a crashed AudioTee looks like a working tap.
     deadline = time.monotonic() + ready_timeout
-    while True:
-        readable, _, _ = select.select([tap_read], [], [], 0.2)
-        if readable:
-            try:
-                available = _pipe_bytes_available(tap_read)
-            except OSError:
-                available = 0
-            if available > 0:
-                format_ready.wait(timeout=0.5)
-                return AudioCapture(
-                    process=process,
-                    read_fd=tap_read,
-                    pids=tuple(pids),
-                    audio_format=detected_format.get("v", DEFAULT_AUDIO_FORMAT),
-                )
-            # Readable with nothing queued == EOF: AudioTee closed stdout.
-            raise _fail_exited_early()
-        if process.poll() is not None:
-            raise _fail_exited_early()
-        if time.monotonic() > deadline:
-            os.close(tap_read)
+    try:
+        while True:
+            readable, _, _ = select.select([tap_read], [], [], 0.2)
+            if readable:
+                try:
+                    available = _pipe_bytes_available(tap_read)
+                except OSError:
+                    available = 0
+                if available > 0:
+                    format_ready.wait(timeout=0.5)
+                    return AudioCapture(
+                        process=process,
+                        read_fd=tap_read,
+                        pids=tuple(pids),
+                        audio_format=detected_format.get("v", DEFAULT_AUDIO_FORMAT),
+                        stderr_thread=stderr_thread,
+                    )
+                # Readable with nothing queued == EOF: AudioTee closed stdout.
+                raise exited_early_error()
+            if process.poll() is not None:
+                raise exited_early_error()
+            if time.monotonic() > deadline:
+                raise AudioCaptureError("No audio data received from cast browser tap.")
+    except BaseException:
+        cleanup_failed_start()
+        raise
+
+
+def _terminate_and_reap(
+    process: subprocess.Popen[bytes],
+    *,
+    terminate_timeout: float = 3.0,
+    kill_timeout: float = 3.0,
+) -> None:
+    """Terminate a child and always wait for it so no live/zombie child leaks."""
+    if process.poll() is None:
+        try:
             process.terminate()
-            raise AudioCaptureError("No audio data received from cast browser tap.")
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=terminate_timeout)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=kill_timeout)
+    except subprocess.TimeoutExpired:
+        # An uninterruptible child cannot be reaped yet; cleanup should still
+        # continue for the rest of the cast pipeline.
+        pass
 
 
 def stop_audio_capture(capture: AudioCapture | None) -> None:
@@ -317,20 +382,20 @@ def stop_audio_capture(capture: AudioCapture | None) -> None:
         os.close(capture.read_fd)
     except OSError:
         pass
-    if capture.process.poll() is None:
-        capture.process.terminate()
-        try:
-            capture.process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            capture.process.kill()
+    _terminate_and_reap(capture.process)
+    if capture.stderr_thread is not None:
+        capture.stderr_thread.join(timeout=1.0)
     if capture.process.stderr:
-        capture.process.stderr.close()
+        try:
+            capture.process.stderr.close()
+        except (OSError, ValueError):
+            pass
 
 
 def install_hint() -> str:
     return (
         "Tab audio uses AudioTee (macOS 14.2+) to capture only the cast browser.\n"
         "Other Mac audio is left untouched.\n"
-        "Build with:\n"
-        "  cd vendor/audiotee && swift build -c release"
+        "Re-run ./install.sh from the fix-casting checkout, or place an "
+        f"executable at:\n  {AUDIOTEE_INSTALL_PATH}"
     )

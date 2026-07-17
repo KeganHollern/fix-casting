@@ -71,7 +71,11 @@ class CastSession:
         self.streamer: HLSStreamer | None = None
         self.audio_capture: AudioCapture | None = None
         self._stop_lock = threading.Lock()
+        self._stop_condition = threading.Condition(self._stop_lock)
+        self._stop_in_progress = False
+        self._stop_owner: int | None = None
         self._stopped = False
+        self._cleanup_complete: set[str] = set()
 
     @property
     def audio_active(self) -> bool:
@@ -82,6 +86,15 @@ class CastSession:
         if self.streamer is None:
             raise RuntimeError("Session not started.")
         return self.streamer.playlist_url
+
+    def raise_if_failed(self) -> None:
+        """Surface asynchronous failures in components owned by the session."""
+        screencaster = self.screencaster
+        if screencaster is not None:
+            screencaster.raise_if_failed()
+        streamer = self.streamer
+        if streamer is not None:
+            streamer.raise_if_failed()
 
     def start(self) -> None:
         cfg = self.config
@@ -102,9 +115,11 @@ class CastSession:
         self.screencaster.enable_capture()
         if self.stats is not None:
             self.stats.trace("enable_capture")
+        self.screencaster.raise_if_failed()
 
         if cfg.capture_audio:
             self._attach_audio()
+            self.screencaster.raise_if_failed()
 
         self.streamer = HLSStreamer(
             width=cfg.width,
@@ -124,8 +139,9 @@ class CastSession:
         self.screencaster.on_frame = self.streamer.publish_frame
         if self.stats is not None:
             self.stats.trace("on_frame wired to streamer")
-        self.streamer.start()
-        self.streamer.wait_until_ready()
+        browser_health_check = self.screencaster.raise_if_failed
+        self.streamer.start(health_check=browser_health_check)
+        self.streamer.wait_until_ready(health_check=browser_health_check)
 
     def _attach_audio(self) -> None:
         """Tap the cast browser's audio; degrade to video-only unless required."""
@@ -186,10 +202,18 @@ class CastSession:
         if self.stats is not None:
             self.stats.trace("audio try_start begin")
         try:
-            assert self.screencaster is not None
+            screencaster = self.screencaster
+            assert screencaster is not None
+
+            def retry_audio_attach() -> None:
+                # AudioTee attachment can retry for tens of seconds after the
+                # page was marked ready. Do not keep probing dead Chrome PIDs.
+                screencaster.raise_if_failed()
+                screencaster.nudge_playback()
+
             self.audio_capture = try_start_chrome_audio_capture(
-                self.screencaster.user_data_dir,
-                on_retry=self.screencaster.nudge_playback,
+                screencaster.user_data_dir,
+                on_retry=retry_audio_attach,
                 on_stderr=on_stderr,
             )
             attached = True
@@ -207,12 +231,63 @@ class CastSession:
             print(install_hint())
 
     def stop(self) -> None:
-        with self._stop_lock:
+        caller = threading.get_ident()
+        with self._stop_condition:
             if self._stopped:
                 return
-            self._stopped = True
-        if self.screencaster is not None:
-            self.screencaster.stop()
-        if self.streamer is not None:
-            self.streamer.stop()
-        stop_audio_capture(self.audio_capture)
+            if self._stop_in_progress and self._stop_owner == caller:
+                # Signal handlers and component callbacks can re-enter stop on
+                # the same thread. Waiting for ourselves would deadlock; the
+                # outer call still owns and will complete every cleanup step.
+                return
+            while self._stop_in_progress:
+                self._stop_condition.wait()
+                if self._stopped:
+                    return
+            self._stop_in_progress = True
+            self._stop_owner = caller
+
+        def stop_screencaster() -> None:
+            if self.screencaster is not None:
+                self.screencaster.stop()
+
+        def stop_streamer() -> None:
+            if self.streamer is not None:
+                self.streamer.stop()
+
+        def stop_audio() -> None:
+            stop_audio_capture(self.audio_capture)
+
+        steps = (
+            ("browser capture", stop_screencaster),
+            ("HLS streamer", stop_streamer),
+            ("audio capture", stop_audio),
+        )
+        failures: list[tuple[str, BaseException]] = []
+        try:
+            for name, cleanup in steps:
+                if name in self._cleanup_complete:
+                    continue
+                try:
+                    cleanup()
+                except BaseException as exc:
+                    failures.append((name, exc))
+                else:
+                    self._cleanup_complete.add(name)
+        finally:
+            with self._stop_condition:
+                self._stopped = len(self._cleanup_complete) == len(steps)
+                self._stop_in_progress = False
+                self._stop_owner = None
+                self._stop_condition.notify_all()
+
+        if len(failures) == 1:
+            name, failure = failures[0]
+            failure.add_note(f"CastSession failed while stopping {name}.")
+            raise failure
+        if failures:
+            names = ", ".join(name for name, _failure in failures)
+            raise BaseExceptionGroup(
+                f"CastSession failed while stopping: {names}",
+                [failure for _name, failure in failures],
+            )

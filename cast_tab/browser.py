@@ -51,6 +51,12 @@ class TabScreencaster:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._ready = threading.Event()
+        # _startup_finished wakes wait_until_ready() for both success and
+        # failure.  A bare _ready event leaves the caller waiting for the full
+        # timeout when Playwright fails on its worker thread.
+        self._startup_finished = threading.Event()
+        self._finished = threading.Event()
+        self._failure: BaseException | None = None
         self._capture_enabled = threading.Event()
         self._nudge_playback = threading.Event()
 
@@ -63,12 +69,39 @@ class TabScreencaster:
         self._on_frame = callback
 
     def start(self) -> None:
+        if self._thread is not None:
+            raise RuntimeError("Browser capture has already been started.")
         self._thread = threading.Thread(target=self._run, name="tab-screencast", daemon=True)
         self._thread.start()
 
     def wait_until_ready(self, timeout: float = 120.0) -> None:
-        if not self._ready.wait(timeout):
+        if not self._startup_finished.wait(timeout):
             raise TimeoutError("Timed out waiting for the browser tab to load.")
+        if self._ready.is_set():
+            # The capture loop can fail immediately after marking the page
+            # ready.  Do not report a successful startup if that already
+            # happened by the time this thread resumed.
+            self.raise_if_failed()
+            return
+        if self._stop.is_set():
+            raise RuntimeError("Browser capture stopped before the tab was ready.")
+        self.raise_if_failed()
+        raise RuntimeError("Browser capture exited before the tab was ready.")
+
+    def raise_if_failed(self) -> None:
+        """Raise a browser-worker failure in the owning thread.
+
+        Callers should poll this after startup.  Chrome can disappear after
+        HLS has a last frame to repeat, which otherwise looks like a healthy
+        but permanently frozen stream.
+        """
+        if self._stop.is_set():
+            return
+        failure = self._failure
+        if failure is not None:
+            raise failure
+        if self._finished.is_set():
+            raise RuntimeError("Browser capture exited unexpectedly.")
 
     def enable_capture(self) -> None:
         self._capture_enabled.set()
@@ -80,8 +113,17 @@ class TabScreencaster:
     def stop(self) -> None:
         self._stop.set()
         self._capture_enabled.set()
+        # Wake a concurrent startup waiter immediately; the browser thread may
+        # still be inside a long navigation while its bounded join runs.
+        self._startup_finished.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=10)
+
+    def _record_failure(self, failure: BaseException) -> None:
+        # Keep the first/root failure if cleanup itself subsequently fails.
+        if self._failure is None:
+            self._failure = failure
+        self._startup_finished.set()
 
     def _run(self) -> None:
         # Each run gets a fresh mkdtemp profile; without cleanup they
@@ -92,9 +134,16 @@ class TabScreencaster:
         self._chrome_may_be_alive = False
         try:
             self._run_browser()
+        except BaseException as exc:
+            # Exceptions cannot cross a thread boundary by themselves.  Store
+            # the original object so wait_until_ready()/raise_if_failed() can
+            # preserve its useful type and message in the owning thread.
+            self._record_failure(exc)
         finally:
             if not self._chrome_may_be_alive:
                 shutil.rmtree(self.user_data_dir, ignore_errors=True)
+            self._finished.set()
+            self._startup_finished.set()
 
     def _run_browser(self) -> None:
         with sync_playwright() as playwright:
@@ -146,10 +195,16 @@ class TabScreencaster:
                 page.wait_for_timeout(1_500)
                 print("Page loaded, starting capture.")
                 self._ready.set()
+                self._startup_finished.set()
                 self._capture_enabled.wait()
 
                 cdp = context.new_cdp_session(page)
                 self._run_screencast(page, cdp)
+            except BaseException as exc:
+                # Publish the operational failure before context.close();
+                # closing a damaged Chrome connection can itself be slow.
+                self._record_failure(exc)
+                raise
             finally:
                 # Close in all paths (goto/setup failures included) so Chrome
                 # is not left running against the profile dir we remove after.

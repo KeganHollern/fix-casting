@@ -1,5 +1,8 @@
 """Unit tests for the TV re-cast watchdog (fake chromecast, no network)."""
 
+import threading
+import time
+
 from cast_tab.caster import IDLE_POLLS_BEFORE_RECAST, TabCaster
 
 
@@ -61,8 +64,8 @@ class FakeChromecast:
         self.status.volume_muted = muted
 
 
-def _caster(states) -> TabCaster:
-    caster = TabCaster(device=None)
+def _caster(states, *, buffering_timeout_s=30.0) -> TabCaster:
+    caster = TabCaster(device=None, buffering_timeout_s=buffering_timeout_s)
     caster._chromecast = FakeChromecast(states)
     caster._playlist_url = "http://host/stream.m3u8"
     return caster
@@ -93,6 +96,65 @@ def test_buffering_and_paused_are_not_idle():
     assert caster.ensure_playing() is None
     assert caster.ensure_playing() is None
     assert caster.reconnects == 0
+
+
+def test_persistent_buffering_recasts_after_elapsed_timeout():
+    caster = _caster([FakeStatus("BUFFERING")] * 3, buffering_timeout_s=5.0)
+    now = 100.0
+    caster._monotonic = lambda: now
+
+    assert caster.ensure_playing() is None
+    now = 104.9
+    assert caster.ensure_playing() is None
+    now = 105.0
+    event = caster.ensure_playing(announce_recovery=False)
+
+    assert event is not None and "BUFFERING" in event
+    assert caster.reconnects == 1
+    assert caster._chromecast.media_controller.play_media_calls == [
+        "http://host/stream.m3u8"
+    ]
+
+
+def test_transient_buffering_resets_elapsed_timeout():
+    caster = _caster(
+        [
+            FakeStatus("BUFFERING"),
+            FakeStatus("BUFFERING"),
+            FakeStatus("PLAYING"),
+            FakeStatus("BUFFERING"),
+            FakeStatus("BUFFERING"),
+        ],
+        buffering_timeout_s=5.0,
+    )
+    now = 100.0
+    caster._monotonic = lambda: now
+
+    assert caster.ensure_playing() is None
+    now = 104.9
+    assert caster.ensure_playing() is None
+    now = 200.0
+    assert caster.ensure_playing() is None  # PLAYING resets the timer
+    assert caster.ensure_playing() is None  # a new buffering interval starts
+    now = 204.9
+    assert caster.ensure_playing() is None
+
+    assert caster.reconnects == 0
+    assert caster._chromecast.media_controller.play_media_calls == []
+
+
+def test_recovery_output_can_be_suppressed_but_defaults_to_announced(capsys):
+    quiet = _caster([FakeStatus("IDLE")] * IDLE_POLLS_BEFORE_RECAST)
+    for _ in range(IDLE_POLLS_BEFORE_RECAST):
+        quiet.ensure_playing(announce_recovery=False)
+    assert capsys.readouterr().out == ""
+
+    announced = _caster([FakeStatus("IDLE")] * IDLE_POLLS_BEFORE_RECAST)
+    for _ in range(IDLE_POLLS_BEFORE_RECAST):
+        announced.ensure_playing()
+    output = capsys.readouterr().out
+    assert "Casting tab mirror stream:" in output
+    assert "Chromecast is playing." in output
 
 
 def test_noop_before_play_or_connect():
@@ -135,8 +197,6 @@ def test_toggle_mute_flips():
 
 
 def test_watchdog_recovers_in_background():
-    import time
-
     caster = _caster([FakeStatus("IDLE", "FINISHED")] * 10)
     events = []
     caster.start_watchdog(grace_s=0.05, interval_s=0.05, on_event=events.append)
@@ -152,8 +212,6 @@ def test_watchdog_recovers_in_background():
 
 
 def test_watchdog_respects_grace_period():
-    import time
-
     caster = _caster([FakeStatus("IDLE", "FINISHED")] * 10)
     events = []
     caster.start_watchdog(grace_s=10.0, interval_s=0.05, on_event=events.append)
@@ -161,6 +219,29 @@ def test_watchdog_respects_grace_period():
     caster.stop()
     assert events == []
     assert caster.reconnects == 0
+
+
+def test_stop_joins_watchdog_without_late_recast_or_callback():
+    caster = _caster([FakeStatus("IDLE", "FINISHED")] * 10)
+    entered_poll = threading.Event()
+    mc = caster._chromecast.media_controller
+
+    def update_status_during_shutdown():
+        entered_poll.set()
+        assert caster._watchdog_stop.wait(timeout=1.0)
+        mc.status = FakeStatus("IDLE", "FINISHED")
+
+    mc.update_status = update_status_during_shutdown
+    events = []
+    caster.start_watchdog(grace_s=0.0, interval_s=0.01, on_event=events.append)
+    assert entered_poll.wait(timeout=1.0)
+
+    watchdog = caster._watchdog_thread
+    caster.stop()
+
+    assert watchdog is not None and not watchdog.is_alive()
+    assert mc.play_media_calls == []
+    assert events == []
 
 
 def test_stop_is_safe_during_control_calls():

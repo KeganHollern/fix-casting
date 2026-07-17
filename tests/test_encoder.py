@@ -1,15 +1,33 @@
 """Unit tests for encoder arg construction (pure, no ffmpeg needed)."""
 
+import io
 import subprocess
+from collections import deque
+from types import SimpleNamespace
 
 import cast_tab.encoder as encoder
 from cast_tab.encoder import (
+    FfmpegProcess,
     default_fps_for_resolution,
     hls_args,
     target_bitrate,
     tv_delay_s,
     video_encoder_args,
 )
+from cast_tab.stats import PipelineStats
+
+
+def test_quiet_summary_stats_do_not_suppress_ffmpeg_diagnostics(capsys):
+    stats = PipelineStats(trace_enabled=False)
+    process = object.__new__(FfmpegProcess)
+    process._proc = SimpleNamespace(stderr=io.BytesIO(b"encoder failed\n"))
+    process._stats = stats
+    process.stderr_tail = deque(maxlen=50)
+
+    process._drain_stderr()
+
+    assert "[ffmpeg] encoder failed" in capsys.readouterr().out
+    assert stats.snapshot(1.0).ffmpeg_errors == 1
 
 
 def test_encoder_probe_failure_is_not_cached(monkeypatch):

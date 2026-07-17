@@ -25,15 +25,31 @@ class TvPlaybackSnapshot:
 # really stopped playing our stream.
 IDLE_POLLS_BEFORE_RECAST = 2
 
+# Buffering is a normal, short-lived receiver state during playlist reloads.
+# Remaining there this long means playback is wedged and should be restarted.
+BUFFERING_TIMEOUT_S = 30.0
+
+# Receiver operations can block inside pychromecast. Give a normal watchdog
+# poll time to finish, but never let a wedged receiver hang shutdown forever.
+WATCHDOG_JOIN_TIMEOUT_S = 2.0
+
 
 class TabCaster:
     """Load an HLS mirror stream on the default media receiver."""
 
-    def __init__(self, device: CastDevice) -> None:
+    def __init__(
+        self,
+        device: CastDevice,
+        *,
+        buffering_timeout_s: float = BUFFERING_TIMEOUT_S,
+    ) -> None:
         self.device = device
         self._chromecast: Chromecast | None = None
         self._playlist_url: str | None = None
         self._idle_polls = 0
+        self._buffering_started_at: float | None = None
+        self._buffering_timeout_s = buffering_timeout_s
+        self._monotonic = time.monotonic
         self.reconnects = 0
         self._watchdog_stop = threading.Event()
         self._watchdog_thread: threading.Thread | None = None
@@ -52,13 +68,14 @@ class TabCaster:
         )
         self._chromecast.wait()
 
-    def play_hls(self, playlist_url: str) -> None:
+    def play_hls(self, playlist_url: str, *, announce: bool = True) -> None:
         if self._chromecast is None:
             raise RuntimeError("Not connected to a Chromecast device.")
 
         self._playlist_url = playlist_url
         mc = self._chromecast.media_controller
-        print(f"Casting tab mirror stream: {playlist_url}")
+        if announce:
+            print(f"Casting tab mirror stream: {playlist_url}")
         mc.play_media(
             playlist_url,
             "application/vnd.apple.mpegurl",
@@ -67,9 +84,9 @@ class TabCaster:
             autoplay=True,
         )
         mc.block_until_active(timeout=30)
-        self._verify_playback()
+        self._verify_playback(announce=announce)
 
-    def _verify_playback(self) -> None:
+    def _verify_playback(self, *, announce: bool = True) -> None:
         if self._chromecast is None:
             return
 
@@ -78,7 +95,8 @@ class TabCaster:
             mc.update_status()
             status = mc.status
             if status and status.player_state == "PLAYING":
-                print("Chromecast is playing.")
+                if announce:
+                    print("Chromecast is playing.")
                 return
             if status and status.idle_reason == "ERROR":
                 raise RuntimeError(
@@ -90,7 +108,7 @@ class TabCaster:
         idle = status.idle_reason if status else None
         raise RuntimeError(f"Chromecast did not start playback (state={state}, idle={idle}).")
 
-    def ensure_playing(self) -> str | None:
+    def ensure_playing(self, *, announce_recovery: bool = True) -> str | None:
         """Re-cast the stream if the TV stopped playing it (app killed on the
         TV, stream error, receiver idle). Call periodically after play_hls;
         acts after IDLE_POLLS_BEFORE_RECAST consecutive idle polls. Returns a
@@ -99,6 +117,8 @@ class TabCaster:
         Transport drops are NOT handled here: pychromecast's socket client
         reconnects itself, and update_status just fails until it has.
         """
+        if self._watchdog_stop.is_set():
+            return None
         # Local snapshot: stop() nulls self._chromecast from another thread;
         # a local keeps the object alive so we never deref None mid-call.
         chromecast = self._chromecast
@@ -110,21 +130,43 @@ class TabCaster:
             status = mc.status
         except Exception:
             return None  # transient; the socket client is reconnecting
+        if self._watchdog_stop.is_set():
+            return None
         state = status.player_state if status else None
-        if state in ("PLAYING", "BUFFERING", "PAUSED"):
+        if state == "BUFFERING":
             self._idle_polls = 0
-            return None
-        self._idle_polls += 1
-        if self._idle_polls < IDLE_POLLS_BEFORE_RECAST:
-            return None
-        self._idle_polls = 0
+            now = self._monotonic()
+            if self._buffering_started_at is None:
+                self._buffering_started_at = now
+            if now - self._buffering_started_at < self._buffering_timeout_s:
+                return None
+            # Rate-limit repeated failed recovery attempts by requiring another
+            # full buffering interval before trying again.
+            self._buffering_started_at = None
+        else:
+            self._buffering_started_at = None
+            if state in ("PLAYING", "PAUSED"):
+                self._idle_polls = 0
+                return None
+
+        if state != "BUFFERING":
+            self._idle_polls += 1
+            if self._idle_polls < IDLE_POLLS_BEFORE_RECAST:
+                return None
+            self._idle_polls = 0
         label = state or "UNKNOWN"
         if status is not None and status.idle_reason:
             label += f" ({status.idle_reason})"
+        if self._watchdog_stop.is_set():
+            return None
         try:
-            self.play_hls(self._playlist_url)
+            self.play_hls(self._playlist_url, announce=announce_recovery)
         except Exception as exc:
+            if self._watchdog_stop.is_set():
+                return None
             return f"TV went {label}; re-cast failed: {exc}"
+        if self._watchdog_stop.is_set():
+            return None
         self.reconnects += 1
         return f"TV went {label}; re-cast the stream"
 
@@ -183,6 +225,7 @@ class TabCaster:
         grace_s: float = 15.0,
         interval_s: float = 5.0,
         on_event: Callable[[str], None] | None = None,
+        announce_recovery: bool = True,
     ) -> None:
         """Run ensure_playing() on a background thread until stop().
 
@@ -191,11 +234,17 @@ class TabCaster:
         The grace period keeps startup buffering from counting as idle.
         """
 
+        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
+            raise RuntimeError("TV watchdog is already running.")
+        self._watchdog_stop.clear()
+
         def run() -> None:
             if self._watchdog_stop.wait(grace_s):
                 return
             while not self._watchdog_stop.is_set():
-                event = self.ensure_playing()
+                event = self.ensure_playing(announce_recovery=announce_recovery)
+                if self._watchdog_stop.is_set():
+                    return
                 if event and on_event is not None:
                     on_event(event)
                 if self._watchdog_stop.wait(interval_s):
@@ -228,13 +277,16 @@ class TabCaster:
         self._watchdog_stop.set()
         chromecast = self._chromecast
         self._chromecast = None
-        if chromecast is None:
-            return
-        try:
-            chromecast.media_controller.stop()
-        except Exception:
-            pass
-        try:
-            chromecast.disconnect()
-        except Exception:
-            pass
+        if chromecast is not None:
+            try:
+                chromecast.media_controller.stop()
+            except Exception:
+                pass
+            try:
+                chromecast.disconnect()
+            except Exception:
+                pass
+
+        watchdog = self._watchdog_thread
+        if watchdog is not None and watchdog is not threading.current_thread():
+            watchdog.join(timeout=WATCHDOG_JOIN_TIMEOUT_S)

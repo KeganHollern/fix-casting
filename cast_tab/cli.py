@@ -3,20 +3,120 @@
 from __future__ import annotations
 
 import argparse
+import math
 import signal
 import sys
 import time
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
+from pathlib import Path
 
 from cast_tab.caster import TabCaster
 from cast_tab.devices import discover_devices, find_device, select_device
 from cast_tab.encoder import tv_delay_s
+from cast_tab.paths import AUDIOTEE_PROVENANCE_PATH, INSTALL_PROVENANCE_PATH
 from cast_tab.session import CastSession, SessionConfig
 from cast_tab.stats import PipelineStats
 from cast_tab.streamer import (
     DEFAULT_JPEG_QUALITY,
+    MAX_AUTO_AV_OFFSET_MS,
     codec_label,
     default_fps_for_resolution,
 )
+
+MAX_VIDEO_BITRATE_MBPS = 1_000.0
+MAX_ABS_AUDIO_DRIFT_PPM = 100_000.0
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
+
+
+def _jpeg_quality(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > 100:
+        raise argparse.ArgumentTypeError("must be between 1 and 100")
+    return parsed
+
+
+def _audio_offset_ms(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if not 0 <= parsed <= MAX_AUTO_AV_OFFSET_MS:
+        raise argparse.ArgumentTypeError(
+            f"must be between 0 and {MAX_AUTO_AV_OFFSET_MS}"
+        )
+    return parsed
+
+
+def _finite_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError("must be finite")
+    return parsed
+
+
+def _positive_finite_float(value: str) -> float:
+    parsed = _finite_float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
+
+
+def _video_bitrate_mbps(value: str) -> float:
+    parsed = _positive_finite_float(value)
+    if parsed > MAX_VIDEO_BITRATE_MBPS:
+        raise argparse.ArgumentTypeError(
+            f"must be at most {MAX_VIDEO_BITRATE_MBPS:g} Mbps"
+        )
+    return parsed
+
+
+def _audio_drift_ppm(value: str) -> float:
+    parsed = _finite_float(value)
+    if abs(parsed) > MAX_ABS_AUDIO_DRIFT_PPM:
+        raise argparse.ArgumentTypeError(
+            f"must be between {-MAX_ABS_AUDIO_DRIFT_PPM:g} and "
+            f"{MAX_ABS_AUDIO_DRIFT_PPM:g}"
+        )
+    return parsed
+
+
+def _version_text() -> str:
+    try:
+        installed_version = package_version("fix-casting")
+    except PackageNotFoundError:
+        installed_version = "unknown"
+
+    # An editable install executes this checkout directly. Never label it with
+    # a stale installation receipt from an earlier snapshot.
+    package_root = Path(__file__).resolve().parents[1]
+    if (package_root / ".git").exists():
+        provenance = "development checkout (editable/source import)"
+    else:
+        try:
+            provenance = INSTALL_PROVENANCE_PATH.read_text(encoding="utf-8").strip()
+        except OSError:
+            provenance = "revision unknown"
+        if not provenance:
+            provenance = "revision unknown"
+    try:
+        audiotee_hash = AUDIOTEE_PROVENANCE_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        audiotee_hash = ""
+    helper = f"; AudioTee sha256:{audiotee_hash[:12]}" if audiotee_hash else ""
+    return f"fix-casting {installed_version} ({provenance}{helper})"
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -27,28 +127,34 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "it to your TV — does not use Chrome's dominant-video detection."
         ),
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=_version_text(),
+        help="show installed version and source provenance",
+    )
     parser.add_argument("url", help="URL to open and mirror")
     parser.add_argument(
         "--width",
-        type=int,
+        type=_positive_int,
         default=1920,
         help="Viewport width (default: 1920)",
     )
     parser.add_argument(
         "--height",
-        type=int,
+        type=_positive_int,
         default=1080,
         help="Viewport height (default: 1080)",
     )
     parser.add_argument(
         "--fps",
-        type=int,
+        type=_positive_int,
         default=None,
         help="Encode frame rate (default: 30 buffered, 23 at 1080p / 24 at 720p otherwise)",
     )
     parser.add_argument(
         "--jpeg-quality",
-        type=int,
+        type=_jpeg_quality,
         default=None,
         metavar="Q",
         help=(
@@ -58,13 +164,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--video-bitrate",
-        type=float,
+        type=_video_bitrate_mbps,
         default=None,
         metavar="MBPS",
         help=(
-            "Override the H.264 target bitrate in Mbps (default: chosen by "
-            "resolution, 15 at 1080p). Raise it with --stats to find how high "
-            "your Chromecast's network sustains before it buffers."
+            f"Override the H.264 target bitrate in Mbps, up to "
+            f"{MAX_VIDEO_BITRATE_MBPS:g} (default: chosen by resolution, 15 at "
+            "1080p). Raise it with --stats to find how high your Chromecast's "
+            "network sustains before it buffers."
         ),
     )
     parser.add_argument(
@@ -78,7 +185,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--discovery-timeout",
-        type=float,
+        type=_positive_finite_float,
         default=5.0,
         help="Seconds to search for Chromecast devices (default: 5)",
     )
@@ -104,21 +211,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--audio-offset-ms",
-        type=int,
+        type=_audio_offset_ms,
         default=0,
         help=(
-            "Manual A/V trim in ms (default: 0). Positive delays audio (use "
-            "if audio is ahead of video); the skew is structurally always "
-            "audio-ahead, so negative values are ignored."
+            f"Manual A/V trim in ms, 0-{MAX_AUTO_AV_OFFSET_MS} (default: 0). "
+            "Positive delays audio (use if audio is ahead of video)."
         ),
     )
     parser.add_argument(
         "--audio-drift-ppm",
-        type=float,
+        type=_audio_drift_ppm,
         default=0.0,
         metavar="PPM",
         help=(
-            "Correct slow audio clock drift in parts-per-million (default: 0). "
+            "Correct slow audio clock drift in parts-per-million "
+            f"({-MAX_ABS_AUDIO_DRIFT_PPM:g} to {MAX_ABS_AUDIO_DRIFT_PPM:g}; "
+            "default: 0). "
             "If audio drifts AHEAD of video over a long session, set this "
             "positive; ffmpeg constant-resamples audio to lock it to real time "
             "(smooth, inaudible). Measure your value with "
@@ -141,13 +249,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--stats-interval",
-        type=float,
+        type=_positive_finite_float,
         default=10.0,
         help="Seconds between stats reports when --stats is set (default: 10)",
     )
     parser.add_argument(
         "--tv-poll-interval",
-        type=float,
+        type=_positive_finite_float,
         default=2.0,
         help="Seconds between Chromecast status polls when --stats is set (default: 2)",
     )
@@ -157,10 +265,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Show a live full-screen dashboard of all pipeline stats with a "
         "real-time audio-offset knob (instead of the scrolling --stats text).",
     )
-    args = parser.parse_args(argv)
-    if args.video_bitrate is not None and args.video_bitrate <= 0:
-        parser.error("--video-bitrate must be greater than 0 (Mbps)")
-    return args
+    return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -182,14 +287,15 @@ def main(argv: list[str] | None = None) -> int:
     encode_fps = args.fps or default_fps_for_resolution(
         args.width, args.height, buffered=args.buffered
     )
-    jpeg_quality = (
-        max(1, min(100, args.jpeg_quality))
-        if args.jpeg_quality is not None
-        else DEFAULT_JPEG_QUALITY
-    )
+    jpeg_quality = args.jpeg_quality or DEFAULT_JPEG_QUALITY
     # The TUI is a live view of the same stats, so it needs them collected too.
     collect_stats = args.stats or args.tui
-    stats = PipelineStats(target_fps=float(encode_fps)) if collect_stats else None
+    # Keep cumulative counters even in the default quiet mode so the exit
+    # summary can report dropped frames and ffmpeg restarts.
+    stats = PipelineStats(
+        target_fps=float(encode_fps),
+        trace_enabled=collect_stats,
+    )
 
     adblock_patterns = None
     if args.adblock:
@@ -232,12 +338,11 @@ def main(argv: list[str] | None = None) -> int:
         parts = [f"cast ran {duration}"]
         if caster.reconnects:
             parts.append(f"{caster.reconnects} TV re-casts")
-        if stats is not None:
-            dropped_total, restarts_total = stats.totals()
-            if dropped_total:
-                parts.append(f"{dropped_total} frames dropped (stutter)")
-            if restarts_total:
-                parts.append(f"{restarts_total} ffmpeg restarts")
+        dropped_total, restarts_total = stats.totals()
+        if dropped_total:
+            parts.append(f"{dropped_total} frames dropped (stutter)")
+        if restarts_total:
+            parts.append(f"{restarts_total} ffmpeg restarts")
         print(f"Summary: {', '.join(parts)}.")
 
     def shutdown() -> None:
@@ -249,19 +354,34 @@ def main(argv: list[str] | None = None) -> int:
             return
         shutting_down = True
         print("\nStopping cast...")
-        session.stop()
-        caster.stop()
+        failures: list[tuple[str, BaseException]] = []
+        for name, stop in (("session", session.stop), ("Chromecast", caster.stop)):
+            try:
+                stop()
+            except BaseException as exc:
+                # Cleanup is best-effort across independent components. A
+                # browser teardown failure must not leave the TV connected.
+                failures.append((name, exc))
         _print_exit_summary()
+        for name, failure in failures:
+            print(f"Warning: failed to stop {name}: {failure}", file=sys.stderr)
 
     def handle_signal(_signum=None, _frame=None) -> None:
+        # A second Ctrl+C may arrive while the first handler is waiting for
+        # browser/ffmpeg cleanup. Returning lets the original handler resume
+        # instead of raising SystemExit in the middle of teardown.
+        if shutting_down:
+            return
         shutdown()
-        sys.exit(0)
+        raise SystemExit(0)
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
     try:
         session.start()
+        streamer = session.streamer
+        assert streamer is not None  # session.start() succeeded above
 
         audio_mode = "with tab audio" if session.audio_active else "video only"
         latency_mode = (
@@ -289,21 +409,22 @@ def main(argv: list[str] | None = None) -> int:
         caster.start_watchdog(
             on_event=None if args.tui else (
                 lambda event: print(f"[recover] {event}", flush=True)
-            )
+            ),
+            announce_recovery=not args.tui,
         )
 
         if args.tui:
             # Full-screen dashboard owns the terminal and its own poll loop.
             from cast_tab.tui import run_tui
 
-            assert stats is not None  # --tui always collects stats
             run_tui(
                 stats=stats,
-                streamer=session.streamer,
+                streamer=streamer,
                 caster=caster,
-                initial_offset_ms=args.audio_offset_ms,
+                initial_offset_ms=streamer.audio_offset_ms,
                 tv_poll_interval=args.tv_poll_interval,
                 playlist_url=session.playlist_url,
+                health_check=session.raise_if_failed,
             )
             shutdown()
             return 0
@@ -314,19 +435,18 @@ def main(argv: list[str] | None = None) -> int:
             print("A browser window is rendering the page locally.")
         if session.audio_active:
             print("Cast browser audio plays on your TV only; other Mac audio is unchanged.")
-        if stats is not None:
+        if args.stats:
             print(
                 f"Stats enabled (every {args.stats_interval:.0f}s, "
                 f"tv polls every {args.tv_poll_interval:.0f}s)."
             )
 
-        streamer = session.streamer
-        assert streamer is not None  # session.start() succeeded above
         next_stats_at = time.monotonic() + args.stats_interval
         next_tv_poll_at = time.monotonic()
         while not shutting_down:
+            session.raise_if_failed()
             now = time.monotonic()
-            if stats is not None and now >= next_tv_poll_at:
+            if args.stats and now >= next_tv_poll_at:
                 streamer.poll_audio_backlog()
                 for event in streamer.poll_hls_stats():
                     print(f"[stats] {event}", flush=True)
@@ -339,7 +459,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"[stats] {event}", flush=True)
                 next_tv_poll_at = now + args.tv_poll_interval
 
-            if stats is not None and now >= next_stats_at:
+            if args.stats and now >= next_stats_at:
                 print(stats.format_report(args.stats_interval), flush=True)
                 next_stats_at = now + args.stats_interval
             time.sleep(0.25)

@@ -87,6 +87,10 @@ class PipelineStats:
     """Thread-safe counters for each stage of the cast pipeline."""
 
     target_fps: float = 30.0
+    # The default CLI always keeps the inexpensive cumulative counters so its
+    # exit summary can report dropped frames and ffmpeg restarts.  Lifecycle
+    # trace lines remain opt-in with --stats/--tui.
+    trace_enabled: bool = True
     # RLock, not Lock: the CLI's signal handler reads stats from the same
     # main thread that may be holding the lock mid-report when SIGINT lands;
     # a non-reentrant lock deadlocks that path.
@@ -158,9 +162,11 @@ class PipelineStats:
 
         once=True fires the first time only — use for one-shot anchors (first
         publish, first sampler tick, first writer write) so the line marks when
-        each stage truly began. Without --stats there is no PipelineStats and
-        these calls don't happen, so traces are opt-in with the rest of --stats.
+        each stage truly began. ``trace_enabled=False`` retains counters while
+        keeping these diagnostic lines quiet.
         """
+        if not self.trace_enabled:
+            return
         with self._lock:
             if once:
                 if label in self._trace_seen:

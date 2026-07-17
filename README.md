@@ -44,7 +44,16 @@ cd fix-casting
 ./install.sh
 ```
 
-This uses [`uv tool install`](https://docs.astral.sh/uv/) to install the `cast` command into `~/.local/bin` (in its own isolated environment), downloads Playwright's Chromium (fallback), and sets up AudioTee for per-tab audio — preferring a prebuilt binary from this repo's GitHub releases, building from `vendor/audiotee` with Swift only when no prebuilt is available. (Maintainers: push an `audiotee-v*` tag to publish a new prebuilt via the release workflow.)
+This uses [`uv tool install`](https://docs.astral.sh/uv/) to install a
+**non-editable snapshot** of the current checkout into `~/.local/bin`, with
+runtime dependency versions constrained by `uv.lock`. Changing branches or
+editing this checkout therefore does not silently change the installed
+command. It also downloads Playwright's Chromium (fallback) and installs
+AudioTee under `~/.local/share/fix-casting` for per-tab audio — preferring a
+SHA-256-verified prebuilt binary from this repo's GitHub releases and building
+from `vendor/audiotee` with Swift only when no verified prebuilt is available.
+(Maintainers: push an `audiotee-v*` tag to publish a new prebuilt via the
+release workflow.)
 
 Make sure `~/.local/bin` is on your `PATH`:
 
@@ -52,7 +61,10 @@ Make sure `~/.local/bin` is on your `PATH`:
 uv tool update-shell    # or: export PATH="$HOME/.local/bin:$PATH"
 ```
 
-To update later, just re-run `./install.sh`. To remove: `uv tool uninstall fix-casting`.
+Use `cast --version` to see the installed branch, revision, source fingerprint,
+and AudioTee hash (or to identify an older editable/source install). To update
+later, re-run `./install.sh` from the revision you want. To remove the command:
+`uv tool uninstall fix-casting`.
 
 Install ffmpeg if needed:
 
@@ -79,15 +91,17 @@ frames, ffmpeg restarts) prints on exit.
 ```
 cast <url> [options]
 
+  --version               Show installed version and source provenance
   --width WIDTH           Viewport width (default: 1920)
   --height HEIGHT         Viewport height (default: 1080)
   --fps FPS               Encode frame rate (default: 30 buffered, 23–24 unbuffered)
   --jpeg-quality Q        Tab-capture JPEG quality 1–100 (default: 92)
-  --video-bitrate MBPS    Override H.264 target bitrate in Mbps (default: by resolution, 15 at 1080p)
+  --video-bitrate MBPS    Override H.264 target bitrate in Mbps, max 1000 (default: by resolution)
   --buffered / --no-buffered
                           Buffered mode for quality vs latency (default: buffered)
   --no-audio              Video only, skip tab audio capture
-  --audio-offset-ms MS    Manual A/V trim; positive delays audio (default: 0)
+  --audio-offset-ms MS    Manual A/V trim 0–3000; positive delays audio (default: 0)
+  --audio-drift-ppm PPM   Correct measured audio-clock drift, -100000…100000 (default: 0)
   --adblock / --no-adblock
                           Block ads/trackers in the captured tab (default: on)
   --headless              Hide the local browser window (may break some players)
@@ -249,10 +263,12 @@ Ensure the TV and Mac are on the same network. Try increasing `--discovery-timeo
 
 **No audio on TV**  
 Audio requires AudioTee. Re-run `./install.sh` (downloads a prebuilt binary or
-builds one), or build manually:
+builds one and installs it under `~/.local/share/fix-casting`), or build
+manually:
 
 ```bash
 cd vendor/audiotee && swift build -c release
+cd ../.. && ./install.sh    # copies the build to the stable per-user path
 ```
 
 If audio still fails, start playback in the local Chrome window (click Play). The tool retries autoplay automatically.

@@ -12,6 +12,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -20,6 +21,7 @@ from textual.timer import Timer
 from textual.widgets import Button, Footer, Header, Label, Sparkline, Static
 
 from cast_tab.stats import PipelineStats, StatsSnapshot
+from cast_tab.streamer import MAX_AUTO_AV_OFFSET_MS
 
 
 class MetricCard(Vertical):
@@ -137,6 +139,7 @@ class CastTUI(App):
         tv_poll_interval: float = 2.0,
         refresh_s: float = 1.0,
         playlist_url: str = "",
+        health_check: Callable[[], None] | None = None,
     ) -> None:
         super().__init__()
         self._stats = stats
@@ -145,10 +148,15 @@ class CastTUI(App):
         self._tv_poll_interval = tv_poll_interval
         self._refresh_s = refresh_s
         self._playlist_url = playlist_url
+        self._health_check = health_check
+        self._pipeline_failure: Exception | None = None
 
         # Audio-offset knob state. Button presses move _pending immediately; a
         # debounce timer applies it (one ffmpeg relaunch) after presses settle.
-        self._offset_applied = max(0, int(initial_offset_ms))
+        self._offset_applied = min(
+            MAX_AUTO_AV_OFFSET_MS,
+            max(0, int(initial_offset_ms)),
+        )
         self._offset_pending = self._offset_applied
         self._apply_timer: Timer | None = None
         self._applying = False
@@ -267,6 +275,20 @@ class CastTUI(App):
     # --- polling ----------------------------------------------------------
     def _poll_loop(self) -> None:
         while not self._poller_stop.wait(self._refresh_s):
+            if self._health_check is not None:
+                try:
+                    self._health_check()
+                except Exception as exc:
+                    # Background browser/ffmpeg failures must close the TUI so
+                    # the owning CLI can report the error and tear everything
+                    # down; otherwise the dashboard can show a frozen cast
+                    # indefinitely.
+                    self._pipeline_failure = exc
+                    try:
+                        self.call_from_thread(self.exit)
+                    except RuntimeError:
+                        pass
+                    break
             try:
                 self._streamer.poll_audio_backlog()
                 self._streamer.poll_hls_stats()
@@ -428,7 +450,10 @@ class CastTUI(App):
         self._nudge_offset(-self._offset_pending)
 
     def _nudge_offset(self, step: int) -> None:
-        new_pending = max(0, self._offset_pending + step)
+        new_pending = min(
+            MAX_AUTO_AV_OFFSET_MS,
+            max(0, self._offset_pending + step),
+        )
         if new_pending == self._offset_pending and step != 0:
             return  # already clamped at 0
         self._offset_pending = new_pending
@@ -483,12 +508,17 @@ def run_tui(
     initial_offset_ms: int = 0,
     tv_poll_interval: float = 2.0,
     playlist_url: str = "",
+    health_check: Callable[[], None] | None = None,
 ) -> None:
-    CastTUI(
+    app = CastTUI(
         stats=stats,
         streamer=streamer,
         caster=caster,
         initial_offset_ms=initial_offset_ms,
         tv_poll_interval=tv_poll_interval,
         playlist_url=playlist_url,
-    ).run()
+        health_check=health_check,
+    )
+    app.run()
+    if app._pipeline_failure is not None:
+        raise app._pipeline_failure
