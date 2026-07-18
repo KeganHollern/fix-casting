@@ -177,8 +177,8 @@ def capture(
             print("VIDEO ONLY (no AudioTee) — isolating video-side backpressure.")
         session.start()
 
-        # Buffered HLS deletes old segments, so the live work dir only ever
-        # holds the last ~48s. Archive every segment before it's deleted so we
+        # HLS deletes old segments, so the live work dir is only a rolling
+        # window. Archive every segment before it's deleted so we
         # can analyze the WHOLE run (and compare start-vs-end for drift).
         archive = WORK_DIR / "archive"
         archive.mkdir(exist_ok=True)

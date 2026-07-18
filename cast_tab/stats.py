@@ -58,15 +58,17 @@ class StatsSnapshot:
     write_peak_ms: float
     queue_peak: int
     queue_dropped: int
+    queue_residence_ms: float
     repeats: int
     resyncs: int
+    resyncs_total: int
+    resync_last_reason: str | None
     ffmpeg_restarts: int
     ffmpeg_errors: int
     ffmpeg_last_error: str | None
     # --- Sync (cumulative) ---
     dropped_total: int
     restarts_total: int
-    drift_ms: float
     # --- HLS (outgoing) ---
     hls_count: int
     hls_age: float | None
@@ -88,7 +90,7 @@ class PipelineStats:
 
     target_fps: float = 30.0
     # The default CLI always keeps the inexpensive cumulative counters so its
-    # exit summary can report dropped frames and ffmpeg restarts.  Lifecycle
+    # exit summary can report lost video timeline ticks and ffmpeg restarts. Lifecycle
     # trace lines remain opt-in with --stats/--tui.
     trace_enabled: bool = True
     # RLock, not Lock: the CLI's signal handler reads stats from the same
@@ -120,21 +122,20 @@ class PipelineStats:
     _encode: _Window = field(default_factory=_Window, repr=False)
     _encode_repeats: int = 0
     _encode_resyncs: int = 0
+    _encode_resyncs_total: int = 0
+    _encode_last_resync: str | None = None
     _encode_write: _Window = field(default_factory=_Window, repr=False)
     _queue_peak: int = 0
-    # Interval running mean of queue depth. Depth IS the live audio lead: a frame
-    # waiting depth/fps seconds in the queue reaches ffmpeg (which timestamps by
-    # arrival) that much later than its audio, so the output plays audio ahead by
-    # ~depth/fps. The mean (not peak) tracks the sustained lead.
+    # Interval running mean of queue depth.  Converted to milliseconds, this is
+    # queue residence/backpressure only. image2pipe timestamps by accepted frame
+    # count, not wall-clock arrival, so depth must never be reported as A/V skew.
     _queue_depth_sum: float = 0.0
     _queue_depth_n: int = 0
     _queue_dropped: int = 0
     _ffmpeg_restarts: int = 0
-    # Cumulative (never reset). Each dropped video frame is a brief skip/freeze
-    # in the video (the encoder couldn't keep up for a moment). Measured A/B
-    # (tools/measure_source_skew.py with induced drops) shows this does NOT
-    # accumulate into A/V desync — the muxed output stays synced — so the total
-    # estimates accumulated *video stutter time* (dropped/fps), not an audio lead.
+    # Cumulative (never reset). A lost sampled frame breaks the old CFR
+    # frame-count timeline. The streamer responds with an A/V re-anchor; this
+    # counter therefore measures discarded visual timeline, not residual skew.
     _queue_dropped_total: int = 0
     _ffmpeg_restarts_total: int = 0
     # ffmpeg stderr lines this interval (at -loglevel error these are real
@@ -205,10 +206,22 @@ class PipelineStats:
         with self._lock:
             self._encode_repeats += 1
 
-    def record_encode_resync(self) -> None:
-        """The encoder fell >1s behind and reset its clock instead of bursting."""
+    def record_encode_resync(self, reason: str, *, lost_frames: int = 0) -> None:
+        """A CFR break requested a fresh, jointly anchored ffmpeg generation."""
         with self._lock:
             self._encode_resyncs += 1
+            self._encode_resyncs_total += 1
+            self._encode_last_resync = reason
+            self._queue_dropped += lost_frames
+            self._queue_dropped_total += lost_frames
+
+    def record_timeline_loss(self, frames: int) -> None:
+        """Count sampled frames intentionally discarded at a re-anchor."""
+        if frames <= 0:
+            return
+        with self._lock:
+            self._queue_dropped += frames
+            self._queue_dropped_total += frames
 
     def record_audio_warning(self, text: str) -> None:
         with self._lock:
@@ -238,9 +251,7 @@ class PipelineStats:
             self._queue_dropped += dropped
             self._queue_dropped_total += dropped
             if self._ts_enabled:
-                self._ts_queue.append(
-                    (time.monotonic() - self._ts_start, depth, dropped)
-                )
+                self._ts_queue.append((time.monotonic() - self._ts_start, depth, dropped))
 
     def format_timeseries(self, window_s: float = 2.0) -> str:
         """Per-window queue depth + write stalls — shows if the queue drains."""
@@ -251,9 +262,8 @@ class PipelineStats:
             return "queue time-series: (no data; call enable_timeseries first)"
         end = max(q[-1][0], w[-1][0] if w else 0.0)
         lines = [
-            "queue depth + write stalls over time "
-            f"(per {window_s:.0f}s window):",
-            "  window      depth(avg/max)  drops   write(max)",
+            f"queue depth + write stalls over time (per {window_s:.0f}s window):",
+            "  window      depth(avg/max)  losses write(max)",
         ]
         n = int(end // window_s) + 1
         for b in range(n):
@@ -315,9 +325,7 @@ class PipelineStats:
             if state and state != "PLAYING":
                 self._tv_non_playing_polls += 1
                 label = state if not idle_reason else f"{state} ({idle_reason})"
-                self._tv_non_playing_states[label] = (
-                    self._tv_non_playing_states.get(label, 0) + 1
-                )
+                self._tv_non_playing_states[label] = self._tv_non_playing_states.get(label, 0) + 1
                 events.append(f"tv event {label}")
 
             if position_s is not None and self._tv_last_poll_pos_s is not None:
@@ -334,7 +342,7 @@ class PipelineStats:
         return events
 
     def totals(self) -> tuple[int, int]:
-        """Cumulative (dropped frames, ffmpeg restarts) — read-only, no reset.
+        """Cumulative (lost video timeline ticks, ffmpeg restarts), no reset.
 
         The exit summary uses this instead of snapshot(): snapshot resets the
         interval windows as a side effect, which is wrong at exit time and can
@@ -355,14 +363,8 @@ class PipelineStats:
             if tv_pos is not None and interval_start_pos is not None:
                 pos_delta = tv_pos - interval_start_pos
             dropped_total = self._queue_dropped_total
-            # Live audio lead = mean queue depth / fps (frames wait in the queue,
-            # ffmpeg timestamps by arrival, so audio plays ahead by that much).
-            avg_depth = (
-                self._queue_depth_sum / self._queue_depth_n
-                if self._queue_depth_n
-                else 0.0
-            )
-            drift_ms = avg_depth / self.target_fps * 1000 if self.target_fps else 0.0
+            avg_depth = self._queue_depth_sum / self._queue_depth_n if self._queue_depth_n else 0.0
+            queue_residence_ms = avg_depth / self.target_fps * 1000 if self.target_fps else 0.0
 
             snap = StatsSnapshot(
                 interval_s=interval_s,
@@ -386,14 +388,16 @@ class PipelineStats:
                 write_peak_ms=self._encode_write.peak * 1000,
                 queue_peak=self._queue_peak,
                 queue_dropped=self._queue_dropped,
+                queue_residence_ms=queue_residence_ms,
                 repeats=self._encode_repeats,
                 resyncs=self._encode_resyncs,
+                resyncs_total=self._encode_resyncs_total,
+                resync_last_reason=self._encode_last_resync,
                 ffmpeg_restarts=self._ffmpeg_restarts,
                 ffmpeg_errors=self._ffmpeg_errors,
                 ffmpeg_last_error=self._ffmpeg_last_error,
                 dropped_total=dropped_total,
                 restarts_total=self._ffmpeg_restarts_total,
-                drift_ms=drift_ms,
                 hls_count=self._hls_segment_count,
                 hls_age=self._hls_segment_age_s,
                 hls_deleted=self._hls_segments_deleted,
@@ -416,6 +420,7 @@ class PipelineStats:
             self._encode.reset()
             self._encode_repeats = 0
             self._encode_resyncs = 0
+            self._encode_last_resync = None
             self._encode_write.reset()
             self._queue_peak = 0
             self._queue_depth_sum = 0.0
@@ -456,9 +461,14 @@ class PipelineStats:
                 f"frame age avg {s.frame_age_ms:.0f}ms peak {s.frame_age_peak_ms:.0f}ms, "
                 f"stdin write avg {s.write_ms:.1f}ms peak {s.write_peak_ms:.1f}ms"
                 + (f", queue peak {s.queue_peak}" if s.queue_peak else "")
-                + (f", dropped {s.queue_dropped}" if s.queue_dropped else "")
+                + (f", timeline loss {s.queue_dropped}" if s.queue_dropped else "")
                 + (f", repeats {s.repeats}" if s.repeats else "")
-                + (f", resyncs {s.resyncs}" if s.resyncs else "")
+                + (f", A/V re-anchors {s.resyncs}" if s.resyncs else "")
+                + (
+                    f' (last: "{s.resync_last_reason}")'
+                    if s.resyncs and s.resync_last_reason
+                    else ""
+                )
                 + (f", ffmpeg restarts {s.ffmpeg_restarts}" if s.ffmpeg_restarts else "")
             ),
         ]
@@ -476,23 +486,20 @@ class PipelineStats:
             hls_line += f", deleted {s.hls_deleted}"
         lines.append(hls_line)
 
-        lead = (
-            f"audio lead ~{s.drift_ms:.0f}ms (encoder queue)"
-            if s.drift_ms >= 80
-            else f"in sync (~{s.drift_ms:.0f}ms)"
-        )
-        extra = ""
+        sync_state = "CFR timeline re-anchored" if s.resyncs_total else "CFR timeline intact"
+        extra = f", queue residence ~{s.queue_residence_ms:.0f}ms (backpressure, not A/V offset)"
         if s.dropped_total:
-            extra += f", {s.dropped_total} frames dropped (stutter)"
+            extra += f", {s.dropped_total} video timeline ticks discarded/skipped"
+        if s.resyncs_total:
+            extra += f", {s.resyncs_total} A/V re-anchors"
         if s.restarts_total:
             extra += f", {s.restarts_total} ffmpeg restarts"
-        lines.append(f"sync    {lead}{extra}")
+        lines.append(f"sync    {sync_state}{extra}")
 
         audio_bits: list[str] = []
         if s.audio_backlog_ms is not None:
             audio_bits.append(
-                f"pipe backlog {s.audio_backlog_ms:.0f}ms "
-                f"peak {s.audio_backlog_peak_ms:.0f}ms"
+                f"pipe backlog {s.audio_backlog_ms:.0f}ms peak {s.audio_backlog_peak_ms:.0f}ms"
             )
         if s.audio_warnings:
             warn = f"{s.audio_warnings} warnings this interval"

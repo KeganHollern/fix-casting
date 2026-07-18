@@ -9,9 +9,10 @@ import cast_tab.encoder as encoder
 from cast_tab.encoder import (
     FfmpegProcess,
     default_fps_for_resolution,
+    estimated_hls_holdback_s,
     hls_args,
+    hls_playlist_retention_s,
     target_bitrate,
-    tv_delay_s,
     video_encoder_args,
 )
 from cast_tab.stats import PipelineStats
@@ -86,12 +87,31 @@ def test_video_encoder_args_gop():
     assert args[args.index("-g") + 1] == "30"  # 1s GOP unbuffered
 
 
-def test_hls_args_and_tv_delay_consistent():
-    """The advertised TV delay must equal segment length x playlist length."""
+def test_hls_args_retention_and_estimated_holdback_are_consistent():
     for buffered in (True, False):
         args = hls_args(buffered=buffered)
         hls_time = int(args[args.index("-hls_time") + 1])
         list_size = int(args[args.index("-hls_list_size") + 1])
-        assert tv_delay_s(buffered=buffered) == hls_time * list_size
-    assert tv_delay_s(buffered=True) == 48
-    assert tv_delay_s(buffered=False) == 4
+        assert hls_playlist_retention_s(buffered=buffered) == hls_time * list_size
+        assert estimated_hls_holdback_s(buffered=buffered) == hls_time * 3
+        assert list_size >= 3
+
+    assert hls_playlist_retention_s(buffered=True) == 12
+    assert estimated_hls_holdback_s(buffered=True) == 6
+    assert hls_playlist_retention_s(buffered=False) == 4
+    assert estimated_hls_holdback_s(buffered=False) == 3
+
+
+def test_hls_restarts_append_to_the_existing_playlist():
+    initial = hls_args(buffered=True)
+    restarted = hls_args(buffered=True, append=True)
+    initial_flags = initial[initial.index("-hls_flags") + 1].split("+")
+    restarted_flags = restarted[restarted.index("-hls_flags") + 1].split("+")
+
+    # FFmpeg's append_list mode parses the existing playlist, continues its
+    # media sequence, and inserts a discontinuity before the first newly
+    # appended segment. discont_start must not be combined with it: that also
+    # inserts a spurious discontinuity at the head of the retained playlist.
+    assert "append_list" not in initial_flags
+    assert "append_list" in restarted_flags
+    assert "discont_start" not in restarted_flags

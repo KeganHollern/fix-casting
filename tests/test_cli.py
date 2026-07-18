@@ -17,6 +17,24 @@ def test_version_identifies_source_checkout(capsys):
     assert "development checkout" in capsys.readouterr().out
 
 
+def test_hls_profile_cli_defaults_and_compatibility_flag():
+    assert cli._parse_args(["https://example.test"]).buffered is True
+    assert cli._parse_args(["https://example.test", "--buffered"]).buffered is True
+    assert cli._parse_args(["https://example.test", "--no-buffered"]).buffered is False
+
+
+def test_hls_profile_help_uses_playlist_not_tv_buffer_terminology(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        cli._parse_args(["--help"])
+
+    assert exc_info.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "2s HLS segments" in help_text
+    assert "12s rolling playlist" in help_text
+    assert "actual TV delay is receiver-controlled" in help_text
+    assert "Buffer ~48s on the TV" not in help_text
+
+
 @pytest.mark.parametrize(
     ("option", "value"),
     [
@@ -117,7 +135,7 @@ def test_default_mode_collects_summary_counters_without_trace_noise(
 
     captured = capsys.readouterr()
     assert result == 1
-    assert "4 frames dropped (stutter)" in captured.out
+    assert "4 video timeline ticks discarded/skipped during A/V re-anchors" in captured.out
     assert "1 ffmpeg restarts" in captured.out
     assert "[trace]" not in captured.out
     assert "background encoder failed" in captured.err

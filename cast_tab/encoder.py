@@ -12,10 +12,18 @@ from cast_tab.stats import PipelineStats
 # quality bottleneck when there's H.264 bitrate to carry the detail.
 DEFAULT_JPEG_QUALITY = 92
 
-# HLS window per mode. Segment length × playlist length is the TV-side buffer,
-# which is what the CLI advertises as the buffered delay.
-HLS_TIME_S = {"buffered": 4, "low_latency": 1}
-HLS_LIST_SIZE = {"buffered": 12, "low_latency": 4}
+# HLS window per mode.  The segment target multiplied by the list size is the
+# amount of media retained in the rolling playlist; it is not a promise about
+# how far a receiver plays behind the live edge.  Without an explicit HLS
+# hold-back tag, roughly three target durations is a useful player estimate,
+# but the Chromecast remains free to choose a different live position.
+#
+# ``buffered=True`` is the compatibility name for the production profile.  Its
+# encode quality stays unchanged while the old 4s x 12 deep window is replaced
+# by a conservative 2s x 6 window.  Six target durations leaves headroom above
+# the conventional three-duration holdback without retaining 48 seconds.
+HLS_TIME_S = {"production": 2, "low_latency": 1}
+HLS_LIST_SIZE = {"production": 6, "low_latency": 4}
 
 
 # Memoized by hand instead of lru_cache: only a probe that actually ran gets
@@ -54,10 +62,20 @@ def codec_label() -> str:
     return "H.264 (VideoToolbox)" if ffmpeg_supports_encoder("h264_videotoolbox") else "H.264"
 
 
-def tv_delay_s(*, buffered: bool) -> int:
-    """Approximate playback delay the TV buffers in each mode."""
-    mode = "buffered" if buffered else "low_latency"
+def _hls_mode(*, buffered: bool) -> str:
+    return "production" if buffered else "low_latency"
+
+
+def hls_playlist_retention_s(*, buffered: bool) -> int:
+    """Media duration retained in the rolling playlist."""
+    mode = _hls_mode(buffered=buffered)
     return HLS_TIME_S[mode] * HLS_LIST_SIZE[mode]
+
+
+def estimated_hls_holdback_s(*, buffered: bool) -> int:
+    """Conventional live holdback estimate, not a receiver latency guarantee."""
+    mode = _hls_mode(buffered=buffered)
+    return HLS_TIME_S[mode] * 3
 
 
 def target_bitrate(
@@ -149,8 +167,15 @@ def video_encoder_args(
     ]
 
 
-def hls_args(*, buffered: bool) -> list[str]:
-    mode = "buffered" if buffered else "low_latency"
+def hls_args(*, buffered: bool, append: bool = False) -> list[str]:
+    mode = _hls_mode(buffered=buffered)
+    flags = ["delete_segments"]
+    if append:
+        # On relaunch FFmpeg parses the existing media sequence, appends the
+        # new generation, and inserts its boundary discontinuity. Enabling
+        # append_list on the initial generation would add a bogus initial tag.
+        flags.append("append_list")
+    flags.extend(["omit_endlist", "independent_segments"])
     return [
         "-f",
         "hls",
@@ -159,7 +184,7 @@ def hls_args(*, buffered: bool) -> list[str]:
         "-hls_list_size",
         str(HLS_LIST_SIZE[mode]),
         "-hls_flags",
-        "delete_segments+append_list+omit_endlist+independent_segments",
+        "+".join(flags),
         "-hls_segment_type",
         "mpegts",
     ]

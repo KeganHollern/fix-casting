@@ -29,12 +29,31 @@ def test_snapshot_resets_interval_windows():
     assert snap2.dropped_total == 1  # cumulative
 
 
-def test_queue_depth_is_audio_lead():
+def test_queue_depth_is_residence_not_av_drift():
     st = PipelineStats(target_fps=30.0)
     for _ in range(10):
         st.record_queue(depth=30)  # a full second of queued frames
     snap = st.snapshot(10.0)
-    assert abs(snap.drift_ms - 1000.0) < 1e-6
+    assert abs(snap.queue_residence_ms - 1000.0) < 1e-6
+
+
+def test_timeline_reanchor_counts_reason_and_discarded_frames():
+    st = PipelineStats(target_fps=30.0)
+    st.record_encode_resync("video queue overflow", lost_frames=4)
+    st.record_timeline_loss(6)
+
+    snap = st.snapshot(10.0)
+    assert snap.resyncs == 1
+    assert snap.resyncs_total == 1
+    assert snap.resync_last_reason == "video queue overflow"
+    assert snap.queue_dropped == 10
+    assert snap.dropped_total == 10
+
+    snap2 = st.snapshot(10.0)
+    assert snap2.resyncs == 0
+    assert snap2.resyncs_total == 1
+    assert snap2.resync_last_reason is None
+    assert snap2.dropped_total == 10
 
 
 def test_tv_poll_stall_accumulation():

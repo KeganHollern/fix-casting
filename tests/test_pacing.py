@@ -57,7 +57,8 @@ def test_queue_clear():
     q = BoundedFrameQueue(maxlen=4)
     q.put(b"a")
     q.put(b"b")
-    q.clear()
+    assert q.clear() == 2
+    assert q.clear() == 0
     stopped = threading.Event()
     stopped.set()
     assert q.get(stopped) is None

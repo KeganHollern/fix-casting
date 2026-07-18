@@ -11,9 +11,7 @@ import cast_tab.streamer as streamer_module
 from cast_tab.stats import PipelineStats
 from cast_tab.streamer import HLSStreamer
 
-requires_ffmpeg = pytest.mark.skipif(
-    shutil.which("ffmpeg") is None, reason="ffmpeg not installed"
-)
+requires_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
 
 
 @pytest.mark.slow
@@ -22,8 +20,7 @@ def test_stderr_drain_records_encoder_errors(tmp_path: Path):
     """Garbage MJPEG makes ffmpeg emit stderr; the drain must surface it in
     stats (and, structurally, keep the pipe from filling and stalling ffmpeg)."""
     stats = PipelineStats(target_fps=30.0)
-    s = HLSStreamer(width=320, height=240, fps=30, buffered=False,
-                    work_dir=tmp_path, stats=stats)
+    s = HLSStreamer(width=320, height=240, fps=30, buffered=False, work_dir=tmp_path, stats=stats)
     stop = threading.Event()
 
     def pump():
@@ -55,6 +52,107 @@ def test_explicit_work_dir_preserved(tmp_path: Path):
     s = HLSStreamer(width=320, height=240, fps=30, work_dir=tmp_path)
     s.stop()
     assert tmp_path.exists()
+
+
+def _publish_raw_hls_fixture(
+    work_dir: Path,
+    *segment_names: str,
+    media_sequence: int = 0,
+    discontinuity_before: set[int] | None = None,
+) -> None:
+    discontinuity_before = discontinuity_before or set()
+    lines = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:6",
+        "#EXT-X-TARGETDURATION:2",
+        f"#EXT-X-MEDIA-SEQUENCE:{media_sequence}",
+    ]
+    for index, name in enumerate(segment_names):
+        if index in discontinuity_before:
+            lines.append("#EXT-X-DISCONTINUITY")
+        lines.extend(["#EXTINF:2.0,", name])
+        (work_dir / name).write_bytes(b"segment")
+    (work_dir / "stream.m3u8").write_text("\n".join(lines) + "\n")
+
+
+def test_hls_spawn_namespaces_are_unique_and_epochs_only_advance_after_publish(
+    tmp_path: Path,
+):
+    streamer = HLSStreamer(work_dir=tmp_path)
+
+    initial_pattern, append = streamer._prepare_hls_output()
+    assert initial_pattern.endswith("seg-e000000-a000000-%09d.ts")
+    assert not append
+
+    first = "seg-e000000-a000000-000000000.ts"
+    _publish_raw_hls_fixture(tmp_path, first)
+    _records, next_sequence = streamer._read_hls_restart_state()
+    assert next_sequence == 1
+    next_pattern, append = streamer._prepare_hls_output()
+    assert next_pattern.endswith("seg-e000001-a000001-%09d.ts")
+    assert append
+
+    # Attempt 1 published nothing. Its replacement gets a unique URI namespace
+    # but reuses pending timeline epoch 1, avoiding a phantom discontinuity.
+    retry_pattern, append = streamer._prepare_hls_output()
+    assert retry_pattern.endswith("seg-e000001-a000002-%09d.ts")
+    assert append
+    streamer.stop()
+
+
+def test_hls_restart_refuses_missing_or_corrupt_published_playlist(tmp_path: Path):
+    streamer = HLSStreamer(work_dir=tmp_path)
+    streamer._hls_ever_published = True
+
+    with pytest.raises(RuntimeError, match="published playlist is missing"):
+        streamer._prepare_hls_output()
+
+    (tmp_path / "stream.m3u8").write_text("not hls\n")
+    with pytest.raises(RuntimeError, match="malformed playlist header"):
+        streamer._prepare_hls_output()
+    streamer.stop()
+
+
+def test_hls_restart_validates_epoch_boundary_and_continues_media_sequence(
+    tmp_path: Path,
+):
+    streamer = HLSStreamer(work_dir=tmp_path)
+    streamer._hls_current_attempt = 1
+    streamer._hls_attempt = 1
+    streamer._hls_timeline_epoch = 1
+    first = "seg-e000000-a000000-000000008.ts"
+    second = "seg-e000001-a000001-000000009.ts"
+    _publish_raw_hls_fixture(
+        tmp_path,
+        first,
+        second,
+        media_sequence=8,
+        discontinuity_before={1},
+    )
+
+    _records, next_sequence = streamer._read_hls_restart_state()
+    assert next_sequence == 10
+    pattern, append = streamer._prepare_hls_output()
+    assert pattern.endswith("seg-e000002-a000002-%09d.ts")
+    assert append
+    streamer.stop()
+
+
+def test_live_hls_check_rejects_media_sequence_renumbering(tmp_path: Path):
+    streamer = HLSStreamer(work_dir=tmp_path)
+    name = "seg-e000000-a000000-000000004.ts"
+    _publish_raw_hls_fixture(tmp_path, name, media_sequence=4)
+    streamer._check_hls_media_sequence_identity()
+
+    # Reusing the URI at a different media sequence violates HLS identity and
+    # was the subtle failure caused by combining append_list with start_number.
+    _publish_raw_hls_fixture(tmp_path, name, media_sequence=9)
+    streamer._hls_identity_mtime_ns = -1
+    with pytest.raises(RuntimeError, match="identity changed"):
+        streamer._check_hls_media_sequence_identity()
+
+    assert streamer.fatal_error is not None
+    streamer.stop()
 
 
 class _DeadFfmpeg:
@@ -140,6 +238,31 @@ class _WedgedFfmpeg:
         self.stdin.unblocked.set()
 
 
+class _RecordingFfmpeg:
+    def __init__(self) -> None:
+        self.stdin = self
+        self.writes: list[bytes] = []
+        self.killed = False
+
+    def poll(self):
+        return -15 if self.killed else None
+
+    def write(self, frame: bytes) -> int:
+        self.writes.append(frame)
+        return len(frame)
+
+    def flush(self) -> None:
+        pass
+
+    def stderr_text(self, *, join_timeout=1.0):
+        del join_timeout
+        return ""
+
+    def kill(self, *, graceful=False):
+        del graceful
+        self.killed = True
+
+
 def test_stop_kills_ffmpeg_before_joining_wedged_writer(tmp_path: Path):
     streamer = HLSStreamer(width=320, height=240, fps=30, work_dir=tmp_path)
     process = _WedgedFfmpeg()
@@ -217,6 +340,21 @@ def test_wait_until_ready_polls_external_health(tmp_path: Path):
     streamer.stop()
 
 
+def test_wait_until_ready_requires_three_segment_startup_runway(tmp_path: Path):
+    streamer = HLSStreamer(work_dir=tmp_path)
+    first = "seg-e000000-a000000-000000000.ts"
+    _publish_raw_hls_fixture(tmp_path, first)
+
+    with pytest.raises(TimeoutError, match="become ready"):
+        streamer.wait_until_ready(timeout=0.05)
+
+    second = "seg-e000000-a000000-000000001.ts"
+    third = "seg-e000000-a000000-000000002.ts"
+    _publish_raw_hls_fixture(tmp_path, first, second, third)
+    streamer.wait_until_ready(timeout=0.2)
+    streamer.stop()
+
+
 class _OneFrameFfmpeg:
     def __init__(self) -> None:
         self.stdin = self
@@ -225,8 +363,8 @@ class _OneFrameFfmpeg:
     def poll(self):
         return None if self.alive else 1
 
-    def write(self, _frame: bytes) -> None:
-        pass
+    def write(self, frame: bytes) -> int:
+        return len(frame)
 
     def flush(self) -> None:
         self.alive = False
@@ -311,6 +449,191 @@ def test_health_check_recovers_wedged_writes_then_opens_circuit(
     streamer.stop()
 
 
+def test_queue_overflow_reanchors_before_post_gap_frame_is_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    stats = PipelineStats(target_fps=1.0)
+    streamer = HLSStreamer(
+        width=320,
+        height=240,
+        fps=1,
+        work_dir=tmp_path,
+        stats=stats,
+    )
+    old = _WedgedFfmpeg()
+    replacements: list[_RecordingFfmpeg] = []
+    streamer._ffmpeg = old  # type: ignore[assignment]
+    streamer._ffmpeg_generation = 1
+    streamer._ffmpeg_started_at = time.monotonic()
+
+    def spawn_replacement() -> None:
+        process = _RecordingFfmpeg()
+        replacements.append(process)
+        streamer._ffmpeg = process  # type: ignore[assignment]
+        streamer._ffmpeg_generation += 1
+        streamer._ffmpeg_started_at = time.monotonic()
+
+    monkeypatch.setattr(streamer, "_start_ffmpeg", spawn_replacement)
+    streamer._start_writer_thread()
+    streamer._queue.put(b"write-blocker")
+    assert old.stdin.entered.wait(timeout=1)
+
+    streamer._enqueue_frame(b"queued-before-gap")
+    streamer._enqueue_frame(b"post-gap-must-not-use-old-generation")
+    assert streamer._pending_timeline_resync == (
+        1,
+        "video queue overflow dropped a sampled CFR frame",
+    )
+
+    # Health polling is the fallback while the writer is blocked. Killing the
+    # old process unblocks it; the queued post-gap frame is discarded at the
+    # boundary rather than entering either side with the wrong PTS anchor.
+    streamer.raise_if_failed()
+    assert old.killed
+    assert len(replacements) == 1
+    streamer._enqueue_frame(b"fresh-generation-frame")
+
+    deadline = time.monotonic() + 1
+    while not replacements[0].writes and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert replacements[0].writes == [b"fresh-generation-frame"]
+    snap = stats.snapshot(1.0)
+    assert snap.resyncs == 1
+    assert snap.ffmpeg_restarts == 1
+    assert snap.queue_dropped >= 2
+    streamer.stop()
+
+
+def test_writer_rejects_frame_popped_before_concurrent_relaunch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    streamer = HLSStreamer(width=320, height=240, fps=30, work_dir=tmp_path)
+    old = _RecordingFfmpeg()
+    new = _RecordingFfmpeg()
+    streamer._ffmpeg = old  # type: ignore[assignment]
+    streamer._ffmpeg_generation = 4
+    streamer._ffmpeg_started_at = time.monotonic()
+    streamer._queue.put(b"stale-popped-frame")
+
+    popped = threading.Event()
+    release = threading.Event()
+    real_get = streamer._queue.get
+    first_get = True
+
+    def gated_get(stopped):
+        nonlocal first_get
+        frame = real_get(stopped)
+        if first_get:
+            first_get = False
+            popped.set()
+            assert release.wait(timeout=1)
+        return frame
+
+    monkeypatch.setattr(streamer._queue, "get", gated_get)
+
+    def spawn_new() -> None:
+        streamer._ffmpeg = new  # type: ignore[assignment]
+        streamer._ffmpeg_generation += 1
+        streamer._ffmpeg_started_at = time.monotonic()
+
+    monkeypatch.setattr(streamer, "_start_ffmpeg", spawn_new)
+    streamer._start_writer_thread()
+    assert popped.wait(timeout=1)
+
+    streamer._relaunch_ffmpeg(reset_failures=True)
+    streamer._enqueue_frame(b"fresh-frame")
+    release.set()
+
+    deadline = time.monotonic() + 1
+    while not new.writes and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert old.writes == []
+    assert new.writes == [b"fresh-frame"]
+    streamer.stop()
+
+
+def test_sampler_rejects_local_frame_captured_before_relaunch(tmp_path: Path):
+    stats = PipelineStats(target_fps=30.0)
+    streamer = HLSStreamer(work_dir=tmp_path, stats=stats)
+    streamer._ffmpeg = _RecordingFfmpeg()  # type: ignore[assignment]
+    streamer._ffmpeg_generation = 12
+
+    assert not streamer._enqueue_frame(
+        b"stale-local-frame",
+        sampled_for_generation=11,
+    )
+    stopped = threading.Event()
+    stopped.set()
+    assert streamer._queue.get(stopped) is None
+    assert stats.snapshot(1.0).dropped_total == 1
+    streamer.stop()
+
+
+def test_sampler_clock_skip_requests_generation_boundary_and_counts_loss(
+    tmp_path: Path,
+):
+    stats = PipelineStats(target_fps=30.0)
+    streamer = HLSStreamer(work_dir=tmp_path, stats=stats)
+    streamer._ffmpeg = _RecordingFfmpeg()  # type: ignore[assignment]
+    streamer._ffmpeg_generation = 3
+
+    assert not streamer._handle_sampler_clock_gap(1.0, 1 / 30)
+    assert streamer._handle_sampler_clock_gap(6.0, 1 / 30)
+    assert streamer._pending_timeline_resync == (
+        3,
+        "sampler skipped 180 elapsed CFR ticks",
+    )
+
+    snap = stats.snapshot(1.0)
+    assert snap.resyncs == 1
+    assert snap.queue_dropped == 180
+    assert snap.resync_last_reason == "sampler skipped 180 elapsed CFR ticks"
+    streamer.stop()
+
+
+def test_stale_write_timing_cannot_reset_fresh_generation_backpressure(
+    tmp_path: Path,
+):
+    streamer = HLSStreamer(work_dir=tmp_path)
+    streamer._ffmpeg = _RecordingFfmpeg()  # type: ignore[assignment]
+    streamer._ffmpeg_generation = 8
+    streamer._backpressure_generation = 8
+    streamer._backpressure_started_at = 123.0
+
+    streamer._note_encode_backpressure(0.0, generation=7)
+
+    assert streamer._backpressure_generation == 8
+    assert streamer._backpressure_started_at == 123.0
+    streamer.stop()
+
+
+def test_stale_resync_request_cannot_kill_fresh_generation(tmp_path: Path):
+    streamer = HLSStreamer(work_dir=tmp_path)
+    old = _RecordingFfmpeg()
+    fresh = _RecordingFfmpeg()
+    streamer._ffmpeg = old  # type: ignore[assignment]
+    streamer._ffmpeg_generation = 7
+
+    assert streamer._request_timeline_resync(
+        "old generation overflow",
+        expected_generation=7,
+    )
+
+    # Model a concurrent manual relaunch after the request was queued but
+    # before the health/writer path consumes it.  Its generation tag makes the
+    # request already satisfied, rather than authority to kill the new process.
+    with streamer._ffmpeg_lock:
+        streamer._ffmpeg = fresh  # type: ignore[assignment]
+        streamer._ffmpeg_generation = 8
+
+    assert not streamer._process_pending_timeline_resync()
+    assert streamer._pending_timeline_resync is None
+    assert not fresh.killed
+    streamer.stop()
+
+
 def test_stop_cannot_return_before_concurrent_start_publishes_resources(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -329,7 +652,7 @@ def test_stop_cannot_return_before_concurrent_start_publishes_resources(
     class HTTP:
         port = 12345
 
-        def __init__(self, *_args):
+        def __init__(self, *_args, **_kwargs):
             events.append("http-created")
 
         def start(self):
@@ -355,17 +678,11 @@ def test_stop_cannot_return_before_concurrent_start_publishes_resources(
         events.append("ffmpeg-started")
 
     monkeypatch.setattr(streamer, "_start_ffmpeg", spawn)
-    monkeypatch.setattr(
-        streamer, "_start_sampler_thread", lambda: events.append("sampler-started")
-    )
-    monkeypatch.setattr(
-        streamer, "_start_writer_thread", lambda: events.append("writer-started")
-    )
+    monkeypatch.setattr(streamer, "_start_sampler_thread", lambda: events.append("sampler-started"))
+    monkeypatch.setattr(streamer, "_start_writer_thread", lambda: events.append("writer-started"))
 
     start_thread = threading.Thread(target=streamer.start)
-    stop_thread = threading.Thread(
-        target=lambda: (streamer.stop(), stop_returned.set())
-    )
+    stop_thread = threading.Thread(target=lambda: (streamer.stop(), stop_returned.set()))
     start_thread.start()
     assert entered_spawn.wait(timeout=1)
     stop_thread.start()

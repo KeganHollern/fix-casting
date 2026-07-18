@@ -14,7 +14,12 @@ cast "https://example.com/watch"
 4. Encodes video + audio to HLS with ffmpeg
 5. Tells your Chromecast to play the stream
 
-Buffered mode is on by default (~48s delay on the TV) for smoother, higher-quality playback.
+The production profile is on by default: it keeps the 30fps/high-bitrate encode
+settings while using 2-second HLS segments and a six-entry rolling playlist
+(12 seconds retained). A conventional player holdback is roughly three target
+durations (~6 seconds), but the TV chooses its actual live position. The cast
+waits for three complete segments before loading the receiver, giving startup
+the same standards-conservative runway.
 
 ## Requirements
 
@@ -83,8 +88,8 @@ The CLI discovers Chromecast devices on your network and prompts you to pick one
 If the TV stops playing the stream (someone exits the receiver app, a stream
 error), the watchdog re-casts it automatically within ~10s.
 
-Press `Ctrl+C` to stop; a one-line summary (duration, re-casts, dropped
-frames, ffmpeg restarts) prints on exit.
+Press `Ctrl+C` to stop; a one-line summary (duration, re-casts, skipped/discarded
+video timeline ticks, guarded A/V re-anchors, ffmpeg restarts) prints on exit.
 
 ### Options
 
@@ -94,11 +99,12 @@ cast <url> [options]
   --version               Show installed version and source provenance
   --width WIDTH           Viewport width (default: 1920)
   --height HEIGHT         Viewport height (default: 1080)
-  --fps FPS               Encode frame rate (default: 30 buffered, 23–24 unbuffered)
+  --fps FPS               Encode frame rate (default: 30 production, 23–24 with --no-buffered)
   --jpeg-quality Q        Tab-capture JPEG quality 1–100 (default: 92)
   --video-bitrate MBPS    Override H.264 target bitrate in Mbps, max 1000 (default: by resolution)
   --buffered / --no-buffered
-                          Buffered mode for quality vs latency (default: buffered)
+                          Production 2s/12s HLS profile vs compatible 1s/4s
+                          low-latency profile (default: buffered/production)
   --no-audio              Video only, skip tab audio capture
   --audio-offset-ms MS    Manual A/V trim 0–3000; positive delays audio (default: 0)
   --audio-drift-ppm PPM   Correct measured audio-clock drift, -100000…100000 (default: 0)
@@ -119,7 +125,7 @@ captured via CDP `Page.startScreencast`.
 
 ### Examples
 
-Lower latency (less buffering on the TV):
+Lower latency (shorter segments and rolling playlist, with leaner encode tuning):
 
 ```bash
 cast --no-buffered "https://example.com"
@@ -172,11 +178,11 @@ health dot per segment. Metrics are grouped by pipeline segment:
 - **① Capture** — CDP screencast + AudioTee (incoming): capture FPS,
   Chrome→app frame lag, decode time, audio pipe backlog, audio warnings.
 - **② Encode pipeline** (internal): encode FPS, frame age, queue depth, ffmpeg
-  stdin-write time, repeats/resyncs.
+  stdin-write time, repeats/re-anchors.
 - **③ HLS stream** (outgoing): segment count, newest-segment age, rotation.
 - **④ TV / Chromecast** (playback): state, position, advance-vs-wall-clock,
   micro-stalls, non-playing polls.
-- **⑤ A/V sync**: cumulative audio-lead drift, frames dropped, ffmpeg restarts.
+- **⑤ A/V sync**: CFR timeline guard/re-anchors, lost video ticks, ffmpeg restarts.
 
 The **audio-offset knob** at the bottom adjusts lip-sync live. Use the
 `-100 / -10 / +10 / +100` ms buttons or the keyboard:
@@ -186,14 +192,15 @@ The **audio-offset knob** at the bottom adjusts lip-sync live. Use the
 | `[` / `]` | audio offset −10 / +10 ms |
 | `{` / `}` | audio offset −100 / +100 ms |
 | `r` | reset offset to 0 |
-| `space` | pause / resume the TV (a pause longer than the buffer resumes as a jump to live) |
+| `space` | pause / resume the TV (a pause longer than playlist retention resumes as a jump to live) |
 | `,` / `.` | TV volume −5% / +5% |
 | `m` | mute / unmute the TV |
 | `q` | stop the cast and exit |
 
 Changes apply after presses settle (one quick ffmpeg re-sync, so expect a brief
-glitch). Note that the buffered HLS delay means an offset change takes ~the
-buffer length to become visible on the TV — adjust in small steps.
+glitch). The TV applies an offset change only after it reaches the restarted HLS
+generation. That lag depends on the receiver's live holdback, not the full
+playlist-retention window, so adjust in small steps and wait for it to appear.
 
 ### Ad blocking (`--adblock`)
 
@@ -231,12 +238,12 @@ Read the `tv` stats line:
 - **`stall ~Ns`**, **`micro-stalls ~Ns`**, or **`non-playing … (BUFFERING …)`** →
   the network can't keep up at that bitrate; back it off.
 
-Step up (e.g. 6 → 8 → 10 → 12 Mbps) and stay at each setting a few minutes — with
-the default ~48s buffer, an over-high bitrate takes that long to drain the buffer
-before it stalls. For faster feedback use `--no-buffered` (small buffer, fails
-fast), then re-confirm your chosen bitrate in normal buffered mode. The highest
-setting that stays `PLAYING` with no stalls is your ceiling; back off ~20% for
-headroom against network jitter.
+Step up (e.g. 6 → 8 → 10 → 12 Mbps) and stay at each setting a few minutes.
+The receiver controls how much it buffers, so playlist length is not a reliable
+countdown to a stall. For faster feedback use `--no-buffered` (shorter segments
+and a four-second rolling playlist), then re-confirm your chosen bitrate with the
+normal production profile. The highest setting that stays `PLAYING` with no
+stalls is your ceiling; back off ~20% for headroom against network jitter.
 
 ## How it works
 
@@ -251,9 +258,15 @@ URL → Chrome tab → JPEG frames + PCM audio
 ```
 
 - **Video capture** uses CDP `Page.startScreencast`: Chrome pushes JPEG frames as the page paints (up to ~60fps), and every frame is acknowledged with `Page.screencastFrameAck` so the stream never stalls.
-- **Even-paced encoding** samples the latest frame at a constant cadence on one thread and feeds ffmpeg on another, with a bounded queue between them. Even sampling keeps motion smooth (no judder) even when an ffmpeg write stalls on an HLS segment flush, while the constant rate keeps the TV buffer from draining. ffmpeg is restarted automatically if it dies or stays backpressured.
+- **Even-paced encoding** samples the latest frame at a constant cadence on one
+  thread and feeds ffmpeg on another, with a bounded queue between them. Brief
+  write stalls are absorbed without changing either media timeline. If a CFR
+  video tick is lost, the old generation is stopped before any post-gap frame
+  can enter it, then video and PCM are jointly re-anchored in a fresh generation.
 - **Audio capture** uses a vendored [AudioTee](https://github.com/makeusabrew/audiotee) binary to tap only the cast browser's processes. An inaudible Web Audio keepalive keeps that private tap initialized while a page is silent, so media which starts later joins the existing audio stream. Your other apps are not routed through a virtual audio device.
-- **Streaming** uses ffmpeg to mux H.264 + AAC into an HLS playlist served from a per-run temp directory (removed on exit).
+- **Streaming** uses ffmpeg to mux H.264 + AAC into an HLS playlist served from
+  a per-run temp directory (removed on exit). Restart generations use unique
+  segment identities and standards-correct HLS discontinuity sequencing.
 - **Casting** uses [pychromecast](https://github.com/home-assistant-libs/pychromecast) to load the HLS URL on the default media receiver.
 
 ## Troubleshooting
@@ -295,7 +308,7 @@ Every 10 seconds you'll see something like:
 ```
 [stats] capture 28.5/30 fps, capture avg 35ms peak 52ms, behind 3x
 [stats] encode  30.0/30 fps to ffmpeg, frame age avg 8ms peak 20ms, stdin write avg 0.5ms
-[stats] hls     12 segments, newest segment 1.2s old
+[stats] hls     6 segments, newest segment 1.2s old
 [stats] tv      PLAYING, playback position 142s
 ```
 
@@ -306,7 +319,7 @@ How to read it:
 - **encode fps drops** but capture is fine → ffmpeg encoding is struggling
 - **frame age rises** → encoder is feeding ffmpeg stale frames (usually means capture slowed down)
 - **newest segment age rises** → ffmpeg/HLS segment generation is falling behind
-- **tv position** creeping further behind real time → TV buffer or network (expected ~48s with `--buffered`)
+- **tv position** creeping further behind real time → receiver buffering or network; the playlist retains 12s by default, but actual TV holdback is client-controlled
 
 ## Project layout
 

@@ -198,8 +198,8 @@ class CastTUI(App):
                                "Frames buffered before ffmpeg; spikes = stall absorbed."),
                     MetricCard("write", "stdin write",
                                "Time blocked writing to ffmpeg; high = backpressure."),
-                    MetricCard("repeats", "Repeats / resync",
-                               "Held frames (no new capture) / clock resyncs.",
+                    MetricCard("repeats", "Repeats / re-anchor",
+                               "Held frames (no new capture) / A/V timeline resets.",
                                show_spark=False),
                     MetricCard("ff_err", "ffmpeg errors",
                                "stderr lines from ffmpeg (encoder/mux errors).",
@@ -240,12 +240,12 @@ class CastTUI(App):
             yield Section(
                 "⑤  A/V sync",
                 [
-                    MetricCard("drift", "Est. audio lead",
-                               "Live A/V offset = encoder queue depth / fps. "
-                               "Rises when the encoder backs up; ~0 when it keeps up.",
+                    MetricCard("drift", "Timeline guard",
+                               "CFR loss triggers a joint audio/video re-anchor; "
+                               "queue depth is not an A/V-offset measurement.",
                                show_spark=False),
-                    MetricCard("dropped", "Frames dropped",
-                               "Brief video skips when the encoder stalled (stutter).",
+                    MetricCard("dropped", "Timeline loss",
+                               "Video CFR ticks skipped/discarded at guarded A/V boundaries.",
                                show_spark=False),
                     MetricCard("restarts", "ffmpeg restarts",
                                "Relaunches (each glitches + re-anchors sync).",
@@ -374,7 +374,10 @@ class CastTUI(App):
                                level=lvl(s.tv_non_playing > 0))
 
         # ⑤ Sync
-        card("drift").set(f"~{s.drift_ms:.0f} ms", level=lvl(s.drift_ms >= 150, s.drift_ms >= 400))
+        timeline_state = (
+            "intact" if s.resyncs_total == 0 else f"re-anchored ×{s.resyncs_total}"
+        )
+        card("drift").set(timeline_state, level=lvl(s.resyncs > 0))
         card("dropped").set(str(s.dropped_total), level=lvl(s.dropped_total > 0))
         card("restarts").set(str(s.restarts_total), level=lvl(s.restarts_total > 0))
 
@@ -392,7 +395,11 @@ class CastTUI(App):
             dot(f"encode {s.encode_fps:.0f}fps", False, enc_lo),
             dot(f"hls {s.hls_count}seg", False, (s.hls_age or 0) > 6),
             dot(f"tv {s.tv_state.lower()}", not tv_ok, s.stall_accum >= 2.0),
-            dot(f"sync ~{s.drift_ms:.0f}ms", s.drift_ms >= 400, s.drift_ms >= 150),
+            dot(
+                "sync guarded" if s.resyncs_total == 0 else f"sync reset ×{s.resyncs_total}",
+                False,
+                s.resyncs > 0,
+            ),
         ]
         self.query_one("#status-bar", Static).update("   ".join(parts))
 

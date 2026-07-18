@@ -37,17 +37,17 @@ class LatestFrame:
 class BoundedFrameQueue:
     """Sampled frames waiting for the writer to push them into ffmpeg.
 
-    Depth IS the audio lead. ffmpeg's image2pipe timestamps frames by the
-    time they ARRIVE on its stdin, so a frame that waits `depth/fps` seconds
-    in this queue reaches the muxer that much later than its audio and the
-    output plays audio ahead by ~depth/fps. (A deep queue was the real
-    "audio leads over long runtime" — it grew under encoder contention and
-    the lead grew with it; an earlier 8s bound let the lead reach 8s.) In
-    normal operation the writer drains the queue to depth ~1 (the encoder
-    has ample headroom), so the lead is ~one frame. Bound it at ~1s so even
-    a sustained stall caps the audio lead at ~1s (dropping the oldest frames
-    past that — a brief stutter — rather than letting the lead grow
-    unbounded). stats exposes the live lead as queue_depth/fps.
+    Queue depth is residence time/backpressure, not A/V offset.  image2pipe's
+    ``-framerate`` assigns video PTS from the number of frames ffmpeg accepts;
+    raw PCM PTS likewise comes from the number of samples.  Waiting in this
+    queue preserves that relationship as long as every sampled frame is later
+    written.  Dropping even one sampled frame, however, shortens the video
+    content timeline by 1/fps while audio keeps every sample.  Callers must
+    therefore treat a non-zero ``dropped`` result as a broken CFR timeline and
+    re-anchor both raw inputs before writing any post-gap frame.
+
+    The bound limits memory and detection latency.  It does *not* make frame
+    loss harmless or cap cumulative A/V skew by itself.
     """
 
     def __init__(self, maxlen: int) -> None:
@@ -78,9 +78,12 @@ class BoundedFrameQueue:
                 return None
             return self._frames.popleft()
 
-    def clear(self) -> None:
+    def clear(self) -> int:
+        """Discard queued frames and return how many were removed."""
         with self._cond:
+            discarded = len(self._frames)
             self._frames.clear()
+            return discarded
 
     def wake_all(self) -> None:
         with self._cond:

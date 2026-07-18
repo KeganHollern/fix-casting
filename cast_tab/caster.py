@@ -174,8 +174,8 @@ class TabCaster:
         """Pause/resume playback on the TV. Returns "paused"/"resumed" or None.
 
         Note: the stream is live HLS with a rolling window, so a pause longer
-        than the buffer (~48s buffered, ~4s low-latency) will stall on resume —
-        the watchdog then recovers with a re-cast (a jump to live).
+        than playlist retention (~12s production, ~4s low-latency) can stall
+        on resume — the watchdog then recovers with a re-cast (a jump to live).
         """
         chromecast = self._chromecast
         if chromecast is None:

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from cast_tab.caster import TabCaster
 from cast_tab.devices import discover_devices, find_device, select_device
-from cast_tab.encoder import tv_delay_s
+from cast_tab.encoder import estimated_hls_holdback_s, hls_playlist_retention_s
 from cast_tab.paths import AUDIOTEE_PROVENANCE_PATH, INSTALL_PROVENANCE_PATH
 from cast_tab.session import CastSession, SessionConfig
 from cast_tab.stats import PipelineStats
@@ -150,7 +150,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--fps",
         type=_positive_int,
         default=None,
-        help="Encode frame rate (default: 30 buffered, 23 at 1080p / 24 at 720p otherwise)",
+        help=(
+            "Encode frame rate (default: 30 in the production profile; "
+            "23 at 1080p / 24 at 720p with --no-buffered)"
+        ),
     )
     parser.add_argument(
         "--jpeg-quality",
@@ -238,8 +241,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Buffer ~48s on the TV for higher quality and smoother playback "
-            "(default: on). Use --no-buffered for lower latency."
+            "Use the production encode profile with 2s HLS segments and a 12s "
+            "rolling playlist (default: on). Use --no-buffered for the existing "
+            "1s/4s low-latency profile; actual TV delay is receiver-controlled."
         ),
     )
     parser.add_argument(
@@ -291,7 +295,7 @@ def main(argv: list[str] | None = None) -> int:
     # The TUI is a live view of the same stats, so it needs them collected too.
     collect_stats = args.stats or args.tui
     # Keep cumulative counters even in the default quiet mode so the exit
-    # summary can report dropped frames and ffmpeg restarts.
+    # summary can report lost video timeline ticks and ffmpeg restarts.
     stats = PipelineStats(
         target_fps=float(encode_fps),
         trace_enabled=collect_stats,
@@ -340,7 +344,10 @@ def main(argv: list[str] | None = None) -> int:
             parts.append(f"{caster.reconnects} TV re-casts")
         dropped_total, restarts_total = stats.totals()
         if dropped_total:
-            parts.append(f"{dropped_total} frames dropped (stutter)")
+            parts.append(
+                f"{dropped_total} video timeline ticks discarded/skipped "
+                "during A/V re-anchors"
+            )
         if restarts_total:
             parts.append(f"{restarts_total} ffmpeg restarts")
         print(f"Summary: {', '.join(parts)}.")
@@ -384,10 +391,12 @@ def main(argv: list[str] | None = None) -> int:
         assert streamer is not None  # session.start() succeeded above
 
         audio_mode = "with tab audio" if session.audio_active else "video only"
+        holdback = estimated_hls_holdback_s(buffered=args.buffered)
+        retention = hls_playlist_retention_s(buffered=args.buffered)
+        profile_name = "production HLS" if args.buffered else "low-latency HLS"
         latency_mode = (
-            f"buffered (~{tv_delay_s(buffered=True)}s TV delay)"
-            if args.buffered
-            else "low-latency"
+            f"{profile_name} (~{holdback}s estimated player holdback, "
+            f"{retention}s playlist retention)"
         )
         bitrate_note = (
             f", {args.video_bitrate:g}M video bitrate"

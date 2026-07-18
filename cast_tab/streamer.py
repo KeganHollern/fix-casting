@@ -9,6 +9,7 @@ ordering between them.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -26,7 +27,11 @@ from cast_tab.encoder import (  # re-exported for callers (cli, tools)
     video_encoder_args,
 )
 from cast_tab.pacing import BoundedFrameQueue, LatestFrame
-from cast_tab.server import HLSHTTPServer, get_local_ip
+from cast_tab.server import (
+    HLSDiscontinuitySequenceNormalizer,
+    HLSHTTPServer,
+    get_local_ip,
+)
 from cast_tab.stats import PipelineStats
 
 __all__ = [
@@ -39,7 +44,10 @@ __all__ = [
 ]
 
 FFMPEG_BACKPRESSURE_WRITE_S = 0.050
-FFMPEG_BACKPRESSURE_DURATION_S = 60.0
+# Do not tolerate slow writes for a minute: the Python queue only holds about
+# one second of CFR ticks.  Queue overflow is itself an immediate re-anchor
+# trigger; this shorter window catches sustained pressure before that point.
+FFMPEG_BACKPRESSURE_DURATION_S = 2.0
 
 # A broken ffmpeg pipe is usually transient (for example, a hardware encoder
 # process dying), so retry it.  Persistent failures must not turn the writer
@@ -55,19 +63,30 @@ FFMPEG_RESTART_MAX_DELAY_S = 2.0
 FFMPEG_RESTART_STABLE_S = 10.0
 FFMPEG_WRITER_GRACEFUL_JOIN_S = 0.1
 # A write which has not returned by this deadline is indistinguishable from a
-# live-but-wedged encoder.  raise_if_failed() drives its bounded recovery.
-FFMPEG_WRITE_STALL_S = 60.0
+# live-but-wedged encoder.  This must be no longer than the frame queue's
+# capacity in seconds: once a sampled frame is lost, continuing the same
+# image2pipe frame-count timeline permanently desynchronizes it from raw PCM.
+FFMPEG_WRITE_STALL_S = 1.0
 HEALTH_POLL_S = 0.1
+# Give a live receiver the conventional three target durations it expects
+# before advertising the stream as ready. This avoids asking the Chromecast to
+# bootstrap from a single segment without increasing steady-state holdback.
+HLS_STARTUP_SEGMENTS = 3
 
 # Keep filling video frames to catch up after a stall this long or shorter (so
 # the encoded timeline stays locked to wall-clock and audio can't drift ahead);
 # only abandon catch-up past it (machine slept, multi-second hang).
 SAMPLER_MAX_CATCHUP_S = 5.0
 
-# Clamp the manual --audio-offset-ms trim to a sane range; covers the audio
-# pre-roll plus the video frame-queue latency we compensate for.
+# Clamp the manual --audio-offset-ms trim to a sane range; covers ordinary
+# fixed capture/encode baseline offsets without masking a broken timeline.
 MAX_AUTO_AV_OFFSET_S = 3.0
 MAX_AUTO_AV_OFFSET_MS = int(MAX_AUTO_AV_OFFSET_S * 1000)
+
+_HLS_SEGMENT_NAME_RE = re.compile(
+    r"^seg-e(?P<epoch>[0-9]{6})-a(?P<attempt>[0-9]{6})-"
+    r"(?P<sequence>[0-9]{9})\.ts$"
+)
 
 
 class HLSStreamer:
@@ -100,8 +119,8 @@ class HLSStreamer:
         # returned unchanged even though the command silently applied 3000ms.
         self.audio_offset_ms = self._clamp_audio_offset_ms(audio_offset_ms)
         self.audio_drift_ppm = audio_drift_ppm
-        # Test-only: sleep this many ms after each stdin write to simulate a slow
-        # encoder, so the frame queue backs up (reproduces queue-delay lead).
+        # Test-only: sleep after each stdin write to simulate an encoder whose
+        # throughput is too low, exercising queue overflow and guarded recovery.
         self._test_write_delay_s = (
             float(os.environ.get("CAST_TEST_WRITE_DELAY_MS", "0") or "0") / 1000.0
         )
@@ -144,11 +163,29 @@ class HLSStreamer:
         self._write_generation: int | None = None
         self._write_stall_recovery_started = False
         self._backpressure_started_at: float | None = None
+        self._backpressure_generation: int | None = None
         self._last_sampled_generation = -1
         self._known_hls_segments: set[str] = set()
-        # Bounded at ~1s of frames: the queue's depth is the live audio lead
-        # (see BoundedFrameQueue's docstring for the full mechanism).
+        # Every ffmpeg spawn gets a unique URI namespace. ``timeline_epoch``
+        # advances only after the prior attempt actually published media, so it
+        # is also the exact HLS discontinuity sequence used by the HTTP
+        # playlist normalizer. A failed empty attempt gets a new attempt id but
+        # reuses the pending epoch.
+        self._hls_timeline_epoch = 0
+        self._hls_attempt = -1
+        self._hls_current_attempt: int | None = None
+        self._hls_ever_published = False
+        self._hls_identity_lock = threading.Lock()
+        self._hls_uri_sequences: dict[str, int] = {}
+        self._hls_identity_mtime_ns = -1
+        # Bounded at ~1s of frames.  The bound is an early-warning threshold,
+        # not an A/V-offset cap: overflow breaks image2pipe's CFR timeline and
+        # must force a new ffmpeg generation (see BoundedFrameQueue).
         self._queue = BoundedFrameQueue(maxlen=max(1, self.fps))
+        # (ffmpeg generation, reason). Accessed only under _ffmpeg_lock.  A
+        # generation tag prevents an old overflow/stall request from killing a
+        # fresh process installed concurrently by a manual offset relaunch.
+        self._pending_timeline_resync: tuple[int, str] | None = None
 
     @property
     def playlist_url(self) -> str:
@@ -174,8 +211,13 @@ class HLSStreamer:
         error = self.fatal_error
         if error is not None:
             raise error
+        self._check_hls_media_sequence_identity()
+        # Queue overflow and sampler clock gaps are CFR timeline boundaries,
+        # not ordinary encoder errors.  Re-anchor both raw inputs before any
+        # post-gap frame is allowed into the old ffmpeg generation.
+        self._process_pending_timeline_resync()
         self._recover_stalled_write_if_needed()
-        # Wedge recovery can open the circuit synchronously.
+        # Timeline/wedge recovery can open the circuit synchronously.
         error = self.fatal_error
         if error is not None:
             raise error
@@ -199,19 +241,116 @@ class HLSStreamer:
             # Only one concurrent health checker may recover this write.
             self._write_stall_recovery_started = True
         with self._ffmpeg_lock:
-            ffmpeg = (
-                self._ffmpeg
-                if self._ffmpeg_generation == generation
-                else None
-            )
+            ffmpeg = self._ffmpeg if self._ffmpeg_generation == generation else None
         if ffmpeg is None:
             return
         stalled_for = time.monotonic() - started_at
-        self._recover_ffmpeg(
-            ffmpeg,
-            generation,
-            TimeoutError(f"ffmpeg stdin write blocked for {stalled_for:.1f}s"),
+        requested = self._request_timeline_resync(
+            f"ffmpeg stdin write blocked for {stalled_for:.1f}s",
+            expected_generation=generation,
         )
+        if requested:
+            self._process_pending_timeline_resync()
+
+    def _request_timeline_resync_locked(
+        self,
+        reason: str,
+        *,
+        expected_generation: int | None = None,
+        lost_frames: int = 0,
+    ) -> bool:
+        """Request a raw-input re-anchor while holding ``_ffmpeg_lock``.
+
+        The generation tag is the key race invariant: a request caused by an
+        old queue/write stall can never tear down a process installed by a
+        concurrent manual relaunch.  Repeated requests for the same generation
+        coalesce, while any additional known frame loss is still counted.
+        """
+        generation = self._ffmpeg_generation
+        if (
+            self._stopped.is_set()
+            or self._ffmpeg is None
+            or (expected_generation is not None and expected_generation != generation)
+        ):
+            return False
+
+        pending = self._pending_timeline_resync
+        if pending is not None and pending[0] == generation:
+            if lost_frames and self._stats is not None:
+                self._stats.record_timeline_loss(lost_frames)
+            return False
+
+        self._pending_timeline_resync = (generation, reason)
+        if self._stats is not None:
+            self._stats.record_encode_resync(reason, lost_frames=lost_frames)
+            self._stats.trace(f"timeline re-anchor requested: {reason}")
+        return True
+
+    def _request_timeline_resync(
+        self,
+        reason: str,
+        *,
+        expected_generation: int | None = None,
+        lost_frames: int = 0,
+    ) -> bool:
+        with self._ffmpeg_lock:
+            return self._request_timeline_resync_locked(
+                reason,
+                expected_generation=expected_generation,
+                lost_frames=lost_frames,
+            )
+
+    def _process_pending_timeline_resync_locked(self) -> bool:
+        """Apply a pending re-anchor while holding ``_ffmpeg_lock``.
+
+        Returns True when a request was consumed (including a terminal circuit
+        open).  Killing the old process unblocks a writer stuck outside the
+        lock; clearing video and draining audio in ``_start_ffmpeg`` then gives
+        the replacement two fresh frame/sample-count timelines at PTS zero.
+        """
+        pending = self._pending_timeline_resync
+        if pending is None:
+            return False
+        requested_generation, reason = pending
+        if requested_generation != self._ffmpeg_generation:
+            # Another relaunch already supplied the requested boundary.
+            self._pending_timeline_resync = None
+            return False
+
+        self._pending_timeline_resync = None
+        self._consecutive_ffmpeg_failures += 1
+        failures = self._consecutive_ffmpeg_failures
+        if failures >= FFMPEG_RESTART_MAX_FAILURES:
+            self._fail(
+                "ffmpeg encoder recovery stopped after "
+                f"{failures} consecutive CFR timeline recovery attempts "
+                f"({reason})"
+            )
+            self._kill_ffmpeg()
+            return True
+
+        self._kill_ffmpeg()
+        discarded = self._queue.clear()
+        if discarded and self._stats is not None:
+            self._stats.record_timeline_loss(discarded)
+        self._backpressure_started_at = None
+        self._backpressure_generation = None
+        if self._stopped.is_set():
+            return True
+        try:
+            self._start_ffmpeg()
+        except Exception as exc:
+            self._fail("ffmpeg timeline re-anchor failed", exc)
+            return True
+
+        if self._stats is not None:
+            self._stats.record_ffmpeg_restart()
+        print(f"Re-anchored A/V after {reason}.", flush=True)
+        return True
+
+    def _process_pending_timeline_resync(self) -> bool:
+        with self._ffmpeg_lock:
+            return self._process_pending_timeline_resync_locked()
 
     def _fail(self, message: str, cause: BaseException | None = None) -> None:
         """Record the first fatal error and stop all producer threads."""
@@ -301,7 +440,11 @@ class HLSStreamer:
             return
 
         def start_http() -> None:
-            self._http = HLSHTTPServer(self.work_dir, self._port)
+            self._http = HLSHTTPServer(
+                self.work_dir,
+                self._port,
+                playlist_transform=HLSDiscontinuitySequenceNormalizer(),
+            )
             self._http.start()
 
         if not self._startup_step(start_http):
@@ -331,9 +474,7 @@ class HLSStreamer:
             backlog = _pipe_bytes_available(self.audio_fd)
         except OSError:
             return
-        self._stats.record_audio_backlog(
-            backlog / self.audio_format.bytes_per_second * 1000
-        )
+        self._stats.record_audio_backlog(backlog / self.audio_format.bytes_per_second * 1000)
 
     def poll_hls_stats(self) -> list[str]:
         if self._stats is None:
@@ -358,13 +499,61 @@ class HLSStreamer:
         )
         return events
 
+    def _check_hls_media_sequence_identity(self) -> None:
+        """Ensure a published segment URI never changes media-sequence number."""
+        playlist = self.work_dir / "stream.m3u8"
+        try:
+            modified_ns = playlist.stat().st_mtime_ns
+        except OSError:
+            return
+        with self._hls_identity_lock:
+            if modified_ns == self._hls_identity_mtime_ns:
+                return
+        try:
+            lines = playlist.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            return
+        media_prefix = "#EXT-X-MEDIA-SEQUENCE:"
+        media_values = [
+            line[len(media_prefix) :]
+            for line in lines
+            if line.startswith(media_prefix)
+        ]
+        uris = [line for line in lines if line and not line.startswith("#")]
+        if len(media_values) != 1 or not uris:
+            return
+        try:
+            media_sequence = int(media_values[0])
+        except ValueError:
+            return
+
+        with self._hls_identity_lock:
+            current_sequences: dict[str, int] = {}
+            for index, uri in enumerate(uris):
+                if _HLS_SEGMENT_NAME_RE.fullmatch(uri) is None:
+                    message = f"HLS published an unexpected segment URI {uri!r}"
+                    self._fail(message)
+                    raise self.fatal_error or RuntimeError(message)
+                sequence = media_sequence + index
+                previous = self._hls_uri_sequences.get(uri)
+                if previous is not None and previous != sequence:
+                    message = (
+                        f"HLS media-sequence identity changed for {uri!r}: "
+                        f"{previous} -> {sequence}"
+                    )
+                    self._fail(message)
+                    raise self.fatal_error or RuntimeError(message)
+                current_sequences[uri] = sequence
+            self._hls_uri_sequences = current_sequences
+            self._hls_identity_mtime_ns = modified_ns
+
     def wait_until_ready(
         self,
         timeout: float | None = None,
         *,
         health_check: Callable[[], None] | None = None,
     ) -> None:
-        """Block until the HLS playlist and first segment exist."""
+        """Block until the live playlist has a stable three-segment runway."""
         if timeout is None:
             timeout = 60.0 if self.buffered else 30.0
         playlist = self.work_dir / "stream.m3u8"
@@ -373,7 +562,20 @@ class HLSStreamer:
             if health_check is not None:
                 health_check()
             self.raise_if_failed()
-            if playlist.exists() and list(self.work_dir.glob("seg*.ts")):
+            try:
+                playlist_lines = playlist.read_text(encoding="utf-8").splitlines()
+            except (OSError, UnicodeError):
+                playlist_lines = []
+            playlist_segments = [
+                line
+                for line in playlist_lines
+                if line and not line.startswith("#")
+            ]
+            if len(playlist_segments) >= HLS_STARTUP_SEGMENTS and all(
+                (self.work_dir / name).is_file()
+                for name in playlist_segments
+            ):
+                self._hls_ever_published = True
                 if health_check is not None:
                     health_check()
                 return
@@ -523,17 +725,16 @@ class HLSStreamer:
         ]
 
     def _audio_delay_filter_args(self) -> list[str]:
-        """Delay audio to match the video pipeline's latency (lip-sync).
+        """Apply the user's fixed audio-ahead lip-sync trim.
 
-        Video runs through the capture + frame-queue + encoder path and reaches
-        the muxer later than the near-direct audio, so audio plays ahead. We
-        prepend silence with the adelay filter to push audio later by
-        --audio-offset-ms.
+        A source/device path can have a stable baseline offset even while its
+        clocks remain locked. We prepend silence with ``adelay`` to move audio
+        later by ``--audio-offset-ms`` without changing its long-run rate.
 
         Input-side -itsoffset is silently ignored for a raw-PCM pipe (ffmpeg
         regenerates the timestamps from 0), so the delay must live in the audio
         filter graph instead. adelay only adds delay, which is all we need: the
-        skew is always audio-ahead.
+        the supported manual trim direction is audio-ahead.
         """
         if self.audio_fd is None or self.audio_offset_ms == 0:
             return []
@@ -590,7 +791,10 @@ class HLSStreamer:
             return offset_ms
         self.audio_offset_ms = offset_ms
         if not self._stopped.is_set():
-            self._relaunch_ffmpeg(reset_failures=True)
+            relaunched = self._relaunch_ffmpeg(reset_failures=True)
+            if relaunched and self._stats is not None:
+                self._stats.record_encode_resync("manual audio-offset change")
+                self._stats.record_ffmpeg_restart()
         return offset_ms
 
     def _relaunch_ffmpeg(
@@ -600,16 +804,15 @@ class HLSStreamer:
         reset_failures: bool = False,
     ) -> bool:
         with self._ffmpeg_lock:
-            if (
-                expected_generation is not None
-                and self._ffmpeg_generation != expected_generation
-            ):
+            if expected_generation is not None and self._ffmpeg_generation != expected_generation:
                 return False
             self._kill_ffmpeg()
             # Drop the queued backlog: the sampler keeps producing during the
             # relaunch gap, and a fresh ffmpeg would otherwise inherit and
             # buffer seconds of stale video, inflating the A/V latency.
-            self._queue.clear()
+            discarded = self._queue.clear()
+            if discarded and self._stats is not None:
+                self._stats.record_timeline_loss(discarded)
             # Re-check under the lock: stop() may have completed between our
             # caller's check and here (e.g. the TUI's debounced offset apply
             # racing a quit) — spawning now would orphan an ffmpeg pointed at
@@ -619,7 +822,8 @@ class HLSStreamer:
             self._start_ffmpeg()
             if reset_failures:
                 self._consecutive_ffmpeg_failures = 0
-        self._backpressure_started_at = None
+            self._backpressure_started_at = None
+            self._backpressure_generation = None
         return True
 
     def _restart_ffmpeg(
@@ -634,6 +838,7 @@ class HLSStreamer:
         if restarted:
             print(f"Restarted ffmpeg after {reason}.", flush=True)
             if self._stats is not None:
+                self._stats.record_encode_resync(f"ffmpeg restart after {reason}")
                 self._stats.record_ffmpeg_restart()
         return restarted
 
@@ -673,10 +878,7 @@ class HLSStreamer:
         opens the circuit and records a fatal error.
         """
         with self._ffmpeg_lock:
-            if (
-                self._ffmpeg_generation != failed_generation
-                or self._ffmpeg is not failed_ffmpeg
-            ):
+            if self._ffmpeg_generation != failed_generation or self._ffmpeg is not failed_ffmpeg:
                 # A user-driven relaunch replaced the failed instance between
                 # the writer's snapshot and recovery.  Leave that fresh
                 # process alone and let its first write determine its health.
@@ -689,10 +891,7 @@ class HLSStreamer:
             self._consecutive_ffmpeg_failures += 1
             failures = self._consecutive_ffmpeg_failures
             if failures >= FFMPEG_RESTART_MAX_FAILURES:
-                message = (
-                    "ffmpeg failed "
-                    f"{failures} consecutive times; encoder recovery stopped"
-                )
+                message = f"ffmpeg failed {failures} consecutive times; encoder recovery stopped"
                 if detail:
                     message = f"{message} ({detail})"
                 # Usually the failed process has already exited, but a pipe
@@ -736,20 +935,196 @@ class HLSStreamer:
 
     def _note_encode_backpressure(self, write_s: float, generation: int) -> None:
         now = time.monotonic()
-        if write_s >= FFMPEG_BACKPRESSURE_WRITE_S:
-            if self._backpressure_started_at is None:
-                self._backpressure_started_at = now
-            elif now - self._backpressure_started_at >= FFMPEG_BACKPRESSURE_DURATION_S:
-                self._restart_ffmpeg(
-                    "sustained encoder backpressure",
-                    expected_generation=generation,
+        with self._ffmpeg_lock:
+            # A write can return after another thread has already relaunched
+            # ffmpeg.  Never let its stale timing arm/reset the fresh
+            # generation's pressure state.
+            if self._ffmpeg_generation != generation:
+                return
+            if write_s >= FFMPEG_BACKPRESSURE_WRITE_S:
+                if self._backpressure_generation != generation:
+                    self._backpressure_generation = generation
+                    self._backpressure_started_at = now
+                elif (
+                    self._backpressure_started_at is not None
+                    and now - self._backpressure_started_at >= FFMPEG_BACKPRESSURE_DURATION_S
+                ):
+                    self._request_timeline_resync_locked(
+                        "sustained encoder backpressure",
+                        expected_generation=generation,
+                    )
+            else:
+                self._backpressure_started_at = None
+                self._backpressure_generation = None
+
+    def _read_hls_restart_state(self) -> tuple[list[tuple[int, int, str]], int]:
+        """Validate the static raw playlist before an append-list relaunch.
+
+        The caller has already killed the old ffmpeg while holding
+        ``_ffmpeg_lock``, so the playlist cannot change underneath this read.
+        Refusing a missing or malformed previously-published playlist is
+        intentional: FFmpeg otherwise silently falls back to media sequence
+        zero, which can overwrite segment identities and wedge a live receiver.
+
+        Returns ``(segments, next_media_sequence)``. An empty result is valid
+        only before any generation has published media.
+        """
+        playlist = self.work_dir / "stream.m3u8"
+        if not playlist.exists():
+            if self._hls_ever_published:
+                raise RuntimeError(
+                    "cannot safely restart HLS: the published playlist is missing"
                 )
-        else:
-            self._backpressure_started_at = None
+            return [], 0
+
+        try:
+            text = playlist.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise RuntimeError("cannot safely restart HLS: playlist is unreadable") from exc
+
+        lines = text.splitlines()
+        if not lines or lines[0] != "#EXTM3U":
+            raise RuntimeError("cannot safely restart HLS: malformed playlist header")
+
+        media_prefix = "#EXT-X-MEDIA-SEQUENCE:"
+        media_values = [
+            line[len(media_prefix) :]
+            for line in lines
+            if line.startswith(media_prefix)
+        ]
+        if len(media_values) != 1:
+            raise RuntimeError(
+                "cannot safely restart HLS: expected one media sequence"
+            )
+        try:
+            media_sequence = int(media_values[0])
+        except ValueError as exc:
+            raise RuntimeError(
+                "cannot safely restart HLS: invalid media sequence"
+            ) from exc
+        if media_sequence < 0:
+            raise RuntimeError("cannot safely restart HLS: negative media sequence")
+
+        records: list[tuple[int, int, str]] = []
+        boundaries: list[bool] = []
+        pending_extinf = False
+        pending_boundary = False
+        for line in lines:
+            if line == "#EXT-X-DISCONTINUITY":
+                if pending_boundary:
+                    raise RuntimeError(
+                        "cannot safely restart HLS: duplicate discontinuity"
+                    )
+                pending_boundary = True
+                continue
+            if line.startswith("#EXTINF:"):
+                if pending_extinf:
+                    raise RuntimeError(
+                        "cannot safely restart HLS: segment URI is missing"
+                    )
+                pending_extinf = True
+                continue
+            if not line or line.startswith("#"):
+                continue
+            if not pending_extinf:
+                raise RuntimeError(
+                    "cannot safely restart HLS: segment has no EXTINF"
+                )
+            match = _HLS_SEGMENT_NAME_RE.fullmatch(line)
+            if match is None:
+                raise RuntimeError(
+                    f"cannot safely restart HLS: unexpected segment URI {line!r}"
+                )
+            if not (self.work_dir / line).is_file():
+                raise RuntimeError(
+                    f"cannot safely restart HLS: referenced segment {line!r} is missing"
+                )
+            records.append(
+                (
+                    int(match.group("epoch")),
+                    int(match.group("attempt")),
+                    line,
+                )
+            )
+            boundaries.append(pending_boundary)
+            pending_extinf = False
+            pending_boundary = False
+
+        if pending_extinf:
+            raise RuntimeError("cannot safely restart HLS: final segment URI is missing")
+        if not records:
+            if self._hls_ever_published:
+                raise RuntimeError(
+                    "cannot safely restart HLS: published playlist has no segments"
+                )
+            return [], 0
+        if len({record[2] for record in records}) != len(records):
+            raise RuntimeError("cannot safely restart HLS: duplicate segment URI")
+
+        previous_epoch, previous_attempt, _name = records[0]
+        for index, (epoch, attempt, _name) in enumerate(records[1:], start=1):
+            boundary = boundaries[index]
+            if epoch == previous_epoch:
+                if boundary or attempt != previous_attempt:
+                    raise RuntimeError(
+                        "cannot safely restart HLS: inconsistent attempt boundary"
+                    )
+            elif epoch == previous_epoch + 1:
+                if not boundary:
+                    raise RuntimeError(
+                        "cannot safely restart HLS: timeline boundary is missing"
+                    )
+            else:
+                raise RuntimeError(
+                    "cannot safely restart HLS: timeline epochs are not consecutive"
+                )
+            previous_epoch, previous_attempt = epoch, attempt
+
+        with self._hls_identity_lock:
+            current_sequences = {
+                name: media_sequence + index
+                for index, (_epoch, _attempt, name) in enumerate(records)
+            }
+            for name, sequence in current_sequences.items():
+                previous = self._hls_uri_sequences.get(name)
+                if previous is not None and previous != sequence:
+                    raise RuntimeError(
+                        "cannot safely restart HLS: media-sequence identity "
+                        f"changed for {name!r}: {previous} -> {sequence}"
+                    )
+            self._hls_uri_sequences = current_sequences
+
+        self._hls_ever_published = True
+        return records, media_sequence + len(records)
+
+    def _prepare_hls_output(self) -> tuple[str, bool]:
+        """Allocate a never-reused segment namespace for the next spawn."""
+        records, _next_media_sequence = self._read_hls_restart_state()
+        append = bool(records)
+        current_attempt_published = (
+            self._hls_current_attempt is not None
+            and any(
+                attempt == self._hls_current_attempt
+                for _epoch, attempt, _name in records
+            )
+        )
+        if current_attempt_published:
+            self._hls_timeline_epoch += 1
+
+        self._hls_attempt += 1
+        self._hls_current_attempt = self._hls_attempt
+        segment_pattern = str(
+            self.work_dir
+            / (
+                f"seg-e{self._hls_timeline_epoch:06d}-"
+                f"a{self._hls_attempt:06d}-%09d.ts"
+            )
+        )
+        return segment_pattern, append
 
     def _start_ffmpeg(self) -> None:
         playlist = self.work_dir / "stream.m3u8"
-        segment_pattern = str(self.work_dir / "seg%03d.ts")
+        segment_pattern, append_hls = self._prepare_hls_output()
 
         cmd = [
             "ffmpeg",
@@ -783,8 +1158,8 @@ class HLSStreamer:
             *self._audio_input_args(),
             # Capture is already viewport-sized (== output), so skip scale/crop
             # and only convert pixel format. Dropping the per-frame scale pass
-            # gives ffmpeg throughput headroom to drain the frame queue, which
-            # is what keeps video ~0.5s behind the audio.
+            # gives ffmpeg enough throughput to preserve every CFR tick during
+            # normal operation, keeping the video and PCM timelines equal.
             "-filter:v",
             "format=yuv420p",
             "-map",
@@ -808,7 +1183,7 @@ class HLSStreamer:
             str(self.audio_format.sample_rate),
             "-ac",
             str(self.audio_format.channels),
-            *hls_args(buffered=self.buffered),
+            *hls_args(buffered=self.buffered, append=append_hls),
             "-hls_segment_filename",
             segment_pattern,
             "-max_muxing_queue_size",
@@ -830,10 +1205,46 @@ class HLSStreamer:
         if self._stats is not None:
             self._stats.trace("ffmpeg spawned")
 
-    def _enqueue_frame(self, frame: bytes) -> None:
-        depth, dropped = self._queue.put(frame)
-        if self._stats is not None:
-            self._stats.record_queue(depth=depth, dropped=dropped)
+    def _enqueue_frame(
+        self,
+        frame: bytes,
+        *,
+        sampled_for_generation: int | None = None,
+    ) -> bool:
+        # Serialize the drop decision with writer generation snapshots.  Once
+        # put() reports a lost CFR tick, no writer can obtain the old ffmpeg
+        # under this lock without first observing the pending re-anchor.
+        with self._ffmpeg_lock:
+            if (
+                sampled_for_generation is not None
+                and sampled_for_generation != self._ffmpeg_generation
+            ):
+                # The sampler may have been holding a local frame while a
+                # relaunch killed a wedged process. Never let that pre-boundary
+                # sample become the first frame of the fresh generation.
+                if self._stats is not None:
+                    self._stats.record_timeline_loss(1)
+                return False
+            depth, dropped = self._queue.put(frame)
+            if self._stats is not None:
+                self._stats.record_queue(depth=depth, dropped=dropped)
+            if dropped:
+                self._request_timeline_resync_locked(
+                    "video queue overflow dropped a sampled CFR frame",
+                    expected_generation=self._ffmpeg_generation,
+                )
+            return True
+
+    def _handle_sampler_clock_gap(self, lag_s: float, frame_period: float) -> bool:
+        """Request a boundary when catch-up would skip CFR ticks."""
+        if lag_s <= SAMPLER_MAX_CATCHUP_S:
+            return False
+        skipped_ticks = max(1, int(lag_s / frame_period))
+        self._request_timeline_resync(
+            f"sampler skipped {skipped_ticks} elapsed CFR ticks",
+            lost_frames=skipped_ticks,
+        )
+        return True
 
     def _start_sampler_thread(self) -> None:
         """Sample the latest frame at an exactly even cadence and enqueue it.
@@ -846,6 +1257,7 @@ class HLSStreamer:
         def sample() -> None:
             frame_period = 1.0 / self.fps
             next_tick = time.monotonic()
+            sampled_ffmpeg_generation: int | None = None
 
             while not self._stopped.is_set():
                 now = time.monotonic()
@@ -859,12 +1271,12 @@ class HLSStreamer:
                 # so audio can't drift ahead of video. Only give up and resync
                 # past a large gap (machine slept), where bursting the whole
                 # backlog isn't worth it. The bounded queue caps the burst.
-                if now - next_tick > SAMPLER_MAX_CATCHUP_S:
+                if self._handle_sampler_clock_gap(now - next_tick, frame_period):
                     next_tick = now
-                    if self._stats is not None:
-                        self._stats.record_encode_resync()
                 next_tick += frame_period
 
+                with self._ffmpeg_lock:
+                    current_ffmpeg_generation = self._ffmpeg_generation
                 frame, published_at, generation = self._latest.peek()
                 if frame is None:
                     continue
@@ -880,7 +1292,24 @@ class HLSStreamer:
                 elif self._stats is not None and published_at is not None:
                     self._stats.record_frame_age(time.monotonic() - published_at)
                 self._last_sampled_generation = generation
-                self._enqueue_frame(frame)
+                enqueued = self._enqueue_frame(
+                    frame,
+                    sampled_for_generation=current_ffmpeg_generation,
+                )
+                if (
+                    not enqueued
+                    or (
+                        sampled_ffmpeg_generation is not None
+                        and current_ffmpeg_generation
+                        != sampled_ffmpeg_generation
+                    )
+                ):
+                    # A relaunch already supplied the required timeline
+                    # boundary. Reset the sampler cadence to the fresh
+                    # generation instead of bursting missed old-generation
+                    # ticks into it and causing a redundant overflow/restart.
+                    next_tick = time.monotonic() + frame_period
+                sampled_ffmpeg_generation = current_ffmpeg_generation
 
         def run() -> None:
             try:
@@ -896,6 +1325,17 @@ class HLSStreamer:
 
         def write() -> None:
             while not self._stopped.is_set():
+                # Process a boundary before taking another queue item, and
+                # remember which generation that item belongs to.  queue.get()
+                # deliberately happens without _ffmpeg_lock, so the second
+                # check below rejects a frame popped concurrently with a
+                # relaunch instead of seeding the new generation with stale
+                # pre-boundary video.
+                with self._ffmpeg_lock:
+                    if self._process_pending_timeline_resync_locked():
+                        continue
+                    queued_for_generation = self._ffmpeg_generation
+
                 frame = self._queue.get(self._stopped)
                 if frame is None:
                     continue
@@ -906,8 +1346,13 @@ class HLSStreamer:
                 # would deadlock stop()/relaunch (which need the lock to kill
                 # ffmpeg — the only thing that unblocks the write).
                 with self._ffmpeg_lock:
-                    ffmpeg = self._ffmpeg
+                    reanchored = self._process_pending_timeline_resync_locked()
                     generation = self._ffmpeg_generation
+                    stale_frame = reanchored or generation != queued_for_generation
+                    ffmpeg = None if stale_frame else self._ffmpeg
+
+                if stale_frame:
+                    continue
 
                 write_s: float | None = None
                 write_error: BaseException | None = None
@@ -919,7 +1364,11 @@ class HLSStreamer:
                         self._write_generation = generation
                         self._write_stall_recovery_started = False
                     try:
-                        stdin.write(frame)
+                        written = stdin.write(frame)
+                        if written != len(frame):
+                            raise OSError(
+                                f"short ffmpeg stdin write: {written}/{len(frame)} bytes"
+                            )
                         stdin.flush()
                         write_s = time.monotonic() - write_started
                     except (BrokenPipeError, OSError, ValueError) as exc:
@@ -937,8 +1386,9 @@ class HLSStreamer:
                     if self._stopped.is_set():
                         break
                     with self._ffmpeg_lock:
+                        reanchored = self._process_pending_timeline_resync_locked()
                         replaced = self._ffmpeg is not ffmpeg
-                    if replaced:
+                    if reanchored or replaced:
                         # A relaunch (offset change, restart) swapped instances
                         # mid-write; the new ffmpeg is healthy — don't kill it.
                         continue
@@ -949,27 +1399,33 @@ class HLSStreamer:
                         break
                     continue
 
-                # A single accepted frame is not proof of recovery: some
-                # broken encoders accept one pipe write and then immediately
-                # exit. Close the circuit only after this generation has been
-                # continuously healthy for the stability window.
+                # A queue overflow may have been requested while this write was
+                # blocked.  Apply it immediately on return, before another
+                # queue item can enter the shortened old CFR timeline.
                 with self._ffmpeg_lock:
-                    current_generation = self._ffmpeg_generation
+                    reanchored = self._process_pending_timeline_resync_locked()
                     started_at = self._ffmpeg_started_at
-                if (
-                    current_generation == generation
-                    and started_at is not None
-                    and time.monotonic() - started_at >= FFMPEG_RESTART_STABLE_S
-                ):
-                    self._consecutive_ffmpeg_failures = 0
-
-                if self._test_write_delay_s:
-                    time.sleep(self._test_write_delay_s)
+                    # A single accepted frame is not proof of recovery: some
+                    # broken encoders accept one pipe write and immediately
+                    # exit.  The generation check and counter mutation must be
+                    # atomic so an old writer cannot bless a fresh process.
+                    if (
+                        not reanchored
+                        and self._ffmpeg_generation == generation
+                        and started_at is not None
+                        and time.monotonic() - started_at >= FFMPEG_RESTART_STABLE_S
+                    ):
+                        self._consecutive_ffmpeg_failures = 0
 
                 if self._stats is not None:
                     self._stats.trace("first frame written to ffmpeg stdin", once=True)
                     self._stats.record_encode_write(write_s)
+                if reanchored:
+                    continue
                 self._note_encode_backpressure(write_s, generation)
+
+                if self._test_write_delay_s:
+                    time.sleep(self._test_write_delay_s)
 
         def run() -> None:
             try:
