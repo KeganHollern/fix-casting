@@ -252,7 +252,7 @@ URL → Chrome tab → JPEG frames + PCM audio
 
 - **Video capture** uses CDP `Page.startScreencast`: Chrome pushes JPEG frames as the page paints (up to ~60fps), and every frame is acknowledged with `Page.screencastFrameAck` so the stream never stalls.
 - **Even-paced encoding** samples the latest frame at a constant cadence on one thread and feeds ffmpeg on another, with a bounded queue between them. Even sampling keeps motion smooth (no judder) even when an ffmpeg write stalls on an HLS segment flush, while the constant rate keeps the TV buffer from draining. ffmpeg is restarted automatically if it dies or stays backpressured.
-- **Audio capture** uses a vendored [AudioTee](https://github.com/makeusabrew/audiotee) binary to tap only the cast browser's processes. Your other apps are not routed through a virtual audio device.
+- **Audio capture** uses a vendored [AudioTee](https://github.com/makeusabrew/audiotee) binary to tap only the cast browser's processes. An inaudible Web Audio keepalive keeps that private tap initialized while a page is silent, so media which starts later joins the existing audio stream. Your other apps are not routed through a virtual audio device.
 - **Streaming** uses ffmpeg to mux H.264 + AAC into an HLS playlist served from a per-run temp directory (removed on exit).
 - **Casting** uses [pychromecast](https://github.com/home-assistant-libs/pychromecast) to load the HLS URL on the default media receiver.
 
@@ -271,7 +271,11 @@ cd vendor/audiotee && swift build -c release
 cd ../.. && ./install.sh    # copies the build to the stable per-user path
 ```
 
-If audio still fails, start playback in the local Chrome window (click Play). The tool retries autoplay automatically.
+The tool keeps an inaudible audio client active before tapping Chrome, so a
+page can remain silent for any length of time and begin playing audio later.
+It also retries autoplay automatically. If a site's player still needs user
+interaction, click Play in the dedicated local Chrome window; AudioTee should
+already be attached and the sound will flow into the existing cast.
 
 **Frozen or choppy video**  
 Try `--no-buffered` to rule out buffer-related delay, or lower resolution with `--width 1280 --height 720`.

@@ -15,6 +15,58 @@ from playwright.sync_api import sync_playwright
 
 from cast_tab.stats import PipelineStats
 
+# AudioTee can only translate a Chrome PID into a CoreAudio process object once
+# that process owns an active audio client.  A page which is silent at startup
+# therefore used to make audio attachment fail permanently.  Keep an inaudible
+# Web Audio graph running in the top-level page: its -140 dB carrier is far
+# below audibility, but unlike an exact zero (which Chrome may optimize away)
+# it makes Chrome continuously render samples until the site's real audio
+# begins.  The graph is stored on globalThis so repeated playback nudges are
+# idempotent and so the nodes are not garbage-collected.
+_AUDIO_KEEPALIVE_INIT_SCRIPT = r"""
+(() => {
+    if (globalThis.top !== globalThis) return;
+
+    const stateKey = "__fixCastingAudioKeepalive";
+    const ensureKey = "__fixCastingEnsureAudioKeepalive";
+
+    globalThis[ensureKey] = async () => {
+        let state = globalThis[stateKey];
+        if (!state || state.context.state === "closed") {
+            const AudioContextClass =
+                globalThis.AudioContext || globalThis.webkitAudioContext;
+            if (!AudioContextClass) return "unavailable";
+
+            const context = new AudioContextClass({latencyHint: "playback"});
+            const oscillator = context.createOscillator();
+            const gain = context.createGain();
+            gain.gain.setValueAtTime(1e-7, context.currentTime);
+            oscillator.connect(gain);
+            gain.connect(context.destination);
+            oscillator.start();
+            state = {context, oscillator, gain};
+            globalThis[stateKey] = state;
+        }
+
+        if (state.context.state !== "running") {
+            await state.context.resume();
+        }
+        return state.context.state;
+    };
+
+    void globalThis[ensureKey]().catch(() => {});
+})();
+"""
+
+_AUDIO_KEEPALIVE_RESUME_SCRIPT = r"""
+() => {
+    const ensure = globalThis.__fixCastingEnsureAudioKeepalive;
+    if (!ensure) return "unavailable";
+    void ensure().catch(() => {});
+    return "requested";
+}
+"""
+
 
 class TabScreencaster:
     """Mirror a browser tab by capturing frames at a steady pace."""
@@ -74,9 +126,22 @@ class TabScreencaster:
         self._thread = threading.Thread(target=self._run, name="tab-screencast", daemon=True)
         self._thread.start()
 
-    def wait_until_ready(self, timeout: float = 120.0) -> None:
-        if not self._startup_finished.wait(timeout):
-            raise TimeoutError("Timed out waiting for the browser tab to load.")
+    def wait_until_ready(
+        self,
+        timeout: float = 120.0,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> None:
+        deadline = time.monotonic() + timeout
+        while not self._startup_finished.is_set():
+            if cancelled is not None and cancelled():
+                raise RuntimeError("Browser startup was cancelled.")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Timed out waiting for the browser tab to load.")
+            self._startup_finished.wait(min(0.1, remaining))
+        if cancelled is not None and cancelled():
+            raise RuntimeError("Browser startup was cancelled.")
         if self._ready.is_set():
             # The capture loop can fail immediately after marking the page
             # ready.  Do not report a successful startup if that already
@@ -179,6 +244,7 @@ class TabScreencaster:
             self._chrome_may_be_alive = True
             try:
                 context.grant_permissions(["notifications", "geolocation"])
+                self._install_audio_keepalive(context)
                 page = context.pages[0] if context.pages else context.new_page()
                 if self._adblock_patterns:
                     # Native CDP blocking on a dedicated session, set before the
@@ -192,6 +258,7 @@ class TabScreencaster:
                     content="html,body{overflow:hidden!important;margin:0!important;}"
                 )
                 self._try_start_playback(page)
+                self._ensure_audio_keepalive(page)
                 page.wait_for_timeout(1_500)
                 print("Page loaded, starting capture.")
                 self._ready.set()
@@ -252,6 +319,7 @@ class TabScreencaster:
                 if self._nudge_playback.is_set():
                     self._nudge_playback.clear()
                     self._try_start_playback(page)
+                    self._ensure_audio_keepalive(page)
 
                 while pending:
                     data_b64, session_id, capture_ts = pending.popleft()
@@ -294,6 +362,28 @@ class TabScreencaster:
                 cdp.send("Page.stopScreencast")
             except Exception:
                 pass
+
+    def _install_audio_keepalive(self, context) -> None:
+        """Prime Chrome's CoreAudio client with an inaudible Web Audio graph.
+
+        The init script runs again after a full-page navigation, while the
+        top-frame guard prevents every embedded frame from creating its own
+        AudioContext.  It is only installed when this session requested audio.
+        """
+        if not self.capture_audio:
+            return
+        context.add_init_script(script=_AUDIO_KEEPALIVE_INIT_SCRIPT)
+
+    def _ensure_audio_keepalive(self, page) -> None:
+        """Request resumption after autoplay attempts or navigation."""
+        if not self.capture_audio:
+            return
+        try:
+            page.evaluate(_AUDIO_KEEPALIVE_RESUME_SCRIPT)
+        except Exception:
+            # Some transient navigation states reject evaluation.  The init
+            # script and the next playback nudge will try again.
+            pass
 
     def _try_start_playback(self, page) -> None:
         """Click common play buttons so the user doesn't have to."""

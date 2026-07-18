@@ -33,6 +33,14 @@ class AudioCaptureError(RuntimeError):
     """Raised when tab audio cannot be captured."""
 
 
+class AudioCaptureCandidateError(AudioCaptureError):
+    """A candidate PID could not provide audio; another candidate may work."""
+
+
+class AudioCaptureCancelled(AudioCaptureError):
+    """Audio attachment was cancelled because its owning session is stopping."""
+
+
 def _pipe_bytes_available(fd: int) -> int:
     """Bytes queued on a pipe read end. 0 while readable means EOF, not data."""
     buf = array.array("i", [0])
@@ -97,6 +105,24 @@ class AudioCapture:
     pids: tuple[int, ...]
     audio_format: AudioFormat
     stderr_thread: threading.Thread | None = None
+    stderr_tail: deque[str] | None = None
+
+    def raise_if_failed(self) -> None:
+        """Surface an AudioTee process which died after successful attach."""
+        returncode = self.process.poll()
+        if returncode is None:
+            return
+        details = ""
+        if self.stderr_tail:
+            try:
+                details = " ".join(tuple(self.stderr_tail)).strip()
+            except RuntimeError:
+                # The stderr drainer may append its final line concurrently.
+                pass
+        suffix = f": {details}" if details else ""
+        raise AudioCaptureError(
+            f"AudioTee exited unexpectedly with status {returncode}{suffix}"
+        )
 
 
 def audiotee_path() -> Path | None:
@@ -131,17 +157,24 @@ def chrome_audio_pid_candidates(user_data_dir: Path) -> list[list[int]]:
     lines = _profile_process_lines(user_data_dir)
     candidates: list[list[int]] = []
 
-    renderers = sorted(pid for pid, command in lines if "--type=renderer" in command)
-    if renderers:
-        candidates.append(renderers)
-    for pid in renderers[:3]:
-        candidates.append([pid])
-
+    # Chrome's dedicated Audio Service owns the final mixed stream for this
+    # isolated browser profile.  Prefer it over renderers: a renderer may be
+    # translatable yet yield no PCM, which needlessly burns the per-candidate
+    # readiness timeout before we reach the reliable mixed-audio process.
     audio_service = sorted(
         pid for pid, command in lines if "audio.mojom.AudioService" in command
     )
-    if audio_service:
-        candidates.append(audio_service[:1])
+    for pid in audio_service:
+        candidates.append([pid])
+
+    renderers = sorted(pid for pid, command in lines if "--type=renderer" in command)
+    if renderers:
+        candidates.append(renderers)
+    # The page renderer is not guaranteed to be one of the first three PIDs.
+    # Trying every renderer individually lets the silent-audio primer's process
+    # attach even when extension/background renderers sort ahead of it.
+    for pid in renderers:
+        candidates.append([pid])
 
     browser = sorted(pid for pid, command in lines if "--type=" not in command)
     if browser:
@@ -168,12 +201,15 @@ def try_start_chrome_audio_capture(
     retry_interval: float = 2.0,
     on_retry: Callable[[], None] | None = None,
     on_stderr: Callable[[str], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> AudioCapture:
-    """Retry audio tap until Chrome is actively outputting audio."""
+    """Retry candidate taps until Chrome's audio client is producing PCM."""
     deadline = time.monotonic() + timeout
     last_error = "unknown error"
 
     while time.monotonic() < deadline:
+        if cancelled is not None and cancelled():
+            raise AudioCaptureCancelled("Audio capture startup was cancelled.")
         if on_retry is not None:
             on_retry()
 
@@ -181,18 +217,37 @@ def try_start_chrome_audio_capture(
             if not pids:
                 continue
             try:
-                return start_chrome_audio_capture(pids, on_stderr=on_stderr)
-            except AudioCaptureError as exc:
-                last_error = str(exc)
-                if "Failed to translate" in last_error or "exited early" in last_error:
-                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                return start_chrome_audio_capture(
+                    pids,
+                    # A primed Audio Service produces its first 100ms chunk
+                    # almost immediately.  Keep fallback candidates bounded
+                    # so stale/silent renderers cannot consume the whole scan.
+                    ready_timeout=min(2.0, remaining),
+                    on_stderr=on_stderr,
+                    cancelled=cancelled,
+                )
+            except AudioCaptureCancelled:
                 raise
+            except AudioCaptureCandidateError as exc:
+                last_error = str(exc)
+                # Candidate-specific failures include both PID translation and
+                # a live tap which produced no bytes yet.  Continue trying the
+                # other renderer/audio-service PIDs instead of permanently
+                # degrading to video-only after the first silent candidate.
+                continue
 
-        time.sleep(retry_interval)
+        if cancelled is not None and cancelled():
+            raise AudioCaptureCancelled("Audio capture startup was cancelled.")
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(retry_interval, remaining))
 
     raise AudioCaptureError(
-        "Could not attach to cast browser audio. "
-        f"Make sure the page is playing sound. Last error: {last_error}"
+        "Could not initialize cast browser audio. "
+        f"Last AudioTee error: {last_error}"
     )
 
 
@@ -203,6 +258,7 @@ def start_chrome_audio_capture(
     chunk_duration: float = 0.1,
     ready_timeout: float = 5.0,
     on_stderr: Callable[[str], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> AudioCapture:
     """Capture audio from specific Chrome PIDs without touching other apps.
 
@@ -305,12 +361,12 @@ def start_chrome_audio_capture(
             except (OSError, ValueError):
                 pass
 
-    def exited_early_error() -> AudioCaptureError:
+    def exited_early_error() -> AudioCaptureCandidateError:
         if process.poll() is not None:
             stderr_thread.join(timeout=0.3)
         details = " ".join(list(stderr_lines)).strip()
         suffix = f": {details}" if details else ""
-        return AudioCaptureError(f"AudioTee exited early{suffix}")
+        return AudioCaptureCandidateError(f"AudioTee exited early{suffix}")
 
     # Wait until AudioTee actually has audio bytes ready, without consuming
     # them (ffmpeg reads the pipe from the first byte). A pipe read end goes
@@ -320,6 +376,8 @@ def start_chrome_audio_capture(
     deadline = time.monotonic() + ready_timeout
     try:
         while True:
+            if cancelled is not None and cancelled():
+                raise AudioCaptureCancelled("Audio capture startup was cancelled.")
             readable, _, _ = select.select([tap_read], [], [], 0.2)
             if readable:
                 try:
@@ -334,13 +392,16 @@ def start_chrome_audio_capture(
                         pids=tuple(pids),
                         audio_format=detected_format.get("v", DEFAULT_AUDIO_FORMAT),
                         stderr_thread=stderr_thread,
+                        stderr_tail=stderr_lines,
                     )
                 # Readable with nothing queued == EOF: AudioTee closed stdout.
                 raise exited_early_error()
             if process.poll() is not None:
                 raise exited_early_error()
             if time.monotonic() > deadline:
-                raise AudioCaptureError("No audio data received from cast browser tap.")
+                raise AudioCaptureCandidateError(
+                    "No audio data received from cast browser tap."
+                )
     except BaseException:
         cleanup_failed_start()
         raise
