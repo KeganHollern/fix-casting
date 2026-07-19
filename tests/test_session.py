@@ -359,7 +359,7 @@ def test_start_monitors_browser_health_through_streamer_readiness(
             self.ready_calls = 0
             self.stop_calls = 0
 
-        def publish_frame(self, _frame) -> None:
+        def publish_frame(self, _frame, _captured_at=None) -> None:
             pass
 
         def start(self, *, health_check) -> None:

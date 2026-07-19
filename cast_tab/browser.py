@@ -79,7 +79,7 @@ class TabScreencaster:
         height: int = 1080,
         fps: int = 24,
         jpeg_quality: int = 75,
-        on_frame: Callable[[bytes], None],
+        on_frame: Callable[[bytes, float | None], None],
         headless: bool = False,
         capture_audio: bool = False,
         stats: PipelineStats | None = None,
@@ -113,11 +113,11 @@ class TabScreencaster:
         self._nudge_playback = threading.Event()
 
     @property
-    def on_frame(self) -> Callable[[bytes], None]:
+    def on_frame(self) -> Callable[[bytes, float | None], None]:
         return self._on_frame
 
     @on_frame.setter
-    def on_frame(self, callback: Callable[[bytes], None]) -> None:
+    def on_frame(self, callback: Callable[[bytes, float | None], None]) -> None:
         self._on_frame = callback
 
     def start(self) -> None:
@@ -290,6 +290,21 @@ class TabScreencaster:
             },
         )
 
+    @staticmethod
+    def _capture_monotonic_time(
+        capture_timestamp: float | None,
+        *,
+        wall_now: float,
+        monotonic_now: float,
+    ) -> tuple[float, float | None]:
+        """Translate Chrome's wall timestamp into the sampler clock domain."""
+        if capture_timestamp is None:
+            return monotonic_now, None
+        lag = wall_now - capture_timestamp
+        if not 0.0 <= lag < 60.0:
+            return monotonic_now, None
+        return monotonic_now - lag, lag
+
     def _run_screencast(self, page, cdp) -> None:
         """Push model: Chrome streams frames as the page paints (up to ~60fps).
 
@@ -334,17 +349,22 @@ class TabScreencaster:
                                 return
                     if data_b64 is None:
                         continue
+                    started = time.monotonic()
+                    # Chrome's timestamp is wall-clock based, but the sampler
+                    # uses monotonic time. Translate it at receipt so downstream
+                    # selection can preserve capture cadence across delivery
+                    # bursts and late sampler wake-ups.
+                    captured_at, lag = self._capture_monotonic_time(
+                        capture_ts,
+                        wall_now=time.time(),
+                        monotonic_now=started,
+                    )
                     if self._stats is not None:
                         self._stats.trace("first screencast frame from chrome", once=True)
-                        # How old the frame already is on arrival — the capture-
-                        # side staleness we suspect drives audio-ahead skew.
-                        if capture_ts is not None:
-                            lag = time.time() - capture_ts
-                            if 0.0 <= lag < 60.0:
-                                self._stats.record_screencast_lag(lag)
-                    started = time.monotonic()
+                        if lag is not None:
+                            self._stats.record_screencast_lag(lag)
                     try:
-                        self._on_frame(base64.b64decode(data_b64))
+                        self._on_frame(base64.b64decode(data_b64), captured_at)
                     except Exception:
                         if self._stats is not None:
                             self._stats.record_capture_error()

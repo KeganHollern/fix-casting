@@ -7,16 +7,269 @@ import os
 import re
 import socket
 import threading
+import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Literal
 from urllib.parse import unquote, urlsplit
 
 SegmentEpochParser = Callable[[str], int | None]
 PlaylistTransform = Callable[[bytes], bytes]
+HLSRequestKind = Literal["playlist", "segment", "other"]
 
 _SEGMENT_EPOCH_RE = re.compile(r"^seg-e(?P<epoch>[0-9]+)(?:[-_.]|$)")
+
+
+@dataclass(frozen=True)
+class HLSDeliverySnapshot:
+    """Thread-safe point-in-time view of HLS HTTP delivery.
+
+    Byte counters cover response bodies successfully written through the file
+    delivery path (playlists and media segments), not HTTP headers. Wall-clock
+    timestamps are Unix seconds; durations use a monotonic clock.
+    """
+
+    playlist_requests: int
+    segment_requests: int
+    other_requests: int
+    active_requests: int
+    active_segment_requests: int
+    oldest_active_segment_started_at: float | None
+    oldest_active_segment_age_s: float | None
+    completed_requests: int
+    error_requests: int
+    bytes_sent: int
+    playlist_bytes_sent: int
+    segment_bytes_sent: int
+    segment_responses: int
+    segment_response_bytes_total: int
+    segment_response_duration_s_total: float
+    latest_request_method: str | None
+    latest_request_path: str | None
+    latest_request_kind: HLSRequestKind | None
+    latest_request_started_at: float | None
+    latest_request_completed_at: float | None
+    latest_request_duration_s: float | None
+    latest_request_status: int | None
+    latest_request_bytes: int
+    latest_request_error: bool
+    latest_segment_started_at: float | None
+    latest_segment_completed_at: float | None
+    latest_segment_duration_s: float | None
+    latest_segment_bytes: int
+    latest_segment_throughput_bps: float | None
+
+    @property
+    def average_segment_response_duration_s(self) -> float | None:
+        if self.segment_responses == 0:
+            return None
+        return self.segment_response_duration_s_total / self.segment_responses
+
+    @property
+    def average_segment_throughput_bps(self) -> float | None:
+        if self.segment_response_duration_s_total <= 0:
+            return None
+        return self.segment_response_bytes_total / self.segment_response_duration_s_total
+
+
+HLSDeliveryCallback = Callable[[HLSDeliverySnapshot], None]
+
+
+@dataclass(frozen=True)
+class _RequestToken:
+    sequence: int
+    method: str
+    path: str
+    kind: HLSRequestKind
+    started_at: float
+    started_monotonic: float
+
+
+class _HLSDeliveryTelemetry:
+    """Small lock-protected request ledger shared by handler threads."""
+
+    def __init__(self, callback: HLSDeliveryCallback | None) -> None:
+        self._callback = callback
+        self._lock = threading.Lock()
+        self._sequence = 0
+        self._playlist_requests = 0
+        self._segment_requests = 0
+        self._other_requests = 0
+        self._active_requests_by_kind: dict[
+            HLSRequestKind,
+            dict[int, _RequestToken],
+        ] = {
+            "playlist": {},
+            "segment": {},
+            "other": {},
+        }
+        self._completed_requests = 0
+        self._error_requests = 0
+        self._bytes_sent = 0
+        self._playlist_bytes_sent = 0
+        self._segment_bytes_sent = 0
+        self._segment_responses = 0
+        self._segment_response_bytes_total = 0
+        self._segment_response_duration_s_total = 0.0
+        self._latest_request_sequence = 0
+        self._latest_request_method: str | None = None
+        self._latest_request_path: str | None = None
+        self._latest_request_kind: HLSRequestKind | None = None
+        self._latest_request_started_at: float | None = None
+        self._latest_request_completed_at: float | None = None
+        self._latest_request_duration_s: float | None = None
+        self._latest_request_status: int | None = None
+        self._latest_request_bytes = 0
+        self._latest_request_error = False
+        self._latest_segment_started_at: float | None = None
+        self._latest_segment_completed_at: float | None = None
+        self._latest_segment_duration_s: float | None = None
+        self._latest_segment_bytes = 0
+        self._latest_segment_throughput_bps: float | None = None
+
+    def begin(self, method: str, path: str, kind: HLSRequestKind) -> _RequestToken:
+        started_at = time.time()
+        started_monotonic = time.monotonic()
+        with self._lock:
+            self._sequence += 1
+            sequence = self._sequence
+            token = _RequestToken(
+                sequence=sequence,
+                method=method,
+                path=path,
+                kind=kind,
+                started_at=started_at,
+                started_monotonic=started_monotonic,
+            )
+            if kind == "playlist":
+                self._playlist_requests += 1
+            elif kind == "segment":
+                self._segment_requests += 1
+            else:
+                self._other_requests += 1
+            self._active_requests_by_kind[kind][sequence] = token
+            self._latest_request_sequence = sequence
+            self._latest_request_method = method
+            self._latest_request_path = path
+            self._latest_request_kind = kind
+            self._latest_request_started_at = started_at
+            self._latest_request_completed_at = None
+            self._latest_request_duration_s = None
+            self._latest_request_status = None
+            self._latest_request_bytes = 0
+            self._latest_request_error = False
+        return token
+
+    def finish(
+        self,
+        token: _RequestToken,
+        *,
+        bytes_sent: int,
+        status: int | None,
+        failed: bool,
+    ) -> None:
+        completed_at = time.time()
+        duration_s = max(0.0, time.monotonic() - token.started_monotonic)
+        bytes_sent = max(0, bytes_sent)
+        request_error = failed or status is None or status >= HTTPStatus.BAD_REQUEST
+        with self._lock:
+            self._active_requests_by_kind[token.kind].pop(token.sequence, None)
+            self._completed_requests += 1
+            if request_error:
+                self._error_requests += 1
+            self._bytes_sent += bytes_sent
+            if token.kind == "playlist":
+                self._playlist_bytes_sent += bytes_sent
+            elif token.kind == "segment":
+                self._segment_bytes_sent += bytes_sent
+                # HEAD, 404s, and broken/partial transfers are requests, but
+                # they are not evidence that media reached the receiver. Keep
+                # successful body-delivery health separate from request/error
+                # counters so probes cannot make a stalled cast look healthy.
+                if bytes_sent > 0 and not request_error:
+                    self._segment_responses += 1
+                    self._segment_response_bytes_total += bytes_sent
+                    self._segment_response_duration_s_total += duration_s
+                    self._latest_segment_started_at = token.started_at
+                    self._latest_segment_completed_at = completed_at
+                    self._latest_segment_duration_s = duration_s
+                    self._latest_segment_bytes = bytes_sent
+                    self._latest_segment_throughput_bps = (
+                        bytes_sent / duration_s if duration_s > 0 else None
+                    )
+
+            # An earlier concurrent request must not overwrite the request that
+            # most recently started. Its totals still contribute above.
+            if token.sequence == self._latest_request_sequence:
+                self._latest_request_completed_at = completed_at
+                self._latest_request_duration_s = duration_s
+                self._latest_request_status = status
+                self._latest_request_bytes = bytes_sent
+                self._latest_request_error = request_error
+            snapshot = self._snapshot_locked()
+
+        callback = self._callback
+        if callback is not None:
+            try:
+                callback(snapshot)
+            except Exception:
+                # Telemetry is observational. A consumer must never break an
+                # HLS response or create noisy request-thread tracebacks.
+                pass
+
+    def snapshot(self) -> HLSDeliverySnapshot:
+        with self._lock:
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> HLSDeliverySnapshot:
+        active_segments = self._active_requests_by_kind["segment"]
+        oldest_active_segment = min(
+            active_segments.values(),
+            key=lambda token: token.started_monotonic,
+            default=None,
+        )
+        return HLSDeliverySnapshot(
+            playlist_requests=self._playlist_requests,
+            segment_requests=self._segment_requests,
+            other_requests=self._other_requests,
+            active_requests=sum(
+                len(active_requests) for active_requests in self._active_requests_by_kind.values()
+            ),
+            active_segment_requests=len(active_segments),
+            oldest_active_segment_started_at=(
+                oldest_active_segment.started_at if oldest_active_segment is not None else None
+            ),
+            oldest_active_segment_age_s=(
+                max(0.0, time.monotonic() - oldest_active_segment.started_monotonic)
+                if oldest_active_segment is not None
+                else None
+            ),
+            completed_requests=self._completed_requests,
+            error_requests=self._error_requests,
+            bytes_sent=self._bytes_sent,
+            playlist_bytes_sent=self._playlist_bytes_sent,
+            segment_bytes_sent=self._segment_bytes_sent,
+            segment_responses=self._segment_responses,
+            segment_response_bytes_total=self._segment_response_bytes_total,
+            segment_response_duration_s_total=self._segment_response_duration_s_total,
+            latest_request_method=self._latest_request_method,
+            latest_request_path=self._latest_request_path,
+            latest_request_kind=self._latest_request_kind,
+            latest_request_started_at=self._latest_request_started_at,
+            latest_request_completed_at=self._latest_request_completed_at,
+            latest_request_duration_s=self._latest_request_duration_s,
+            latest_request_status=self._latest_request_status,
+            latest_request_bytes=self._latest_request_bytes,
+            latest_request_error=self._latest_request_error,
+            latest_segment_started_at=self._latest_segment_started_at,
+            latest_segment_completed_at=self._latest_segment_completed_at,
+            latest_segment_duration_s=self._latest_segment_duration_s,
+            latest_segment_bytes=self._latest_segment_bytes,
+            latest_segment_throughput_bps=self._latest_segment_throughput_bps,
+        )
 
 
 def parse_hls_segment_epoch(uri: str) -> int | None:
@@ -150,6 +403,7 @@ class HLSHTTPServer:
         *,
         playlist_transform: PlaylistTransform | None = None,
         playlist_name: str = "stream.m3u8",
+        on_delivery: HLSDeliveryCallback | None = None,
     ) -> None:
         if Path(playlist_name).name != playlist_name or playlist_name in {"", ".", ".."}:
             raise ValueError("playlist_name must be a file name")
@@ -157,6 +411,7 @@ class HLSHTTPServer:
         self._requested_port = port
         self._playlist_transform = playlist_transform
         self._playlist_name = playlist_name
+        self._delivery_telemetry = _HLSDeliveryTelemetry(on_delivery)
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._stop_lock = threading.Lock()
@@ -171,6 +426,10 @@ class HLSHTTPServer:
         with self._stop_lock:
             server = self._server
             return server.server_port if server else 0
+
+    def delivery_snapshot(self) -> HLSDeliverySnapshot:
+        """Return an immutable, thread-safe HTTP delivery snapshot."""
+        return self._delivery_telemetry.snapshot()
 
     def _serve(self, server: ThreadingHTTPServer) -> None:
         failure: BaseException | None = None
@@ -206,13 +465,80 @@ class HLSHTTPServer:
             playlist_transform = self._playlist_transform
             playlist_name = self._playlist_name
             playlist_path = Path(serve_dir) / playlist_name
+            delivery_telemetry = self._delivery_telemetry
 
             class Handler(SimpleHTTPRequestHandler):
                 def __init__(self, *args, **kwargs):
                     super().__init__(*args, directory=serve_dir, **kwargs)
 
+                def _request_path(self) -> str:
+                    try:
+                        return unquote(urlsplit(self.path).path)
+                    except (TypeError, ValueError):
+                        return str(self.path)
+
+                def _request_kind(self, request_path: str) -> HLSRequestKind:
+                    if request_path == f"/{playlist_name}":
+                        return "playlist"
+                    if request_path.lower().endswith(".ts"):
+                        return "segment"
+                    return "other"
+
+                def _serve_with_telemetry(self, method: Callable[[], None]) -> None:
+                    request_path = self._request_path()
+                    token = delivery_telemetry.begin(
+                        self.command,
+                        request_path,
+                        self._request_kind(request_path),
+                    )
+                    self._delivery_body_bytes = 0
+                    self._delivery_status: int | None = None
+                    failed = False
+                    try:
+                        method()
+                    except BaseException:
+                        failed = True
+                        raise
+                    finally:
+                        delivery_telemetry.finish(
+                            token,
+                            bytes_sent=self._delivery_body_bytes,
+                            status=self._delivery_status,
+                            failed=failed,
+                        )
+
+                def do_GET(self) -> None:
+                    self._serve_with_telemetry(super().do_GET)
+
+                def do_HEAD(self) -> None:
+                    self._serve_with_telemetry(super().do_HEAD)
+
+                def send_response(
+                    self,
+                    code: int,
+                    message: str | None = None,
+                ) -> None:
+                    self._delivery_status = code
+                    super().send_response(code, message)
+
+                def copyfile(self, source, outputfile) -> None:
+                    handler = self
+
+                    class CountingOutput:
+                        def write(self, data):
+                            written = outputfile.write(data)
+                            handler._delivery_body_bytes += (
+                                len(data) if written is None else max(0, written)
+                            )
+                            return written
+
+                        def __getattr__(self, name):
+                            return getattr(outputfile, name)
+
+                    super().copyfile(source, CountingOutput())
+
                 def send_head(self):
-                    request_path = unquote(urlsplit(self.path).path)
+                    request_path = self._request_path()
                     if playlist_transform is None or request_path != f"/{playlist_name}":
                         return super().send_head()
 

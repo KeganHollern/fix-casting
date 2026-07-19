@@ -72,6 +72,11 @@ def hls_playlist_retention_s(*, buffered: bool) -> int:
     return HLS_TIME_S[mode] * HLS_LIST_SIZE[mode]
 
 
+def hls_segment_duration_s(*, buffered: bool) -> int:
+    """Target duration of one HLS media segment."""
+    return HLS_TIME_S[_hls_mode(buffered=buffered)]
+
+
 def estimated_hls_holdback_s(*, buffered: bool) -> int:
     """Conventional live holdback estimate, not a receiver latency guarantee."""
     mode = _hls_mode(buffered=buffered)

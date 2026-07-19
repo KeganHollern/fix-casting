@@ -142,7 +142,7 @@ class CastSession:
             height=cfg.height,
             fps=cfg.fps,
             jpeg_quality=cfg.jpeg_quality,
-            on_frame=lambda _frame: None,
+            on_frame=lambda _frame, _captured_at: None,
             headless=cfg.headless,
             capture_audio=cfg.capture_audio,
             stats=self.stats,

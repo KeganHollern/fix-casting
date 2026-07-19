@@ -21,6 +21,15 @@ cast = "cast_tab.cli:main"
 where = ["."]
 include = ["cast_tab*"]
 
+# uv otherwise keys a local-directory wheel primarily from pyproject.toml's
+# mtime. Track both committed and dirty package-source changes as build inputs.
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { git = { commit = true } },
+    { file = "cast_tab/**/*.py" },
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8",

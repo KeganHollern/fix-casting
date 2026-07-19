@@ -66,10 +66,12 @@ Make sure `~/.local/bin` is on your `PATH`:
 uv tool update-shell    # or: export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Use `cast --version` to see the installed branch, revision, source fingerprint,
-and AudioTee hash (or to identify an older editable/source install). To update
-later, re-run `./install.sh` from the revision you want. To remove the command:
-`uv tool uninstall fix-casting`.
+Use `cast --version` to see the installed branch, revision, verified source
+fingerprint, and AudioTee hash (or to identify an editable/source install). The
+installer rebuilds the local package and publishes that revision only after its
+installed sources match the checkout; an incomplete or mismatched install is
+reported as an unknown revision. To update later, re-run `./install.sh` from
+the revision you want. To remove the command: `uv tool uninstall fix-casting`.
 
 Install ffmpeg if needed:
 

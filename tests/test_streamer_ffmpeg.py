@@ -1,9 +1,11 @@
 """ffmpeg lifecycle tests, with one explicitly marked real-process check."""
 
+import os
 import shutil
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -52,6 +54,123 @@ def test_explicit_work_dir_preserved(tmp_path: Path):
     s = HLSStreamer(width=320, height=240, fps=30, work_dir=tmp_path)
     s.stop()
     assert tmp_path.exists()
+
+
+def test_hls_stats_count_playlist_and_measure_publish_and_tv_delivery(tmp_path: Path):
+    stats = PipelineStats(target_fps=30.0)
+    streamer = HLSStreamer(work_dir=tmp_path, buffered=True, stats=stats)
+    grace = "seg-e000000-a000000-000000000.ts"
+    active_one = "seg-e000000-a000000-000000001.ts"
+    active_two = "seg-e000000-a000000-000000002.ts"
+    _publish_raw_hls_fixture(tmp_path, active_one, active_two)
+    (tmp_path / grace).write_bytes(b"grace")
+    base = time.time() - 5.0
+    for index, name in enumerate((grace, active_one, active_two)):
+        os.utime(tmp_path / name, (base + index * 2, base + index * 2))
+    # An orphan/deletion-grace file newer than the playlist must not make the
+    # receiver-visible stream age or publish cadence look healthier.
+    orphan_time = time.time()
+    os.utime(tmp_path / grace, (orphan_time, orphan_time))
+
+    delivery = SimpleNamespace(
+        segment_requests=4,
+        segment_responses=4,
+        error_requests=1,
+        active_requests=0,
+        active_segment_requests=0,
+        oldest_active_segment_age_s=None,
+        latest_segment_bytes=1_000_000,
+        latest_segment_duration_s=0.1,
+        latest_segment_throughput_bps=10_000_000.0,
+        latest_segment_completed_at=time.time() - 0.25,
+        latest_request_kind="segment",
+        latest_request_completed_at=time.time(),
+        latest_request_started_at=time.time() - 0.1,
+    )
+    streamer._http = SimpleNamespace(  # type: ignore[assignment]
+        delivery_snapshot=lambda: delivery,
+    )
+
+    assert streamer.poll_hls_stats() == []
+    snap = stats.snapshot(1.0)
+    assert snap.hls_count == 2  # deletion-grace file is not a playlist entry
+    assert snap.hls_age is not None and 0.75 <= snap.hls_age <= 2.0
+    assert snap.hls_publish_count == 1
+    assert snap.hls_publish_ms == 2000.0
+    assert snap.hls_segment_requests == 4
+    assert snap.hls_delivery_ms == 100.0
+    assert snap.hls_delivery_mbps == 80.0
+    assert snap.hls_delivery_idle_ms == pytest.approx(250.0, abs=25.0)
+    assert snap.hls_delivery_seen
+    assert snap.hls_delivery_errors == 1
+    streamer._http = None
+    streamer.stop()
+
+
+def test_hls_stats_keep_an_older_active_segment_visible_after_playlist_request(
+    tmp_path: Path,
+):
+    stats = PipelineStats(target_fps=30.0)
+    streamer = HLSStreamer(work_dir=tmp_path, buffered=True, stats=stats)
+    delivery = SimpleNamespace(
+        segment_requests=1,
+        segment_responses=0,
+        error_requests=0,
+        active_segment_requests=1,
+        oldest_active_segment_age_s=1.25,
+        latest_segment_bytes=0,
+        latest_segment_duration_s=None,
+        latest_segment_throughput_bps=None,
+        latest_segment_completed_at=None,
+        # A newer playlist request is the generic latest request. Segment-
+        # specific active telemetry must still drive the dashboard.
+        latest_request_kind="playlist",
+        latest_request_completed_at=time.time(),
+        latest_request_started_at=time.time() - 0.01,
+    )
+    streamer._http = SimpleNamespace(  # type: ignore[assignment]
+        delivery_snapshot=lambda: delivery,
+    )
+
+    streamer.poll_hls_stats()
+    snap = stats.snapshot(1.0)
+
+    assert snap.hls_delivery_active == 1
+    assert snap.hls_delivery_active_ms == 1250.0
+    assert snap.hls_delivery_seen
+    streamer._http = None
+    streamer.stop()
+
+
+def test_hls_stats_expose_receiver_that_never_fetches_segments(tmp_path: Path):
+    stats = PipelineStats(target_fps=30.0)
+    streamer = HLSStreamer(work_dir=tmp_path, buffered=True, stats=stats)
+    delivery = SimpleNamespace(
+        segment_requests=0,
+        segment_responses=0,
+        error_requests=0,
+        active_segment_requests=0,
+        oldest_active_segment_age_s=None,
+        latest_segment_bytes=0,
+        latest_segment_duration_s=None,
+        latest_segment_throughput_bps=None,
+        latest_segment_completed_at=None,
+        latest_request_kind="playlist",
+        latest_request_completed_at=time.time(),
+        latest_request_started_at=time.time() - 0.01,
+    )
+    streamer._http = SimpleNamespace(  # type: ignore[assignment]
+        delivery_snapshot=lambda: delivery,
+    )
+    streamer._hls_delivery_observed_at = time.time() - 5.0
+
+    streamer.poll_hls_stats()
+    snap = stats.snapshot(1.0)
+
+    assert not snap.hls_delivery_seen
+    assert snap.hls_delivery_idle_ms == pytest.approx(5000.0, abs=25.0)
+    streamer._http = None
+    streamer.stop()
 
 
 def _publish_raw_hls_fixture(
@@ -261,6 +380,62 @@ class _RecordingFfmpeg:
     def kill(self, *, graceful=False):
         del graceful
         self.killed = True
+
+
+def test_video_demux_queue_is_bounded_to_one_second(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    commands: list[list[str]] = []
+    process = _RecordingFfmpeg()
+
+    def process_factory(cmd, **_kwargs):
+        commands.append(cmd)
+        return process
+
+    monkeypatch.setattr(streamer_module, "FfmpegProcess", process_factory)
+    monkeypatch.setattr(streamer_module, "video_encoder_args", lambda *_args, **_kwargs: [])
+    streamer = HLSStreamer(fps=30, work_dir=tmp_path)
+    streamer._start_ffmpeg()
+
+    command = commands[0]
+    queue_index = command.index("-thread_queue_size")
+    assert command[queue_index + 1] == "30"
+    assert streamer._ffmpeg_video_boundary == (1, None)
+    streamer.stop()
+
+
+def test_replacement_spawn_records_generation_specific_video_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    processes: list[_RecordingFfmpeg] = []
+
+    def process_factory(_cmd, **_kwargs):
+        process = _RecordingFfmpeg()
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(streamer_module, "FfmpegProcess", process_factory)
+    monkeypatch.setattr(streamer_module, "video_encoder_args", lambda *_args, **_kwargs: [])
+    streamer = HLSStreamer(fps=30, work_dir=tmp_path)
+    streamer._latest.publish(b"static-page", captured_at=time.monotonic())
+    streamer._start_ffmpeg()
+    streamer._kill_ffmpeg()
+
+    before = time.monotonic()
+    streamer._start_ffmpeg()
+    after = time.monotonic()
+
+    boundary_generation, boundary_at = streamer._ffmpeg_video_boundary
+    assert boundary_generation == streamer._ffmpeg_generation == 2
+    assert boundary_at is not None
+    assert before <= boundary_at <= after
+    held = streamer._latest.select(boundary_at, not_before=boundary_at)
+    assert held is not None
+    assert held.frame == b"static-page"
+    assert held.captured_at == held.published_at == boundary_at
+    streamer.stop()
 
 
 def test_stop_kills_ffmpeg_before_joining_wedged_writer(tmp_path: Path):
@@ -568,6 +743,68 @@ def test_sampler_rejects_local_frame_captured_before_relaunch(tmp_path: Path):
     stopped.set()
     assert streamer._queue.get(stopped) is None
     assert stats.snapshot(1.0).dropped_total == 1
+    streamer.stop()
+
+
+def test_sampler_new_generation_holds_static_page_and_rejects_delayed_old_frame(
+    tmp_path: Path,
+):
+    streamer = HLSStreamer(fps=20, work_dir=tmp_path)
+    streamer._ffmpeg = _RecordingFfmpeg()  # type: ignore[assignment]
+    streamer._ffmpeg_generation = 1
+    streamer._ffmpeg_video_boundary = (1, None)
+    initial_capture_at = time.monotonic() - 0.01
+    streamer._latest.publish(
+        b"initial",
+        captured_at=initial_capture_at,
+    )
+
+    stopped = threading.Event()
+    stopped.set()
+
+    def pop_until(deadline: float) -> bytes | None:
+        while time.monotonic() < deadline:
+            frame = streamer._queue.get(stopped)
+            if frame is not None:
+                return frame
+            time.sleep(0.005)
+        return None
+
+    streamer._start_sampler_thread()
+    assert pop_until(time.monotonic() + 1.0) == b"initial"
+
+    # Model a completed re-anchor while the sampler is between ticks. Clearing
+    # the encode queue is part of the production relaunch transaction.
+    with streamer._ffmpeg_lock:
+        streamer._queue.clear()
+        streamer._ffmpeg_generation = 2
+        boundary_at = time.monotonic()
+        streamer._ffmpeg_video_boundary = (2, boundary_at)
+        held = streamer._latest.reanchor_latest(boundary_at)
+        assert held is not None
+
+    # Delivery happened after the re-anchor, but Chrome says capture happened
+    # before it. Publication order must not let this frame seed generation 2.
+    streamer._latest.publish(
+        b"delayed-pre-boundary",
+        captured_at=boundary_at - 0.001,
+    )
+    # With no new page capture, the held visual keeps a static page alive. The
+    # delayed old-timeline capture must never displace it.
+    assert pop_until(time.monotonic() + 1.0) == b"initial"
+    assert pop_until(time.monotonic() + 1.0) == b"initial"
+
+    streamer._latest.publish(
+        b"fresh-generation-frame",
+        captured_at=boundary_at + 0.001,
+    )
+    deadline = time.monotonic() + 1.0
+    while True:
+        frame = pop_until(deadline)
+        assert frame != b"delayed-pre-boundary"
+        if frame == b"fresh-generation-frame":
+            break
+        assert frame == b"initial"
     streamer.stop()
 
 

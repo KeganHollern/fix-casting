@@ -37,6 +37,69 @@ def test_queue_depth_is_residence_not_av_drift():
     assert abs(snap.queue_residence_ms - 1000.0) < 1e-6
 
 
+def test_sampler_cadence_exposes_held_frame_and_history_recovery():
+    st = PipelineStats(target_fps=30.0)
+    st.record_sampler_cadence(
+        source_interval_s=0.0,
+        tick_late_s=0.040,
+        recovered_from_history=True,
+    )
+
+    snap = st.snapshot(1.0)
+    assert snap.history_recoveries == 1
+    assert 33.3 < snap.cadence_error_ms < 33.4
+    assert snap.cadence_error_peak_ms == snap.cadence_error_ms
+    assert snap.sampler_late_peak_ms == 40.0
+
+    reset = st.snapshot(1.0)
+    assert reset.history_recoveries == 0
+    assert reset.cadence_error_peak_ms == 0.0
+
+
+def test_hls_snapshot_distinguishes_playlist_delivery_and_publish_cadence():
+    st = PipelineStats(target_fps=30.0)
+    st.record_hls(
+        segment_count=6,
+        newest_age_s=0.5,
+        segments_deleted=1,
+        target_duration_s=2.0,
+        publish_intervals_s=(2.0, 2.1),
+        segment_requests=1,
+        delivery_s=0.125,
+        delivery_mbps=80.0,
+        delivery_active=1,
+        delivery_active_s=0.75,
+        delivery_idle_s=1.5,
+        delivery_seen=True,
+        delivery_errors=1,
+    )
+
+    snap = st.snapshot(1.0)
+    assert snap.hls_count == 6
+    assert snap.hls_target_s == 2.0
+    assert snap.hls_publish_count == 2
+    assert snap.hls_publish_ms == 2050.0
+    assert snap.hls_publish_peak_ms == 2100.0
+    assert snap.hls_segment_requests == 1
+    assert snap.hls_delivery_ms == 125.0
+    assert snap.hls_delivery_mbps == 80.0
+    assert snap.hls_delivery_active == 1
+    assert snap.hls_delivery_active_ms == 750.0
+    assert snap.hls_delivery_idle_ms == 1500.0
+    assert snap.hls_delivery_seen
+    assert snap.hls_delivery_errors == 1
+
+    reset = st.snapshot(1.0)
+    assert reset.hls_publish_count == 0
+    assert reset.hls_segment_requests == 0
+    assert reset.hls_delivery_errors == 0
+    # Latest delivery health remains visible between the TV's segment GETs.
+    assert reset.hls_delivery_ms == 125.0
+    assert reset.hls_delivery_active_ms == 750.0
+    assert reset.hls_delivery_idle_ms == 1500.0
+    assert reset.hls_delivery_seen
+
+
 def test_timeline_reanchor_counts_reason_and_discarded_frames():
     st = PipelineStats(target_fps=30.0)
     st.record_encode_resync("video queue overflow", lost_frames=4)

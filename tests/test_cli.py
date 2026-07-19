@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import signal
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +16,80 @@ def test_version_identifies_source_checkout(capsys):
         cli._parse_args(["--version"])
     assert exc_info.value.code == 0
     assert "development checkout" in capsys.readouterr().out
+
+
+def _fake_installed_package(monkeypatch, tmp_path: Path) -> tuple[Path, Path]:
+    package_dir = tmp_path / "site-packages" / "cast_tab"
+    package_dir.mkdir(parents=True)
+    fake_cli = package_dir / "cli.py"
+    fake_cli.write_text("# installed cli\n", encoding="utf-8")
+    (package_dir / "nested.py").write_text("VALUE = 1\n", encoding="utf-8")
+    receipt = tmp_path / "revision"
+    monkeypatch.setattr(cli, "__file__", str(fake_cli))
+    monkeypatch.setattr(cli, "INSTALL_PROVENANCE_PATH", receipt)
+    monkeypatch.setattr(cli, "AUDIOTEE_PROVENANCE_PATH", tmp_path / "missing-audiotee")
+    return package_dir, receipt
+
+
+def test_version_reports_verified_installed_revision(monkeypatch, tmp_path):
+    package_dir, receipt = _fake_installed_package(monkeypatch, tmp_path)
+    package_fingerprint = cli._package_fingerprint(package_dir)
+    revision = f"fable-refactor@abc123+source.{package_fingerprint[:16]}"
+    receipt.write_text(
+        f"format=1\nrevision={revision}\npackage_fingerprint={package_fingerprint}\n",
+        encoding="utf-8",
+    )
+
+    assert revision in cli._version_text()
+
+
+def test_version_refuses_receipt_for_different_installed_source(monkeypatch, tmp_path):
+    package_dir, receipt = _fake_installed_package(monkeypatch, tmp_path)
+    package_fingerprint = cli._package_fingerprint(package_dir)
+    claimed_revision = f"fable-refactor@wrong-snapshot+source.{package_fingerprint[:16]}"
+    receipt.write_text(
+        f"format=1\nrevision={claimed_revision}\npackage_fingerprint={package_fingerprint}\n",
+        encoding="utf-8",
+    )
+    (package_dir / "nested.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+    version_text = cli._version_text()
+
+    assert claimed_revision not in version_text
+    assert "installed source does not match receipt" in version_text
+
+
+def test_version_refuses_internally_inconsistent_receipt(monkeypatch, tmp_path):
+    package_dir, receipt = _fake_installed_package(monkeypatch, tmp_path)
+    package_fingerprint = cli._package_fingerprint(package_dir)
+    claimed_revision = "fable-refactor@abc123+source.0000000000000000"
+    receipt.write_text(
+        f"format=1\nrevision={claimed_revision}\npackage_fingerprint={package_fingerprint}\n",
+        encoding="utf-8",
+    )
+
+    version_text = cli._version_text()
+
+    assert claimed_revision not in version_text
+    assert "internally inconsistent" in version_text
+
+
+def test_version_refuses_legacy_unverifiable_receipt(monkeypatch, tmp_path):
+    _package_dir, receipt = _fake_installed_package(monkeypatch, tmp_path)
+    claimed_revision = "fable-refactor@unverified+source.0123456789abcdef"
+    receipt.write_text(f"{claimed_revision}\n", encoding="utf-8")
+
+    version_text = cli._version_text()
+
+    assert claimed_revision not in version_text
+    assert "unverified install receipt" in version_text
+
+
+def test_version_handles_non_utf8_receipt(monkeypatch, tmp_path):
+    _package_dir, receipt = _fake_installed_package(monkeypatch, tmp_path)
+    receipt.write_bytes(b"\xff\xfe")
+
+    assert "revision unknown" in cli._version_text()
 
 
 def test_hls_profile_cli_defaults_and_compatibility_flag():

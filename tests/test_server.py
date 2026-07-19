@@ -226,9 +226,14 @@ class _HandlerSocket:
         self.response.extend(data)
 
 
-def _request(handler, path: str = "/stream.m3u8") -> tuple[bytes, bytes]:
+def _request(
+    handler,
+    path: str = "/stream.m3u8",
+    *,
+    method: str = "GET",
+) -> tuple[bytes, bytes]:
     sock = _HandlerSocket(
-        f"GET {path} HTTP/1.1\r\nHost: cast.test\r\nConnection: close\r\n\r\n".encode()
+        f"{method} {path} HTTP/1.1\r\nHost: cast.test\r\nConnection: close\r\n\r\n".encode()
     )
     handler(sock, ("127.0.0.1", 12345), object())
     headers, body = bytes(sock.response).split(b"\r\n\r\n", 1)
@@ -285,6 +290,260 @@ def test_http_server_falls_back_to_raw_playlist_when_transform_fails(
         server.stop()
 
     assert body == raw
+
+
+def test_delivery_telemetry_reports_hls_requests_bytes_and_timing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _FakeHTTPServer.instances.clear()
+    monkeypatch.setattr(server_module, "ThreadingHTTPServer", _FakeHTTPServer)
+    playlist_body = _playlist("#EXTINF:2.0,", "segment.ts")
+    segment_body = b"mpeg-ts-payload" * 32
+    (tmp_path / "stream.m3u8").write_bytes(playlist_body)
+    (tmp_path / "segment.ts").write_bytes(segment_body)
+    callback_snapshots = []
+    server = HLSHTTPServer(tmp_path, on_delivery=callback_snapshots.append)
+    server.start()
+
+    try:
+        underlying = server._server
+        assert underlying is not None
+        _playlist_headers, delivered_playlist = _request(
+            underlying.handler, "/stream.m3u8?reload=1"
+        )
+        _segment_headers, delivered_segment = _request(underlying.handler, "/segment.ts?token=abc")
+        missing_headers, _missing_body = _request(underlying.handler, "/missing.txt")
+        snapshot = server.delivery_snapshot()
+    finally:
+        server.stop()
+
+    assert delivered_playlist == playlist_body
+    assert delivered_segment == segment_body
+    assert b"404 File not found" in missing_headers
+    assert snapshot.playlist_requests == 1
+    assert snapshot.segment_requests == 1
+    assert snapshot.other_requests == 1
+    assert snapshot.active_requests == 0
+    assert snapshot.completed_requests == 3
+    assert snapshot.error_requests == 1
+    assert snapshot.playlist_bytes_sent == len(playlist_body)
+    assert snapshot.segment_bytes_sent == len(segment_body)
+    assert snapshot.bytes_sent == len(playlist_body) + len(segment_body)
+    assert snapshot.segment_responses == 1
+    assert snapshot.segment_response_bytes_total == len(segment_body)
+    assert snapshot.segment_response_duration_s_total >= 0
+    assert snapshot.average_segment_response_duration_s is not None
+    assert snapshot.average_segment_throughput_bps is not None
+    assert snapshot.latest_segment_bytes == len(segment_body)
+    assert snapshot.latest_segment_duration_s is not None
+    assert snapshot.latest_segment_throughput_bps is not None
+    assert snapshot.latest_segment_started_at is not None
+    assert snapshot.latest_segment_completed_at is not None
+    assert snapshot.latest_request_method == "GET"
+    assert snapshot.latest_request_path == "/missing.txt"
+    assert snapshot.latest_request_kind == "other"
+    assert snapshot.latest_request_started_at is not None
+    assert snapshot.latest_request_completed_at is not None
+    assert snapshot.latest_request_duration_s is not None
+    assert snapshot.latest_request_status == 404
+    assert snapshot.latest_request_error
+    assert len(callback_snapshots) == 3
+    assert callback_snapshots[-1] == snapshot
+
+
+def test_segment_head_is_not_counted_as_successful_media_delivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _FakeHTTPServer.instances.clear()
+    monkeypatch.setattr(server_module, "ThreadingHTTPServer", _FakeHTTPServer)
+    segment_body = b"mpeg-ts-payload"
+    (tmp_path / "segment.ts").write_bytes(segment_body)
+    server = HLSHTTPServer(tmp_path)
+    server.start()
+
+    try:
+        underlying = server._server
+        assert underlying is not None
+        headers, body = _request(
+            underlying.handler,
+            "/segment.ts",
+            method="HEAD",
+        )
+        snapshot = server.delivery_snapshot()
+    finally:
+        server.stop()
+
+    assert b"200 OK" in headers
+    assert body == b""
+    assert snapshot.segment_requests == 1
+    assert snapshot.segment_responses == 0
+    assert snapshot.segment_response_bytes_total == 0
+    assert snapshot.segment_bytes_sent == 0
+    assert snapshot.latest_segment_completed_at is None
+    assert snapshot.latest_segment_duration_s is None
+    assert snapshot.latest_segment_bytes == 0
+
+
+class _BlockingBodySocket(_HandlerSocket):
+    def __init__(self, request: bytes, body: bytes) -> None:
+        super().__init__(request)
+        self._body = body
+        self.body_write_started = threading.Event()
+        self.release_body = threading.Event()
+
+    def sendall(self, data: bytes) -> None:
+        if data == self._body:
+            self.body_write_started.set()
+            self.release_body.wait(timeout=2)
+        super().sendall(data)
+
+
+def test_delivery_telemetry_snapshot_is_safe_during_active_segment_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _FakeHTTPServer.instances.clear()
+    monkeypatch.setattr(server_module, "ThreadingHTTPServer", _FakeHTTPServer)
+    segment_body = b"x" * 4096
+    (tmp_path / "segment.ts").write_bytes(segment_body)
+    callback_snapshots = []
+    server = HLSHTTPServer(tmp_path, on_delivery=callback_snapshots.append)
+    server.start()
+    underlying = server._server
+    assert underlying is not None
+    sock = _BlockingBodySocket(
+        b"GET /segment.ts HTTP/1.1\r\nHost: cast.test\r\nConnection: close\r\n\r\n",
+        segment_body,
+    )
+    request_thread = threading.Thread(
+        target=underlying.handler,
+        args=(sock, ("127.0.0.1", 12345), object()),
+    )
+
+    try:
+        request_thread.start()
+        assert sock.body_write_started.wait(timeout=1)
+        active = server.delivery_snapshot()
+        assert active.segment_requests == 1
+        assert active.active_requests == 1
+        assert active.active_segment_requests == 1
+        assert active.oldest_active_segment_started_at is not None
+        assert active.oldest_active_segment_age_s is not None
+        assert active.oldest_active_segment_age_s >= 0
+        assert active.completed_requests == 0
+        assert active.latest_request_path == "/segment.ts"
+        assert active.latest_request_completed_at is None
+
+        sock.release_body.set()
+        request_thread.join(timeout=1)
+        completed = server.delivery_snapshot()
+    finally:
+        sock.release_body.set()
+        request_thread.join(timeout=1)
+        server.stop()
+
+    assert not request_thread.is_alive()
+    assert completed.active_requests == 0
+    assert completed.active_segment_requests == 0
+    assert completed.oldest_active_segment_started_at is None
+    assert completed.oldest_active_segment_age_s is None
+    assert completed.completed_requests == 1
+    assert completed.error_requests == 0
+    assert completed.segment_bytes_sent == len(segment_body)
+    assert len(callback_snapshots) == 1
+    assert callback_snapshots[0] == completed
+
+
+def test_active_segment_remains_visible_after_later_playlist_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _FakeHTTPServer.instances.clear()
+    monkeypatch.setattr(server_module, "ThreadingHTTPServer", _FakeHTTPServer)
+    playlist_body = _playlist("#EXTINF:2.0,", "segment.ts")
+    segment_body = b"x" * 4096
+    (tmp_path / "stream.m3u8").write_bytes(playlist_body)
+    (tmp_path / "segment.ts").write_bytes(segment_body)
+    server = HLSHTTPServer(tmp_path)
+    server.start()
+    underlying = server._server
+    assert underlying is not None
+    sock = _BlockingBodySocket(
+        b"GET /segment.ts HTTP/1.1\r\nHost: cast.test\r\nConnection: close\r\n\r\n",
+        segment_body,
+    )
+    request_thread = threading.Thread(
+        target=underlying.handler,
+        args=(sock, ("127.0.0.1", 12345), object()),
+    )
+
+    try:
+        request_thread.start()
+        assert sock.body_write_started.wait(timeout=1)
+        before_playlist = server.delivery_snapshot()
+
+        _headers, delivered_playlist = _request(underlying.handler, "/stream.m3u8")
+        after_playlist = server.delivery_snapshot()
+
+        assert delivered_playlist == playlist_body
+        assert after_playlist.latest_request_kind == "playlist"
+        assert after_playlist.latest_request_completed_at is not None
+        assert after_playlist.active_requests == 1
+        assert after_playlist.active_segment_requests == 1
+        assert (
+            after_playlist.oldest_active_segment_started_at
+            == before_playlist.oldest_active_segment_started_at
+        )
+        assert after_playlist.oldest_active_segment_age_s is not None
+        assert before_playlist.oldest_active_segment_age_s is not None
+        assert (
+            after_playlist.oldest_active_segment_age_s
+            >= before_playlist.oldest_active_segment_age_s
+        )
+
+        sock.release_body.set()
+        request_thread.join(timeout=1)
+        completed = server.delivery_snapshot()
+    finally:
+        sock.release_body.set()
+        request_thread.join(timeout=1)
+        server.stop()
+
+    assert not request_thread.is_alive()
+    assert completed.active_requests == 0
+    assert completed.active_segment_requests == 0
+    assert completed.oldest_active_segment_started_at is None
+    assert completed.oldest_active_segment_age_s is None
+
+
+def test_delivery_callback_failure_is_silent_and_does_not_break_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    _FakeHTTPServer.instances.clear()
+    monkeypatch.setattr(server_module, "ThreadingHTTPServer", _FakeHTTPServer)
+    segment_body = b"segment"
+    (tmp_path / "segment.ts").write_bytes(segment_body)
+
+    def fail_callback(_snapshot) -> None:
+        raise RuntimeError("telemetry consumer failed")
+
+    server = HLSHTTPServer(tmp_path, on_delivery=fail_callback)
+    server.start()
+    try:
+        underlying = server._server
+        assert underlying is not None
+        headers, body = _request(underlying.handler, "/segment.ts")
+    finally:
+        server.stop()
+
+    assert b"200 OK" in headers
+    assert body == segment_body
+    assert server.delivery_snapshot().completed_requests == 1
+    assert capsys.readouterr() == ("", "")
 
 
 def test_stop_closes_listener_and_is_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

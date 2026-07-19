@@ -24,6 +24,7 @@ from cast_tab.encoder import (  # re-exported for callers (cli, tools)
     codec_label,
     default_fps_for_resolution,
     hls_args,
+    hls_segment_duration_s,
     video_encoder_args,
 )
 from cast_tab.pacing import BoundedFrameQueue, LatestFrame
@@ -73,10 +74,10 @@ HEALTH_POLL_S = 0.1
 # bootstrap from a single segment without increasing steady-state holdback.
 HLS_STARTUP_SEGMENTS = 3
 
-# Keep filling video frames to catch up after a stall this long or shorter (so
-# the encoded timeline stays locked to wall-clock and audio can't drift ahead);
-# only abandon catch-up past it (machine slept, multi-second hang).
-SAMPLER_MAX_CATCHUP_S = 5.0
+# Timestamp history and the application queue each cover roughly a second. Catch
+# up within that window using the actual historical captures; beyond it, create
+# a clean joint A/V boundary instead of bursting repeated or pruned frames.
+SAMPLER_MAX_CATCHUP_S = 1.0
 
 # Clamp the manual --audio-offset-ms trim to a sane range; covers ordinary
 # fixed capture/encode baseline offsets without masking a broken timeline.
@@ -158,6 +159,10 @@ class HLSStreamer:
         self._consecutive_ffmpeg_failures = 0
         self._ffmpeg_generation = 0
         self._ffmpeg_started_at: float | None = None
+        # (ffmpeg generation, earliest capture eligible to seed its video PTS
+        # zero). The initial process may use the frame which triggered startup;
+        # every replacement requires capture from its new raw-input boundary.
+        self._ffmpeg_video_boundary: tuple[int, float | None] = (0, None)
         self._write_state_lock = threading.Lock()
         self._write_started_at: float | None = None
         self._write_generation: int | None = None
@@ -166,6 +171,13 @@ class HLSStreamer:
         self._backpressure_generation: int | None = None
         self._last_sampled_generation = -1
         self._known_hls_segments: set[str] = set()
+        self._known_hls_playlist_segments: set[str] = set()
+        self._last_hls_publish_mtime: float | None = None
+        self._hls_delivery_segment_requests = 0
+        self._hls_delivery_errors = 0
+        self._hls_last_delivery_s: float | None = None
+        self._hls_last_delivery_mbps: float | None = None
+        self._hls_delivery_observed_at: float | None = None
         # Every ffmpeg spawn gets a unique URI namespace. ``timeline_epoch``
         # advances only after the prior attempt actually published media, so it
         # is also the exact HLS discontinuity sequence used by the HTTP
@@ -446,6 +458,7 @@ class HLSStreamer:
                 playlist_transform=HLSDiscontinuitySequenceNormalizer(),
             )
             self._http.start()
+            self._hls_delivery_observed_at = time.time()
 
         if not self._startup_step(start_http):
             return
@@ -453,9 +466,13 @@ class HLSStreamer:
             if self._lifecycle_state == "starting" and not self._stopped.is_set():
                 self._lifecycle_state = "running"
 
-    def publish_frame(self, jpeg_data: bytes) -> None:
+    def publish_frame(
+        self,
+        jpeg_data: bytes,
+        captured_at: float | None = None,
+    ) -> None:
         if not self._stopped.is_set():
-            self._latest.publish(jpeg_data)
+            self._latest.publish(jpeg_data, captured_at=captured_at)
             self._first_frame.set()
             if self._stats is not None:
                 self._stats.trace("first frame published to streamer", once=True)
@@ -479,23 +496,128 @@ class HLSStreamer:
     def poll_hls_stats(self) -> list[str]:
         if self._stats is None:
             return []
-        segments = sorted(self.work_dir.glob("seg*.ts"))
-        newest_age: float | None = None
-        if segments:
-            newest_age = time.time() - segments[-1].stat().st_mtime
 
-        current = {path.name for path in segments}
+        segment_mtimes: dict[str, float] = {}
+        for path in self.work_dir.glob("seg*.ts"):
+            try:
+                segment_mtimes[path.name] = path.stat().st_mtime
+            except OSError:
+                continue
+
+        current = set(segment_mtimes)
         had_segments = bool(self._known_hls_segments)
         deleted = sorted(self._known_hls_segments - current)
+
         events: list[str] = []
         if deleted and had_segments:
             events.append(f"hls deleted {', '.join(deleted)}")
         self._known_hls_segments = current
 
+        # Count actual playlist entries rather than deletion-grace files left on
+        # disk by FFmpeg.  The old disk count made a 12-entry window appear as
+        # thirteen segments and was easy to misread as receiver buffer depth.
+        playlist_segments = set(self._known_hls_playlist_segments)
+        playlist_read = False
+        try:
+            playlist_text = (self.work_dir / "stream.m3u8").read_text(encoding="utf-8")
+            playlist_segments = {
+                line.split("?", 1)[0]
+                for line in playlist_text.splitlines()
+                if line and not line.startswith("#") and line.split("?", 1)[0].endswith(".ts")
+            }
+            playlist_read = True
+        except (OSError, UnicodeError):
+            pass
+
+        # Production cadence and age must follow media the receiver can
+        # actually discover. A completed but not-yet-published (or orphaned)
+        # .ts file must not make a stalled playlist look healthy.
+        active_mtimes = {
+            name: segment_mtimes[name]
+            for name in playlist_segments
+            if name in segment_mtimes
+        }
+        newest_age: float | None = None
+        if active_mtimes:
+            newest_age = max(0.0, time.time() - max(active_mtimes.values()))
+
+        new_mtimes = sorted(
+            active_mtimes[name]
+            for name in (
+                playlist_segments - self._known_hls_playlist_segments
+                if playlist_read
+                else set()
+            )
+            if name in active_mtimes
+        )
+        publish_intervals: list[float] = []
+        for published_at in new_mtimes:
+            previous = self._last_hls_publish_mtime
+            if previous is not None and published_at >= previous:
+                publish_intervals.append(published_at - previous)
+            if previous is None or published_at > previous:
+                self._last_hls_publish_mtime = published_at
+        if playlist_read:
+            self._known_hls_playlist_segments = playlist_segments
+
+        segment_requests = 0
+        delivery_errors = 0
+        delivery_active = 0
+        delivery_active_s: float | None = None
+        delivery_idle_s: float | None = None
+        delivery_seen = False
+        http = self._http
+        if http is not None and hasattr(http, "delivery_snapshot"):
+            delivery = http.delivery_snapshot()
+            segment_requests = max(
+                0,
+                delivery.segment_requests - self._hls_delivery_segment_requests,
+            )
+            delivery_errors = max(
+                0,
+                delivery.error_requests - self._hls_delivery_errors,
+            )
+            self._hls_delivery_segment_requests = delivery.segment_requests
+            self._hls_delivery_errors = delivery.error_requests
+            delivery_seen = (
+                delivery.segment_responses > 0
+                or delivery.active_segment_requests > 0
+            )
+            delivery_active = delivery.active_segment_requests
+            delivery_active_s = delivery.oldest_active_segment_age_s
+
+            now_wall = time.time()
+            if delivery.latest_segment_completed_at is not None:
+                delivery_idle_s = max(
+                    0.0,
+                    now_wall - delivery.latest_segment_completed_at,
+                )
+            elif self._hls_delivery_observed_at is not None:
+                delivery_idle_s = max(
+                    0.0,
+                    now_wall - self._hls_delivery_observed_at,
+                )
+
+            if delivery.latest_segment_bytes > 0 and delivery.latest_segment_duration_s is not None:
+                self._hls_last_delivery_s = delivery.latest_segment_duration_s
+                throughput = delivery.latest_segment_throughput_bps
+                self._hls_last_delivery_mbps = (
+                    throughput * 8 / 1_000_000 if throughput is not None else None
+                )
         self._stats.record_hls(
-            segment_count=len(segments),
+            segment_count=len(playlist_segments),
             newest_age_s=newest_age,
             segments_deleted=len(deleted) if had_segments else 0,
+            target_duration_s=float(hls_segment_duration_s(buffered=self.buffered)),
+            publish_intervals_s=tuple(publish_intervals),
+            segment_requests=segment_requests,
+            delivery_s=self._hls_last_delivery_s,
+            delivery_mbps=self._hls_last_delivery_mbps,
+            delivery_active=delivery_active,
+            delivery_active_s=delivery_active_s,
+            delivery_idle_s=delivery_idle_s,
+            delivery_seen=delivery_seen,
+            delivery_errors=delivery_errors,
         )
         return events
 
@@ -515,9 +637,7 @@ class HLSStreamer:
             return
         media_prefix = "#EXT-X-MEDIA-SEQUENCE:"
         media_values = [
-            line[len(media_prefix) :]
-            for line in lines
-            if line.startswith(media_prefix)
+            line[len(media_prefix) :] for line in lines if line.startswith(media_prefix)
         ]
         uris = [line for line in lines if line and not line.startswith("#")]
         if len(media_values) != 1 or not uris:
@@ -538,8 +658,7 @@ class HLSStreamer:
                 previous = self._hls_uri_sequences.get(uri)
                 if previous is not None and previous != sequence:
                     message = (
-                        f"HLS media-sequence identity changed for {uri!r}: "
-                        f"{previous} -> {sequence}"
+                        f"HLS media-sequence identity changed for {uri!r}: {previous} -> {sequence}"
                     )
                     self._fail(message)
                     raise self.fatal_error or RuntimeError(message)
@@ -567,13 +686,10 @@ class HLSStreamer:
             except (OSError, UnicodeError):
                 playlist_lines = []
             playlist_segments = [
-                line
-                for line in playlist_lines
-                if line and not line.startswith("#")
+                line for line in playlist_lines if line and not line.startswith("#")
             ]
             if len(playlist_segments) >= HLS_STARTUP_SEGMENTS and all(
-                (self.work_dir / name).is_file()
-                for name in playlist_segments
+                (self.work_dir / name).is_file() for name in playlist_segments
             ):
                 self._hls_ever_published = True
                 if health_check is not None:
@@ -972,9 +1088,7 @@ class HLSStreamer:
         playlist = self.work_dir / "stream.m3u8"
         if not playlist.exists():
             if self._hls_ever_published:
-                raise RuntimeError(
-                    "cannot safely restart HLS: the published playlist is missing"
-                )
+                raise RuntimeError("cannot safely restart HLS: the published playlist is missing")
             return [], 0
 
         try:
@@ -988,20 +1102,14 @@ class HLSStreamer:
 
         media_prefix = "#EXT-X-MEDIA-SEQUENCE:"
         media_values = [
-            line[len(media_prefix) :]
-            for line in lines
-            if line.startswith(media_prefix)
+            line[len(media_prefix) :] for line in lines if line.startswith(media_prefix)
         ]
         if len(media_values) != 1:
-            raise RuntimeError(
-                "cannot safely restart HLS: expected one media sequence"
-            )
+            raise RuntimeError("cannot safely restart HLS: expected one media sequence")
         try:
             media_sequence = int(media_values[0])
         except ValueError as exc:
-            raise RuntimeError(
-                "cannot safely restart HLS: invalid media sequence"
-            ) from exc
+            raise RuntimeError("cannot safely restart HLS: invalid media sequence") from exc
         if media_sequence < 0:
             raise RuntimeError("cannot safely restart HLS: negative media sequence")
 
@@ -1012,29 +1120,21 @@ class HLSStreamer:
         for line in lines:
             if line == "#EXT-X-DISCONTINUITY":
                 if pending_boundary:
-                    raise RuntimeError(
-                        "cannot safely restart HLS: duplicate discontinuity"
-                    )
+                    raise RuntimeError("cannot safely restart HLS: duplicate discontinuity")
                 pending_boundary = True
                 continue
             if line.startswith("#EXTINF:"):
                 if pending_extinf:
-                    raise RuntimeError(
-                        "cannot safely restart HLS: segment URI is missing"
-                    )
+                    raise RuntimeError("cannot safely restart HLS: segment URI is missing")
                 pending_extinf = True
                 continue
             if not line or line.startswith("#"):
                 continue
             if not pending_extinf:
-                raise RuntimeError(
-                    "cannot safely restart HLS: segment has no EXTINF"
-                )
+                raise RuntimeError("cannot safely restart HLS: segment has no EXTINF")
             match = _HLS_SEGMENT_NAME_RE.fullmatch(line)
             if match is None:
-                raise RuntimeError(
-                    f"cannot safely restart HLS: unexpected segment URI {line!r}"
-                )
+                raise RuntimeError(f"cannot safely restart HLS: unexpected segment URI {line!r}")
             if not (self.work_dir / line).is_file():
                 raise RuntimeError(
                     f"cannot safely restart HLS: referenced segment {line!r} is missing"
@@ -1054,9 +1154,7 @@ class HLSStreamer:
             raise RuntimeError("cannot safely restart HLS: final segment URI is missing")
         if not records:
             if self._hls_ever_published:
-                raise RuntimeError(
-                    "cannot safely restart HLS: published playlist has no segments"
-                )
+                raise RuntimeError("cannot safely restart HLS: published playlist has no segments")
             return [], 0
         if len({record[2] for record in records}) != len(records):
             raise RuntimeError("cannot safely restart HLS: duplicate segment URI")
@@ -1066,18 +1164,12 @@ class HLSStreamer:
             boundary = boundaries[index]
             if epoch == previous_epoch:
                 if boundary or attempt != previous_attempt:
-                    raise RuntimeError(
-                        "cannot safely restart HLS: inconsistent attempt boundary"
-                    )
+                    raise RuntimeError("cannot safely restart HLS: inconsistent attempt boundary")
             elif epoch == previous_epoch + 1:
                 if not boundary:
-                    raise RuntimeError(
-                        "cannot safely restart HLS: timeline boundary is missing"
-                    )
+                    raise RuntimeError("cannot safely restart HLS: timeline boundary is missing")
             else:
-                raise RuntimeError(
-                    "cannot safely restart HLS: timeline epochs are not consecutive"
-                )
+                raise RuntimeError("cannot safely restart HLS: timeline epochs are not consecutive")
             previous_epoch, previous_attempt = epoch, attempt
 
         with self._hls_identity_lock:
@@ -1101,12 +1193,8 @@ class HLSStreamer:
         """Allocate a never-reused segment namespace for the next spawn."""
         records, _next_media_sequence = self._read_hls_restart_state()
         append = bool(records)
-        current_attempt_published = (
-            self._hls_current_attempt is not None
-            and any(
-                attempt == self._hls_current_attempt
-                for _epoch, attempt, _name in records
-            )
+        current_attempt_published = self._hls_current_attempt is not None and any(
+            attempt == self._hls_current_attempt for _epoch, attempt, _name in records
         )
         if current_attempt_published:
             self._hls_timeline_epoch += 1
@@ -1115,10 +1203,7 @@ class HLSStreamer:
         self._hls_current_attempt = self._hls_attempt
         segment_pattern = str(
             self.work_dir
-            / (
-                f"seg-e{self._hls_timeline_epoch:06d}-"
-                f"a{self._hls_attempt:06d}-%09d.ts"
-            )
+            / (f"seg-e{self._hls_timeline_epoch:06d}-a{self._hls_attempt:06d}-%09d.ts")
         )
         return segment_pattern, append
 
@@ -1141,8 +1226,11 @@ class HLSStreamer:
             # the queue then stays at depth ~1 and never drops. A buffered demux
             # thread on the pipe (matching the audio input) keeps video flowing
             # even if the transcode loop briefly waits on the real-time audio fd.
+            # Bound that hidden queue to one second: the previous 1024 packets
+            # could conceal roughly 34 seconds of transcode lag behind fast app
+            # writes, making the dashboard green while HLS fell behind.
             "-thread_queue_size",
-            "1024",
+            str(max(8, self.fps)),
             "-probesize",
             "32",
             "-analyzeduration",
@@ -1202,6 +1290,16 @@ class HLSStreamer:
         self._ffmpeg = FfmpegProcess(cmd, pass_fds=pass_fds, stats=self._stats)
         self._ffmpeg_generation += 1
         self._ffmpeg_started_at = time.monotonic()
+        self._ffmpeg_video_boundary = (
+            self._ffmpeg_generation,
+            None if self._ffmpeg_generation == 1 else self._ffmpeg_started_at,
+        )
+        video_boundary_at = self._ffmpeg_video_boundary[1]
+        if video_boundary_at is not None:
+            # A static page may not emit another screencast frame. Represent
+            # its current visual state at the fresh PTS-zero boundary while the
+            # sampler's cutoff still rejects delayed captures from before it.
+            self._latest.reanchor_latest(video_boundary_at)
         if self._stats is not None:
             self._stats.trace("ffmpeg spawned")
 
@@ -1258,6 +1356,7 @@ class HLSStreamer:
             frame_period = 1.0 / self.fps
             next_tick = time.monotonic()
             sampled_ffmpeg_generation: int | None = None
+            previous_capture_at: float | None = None
 
             while not self._stopped.is_set():
                 now = time.monotonic()
@@ -1265,6 +1364,25 @@ class HLSStreamer:
                 if sleep_for > 0:
                     self._stopped.wait(sleep_for)
                     now = time.monotonic()
+                with self._ffmpeg_lock:
+                    current_ffmpeg_generation = self._ffmpeg_generation
+                    boundary_generation, video_boundary_at = self._ffmpeg_video_boundary
+                if boundary_generation != current_ffmpeg_generation:
+                    # Tests and failed partial starts can install a process
+                    # without the production boundary transaction. Never apply
+                    # another generation's cutoff to this one.
+                    video_boundary_at = None
+                generation_changed = (
+                    sampled_ffmpeg_generation is not None
+                    and current_ffmpeg_generation != sampled_ffmpeg_generation
+                )
+                if generation_changed:
+                    # Do this before selecting: an old scheduled tick can name
+                    # a perfectly valid historical frame which must nevertheless
+                    # never seed the replacement's video PTS-zero timeline.
+                    next_tick = now
+                    self._last_sampled_generation = -1
+                    previous_capture_at = None
                 # When we fall behind schedule, keep the loop running back-to-
                 # back (no sleep) so it feeds one frame per missed tick — those
                 # catch-up frames hold the encoded timeline level with wall-clock
@@ -1273,37 +1391,56 @@ class HLSStreamer:
                 # backlog isn't worth it. The bounded queue caps the burst.
                 if self._handle_sampler_clock_gap(now - next_tick, frame_period):
                     next_tick = now
-                next_tick += frame_period
+                scheduled_tick = next_tick
+                tick_late_s = max(0.0, now - scheduled_tick)
+                next_tick = scheduled_tick + frame_period
 
-                with self._ffmpeg_lock:
-                    current_ffmpeg_generation = self._ffmpeg_generation
-                frame, published_at, generation = self._latest.peek()
-                if frame is None:
+                previous_generation = (
+                    self._last_sampled_generation if self._last_sampled_generation >= 0 else None
+                )
+                selection = self._latest.select(
+                    scheduled_tick,
+                    previous_generation=previous_generation,
+                    not_before=video_boundary_at,
+                )
+                if selection is None:
+                    sampled_ffmpeg_generation = current_ffmpeg_generation
                     continue
                 if self._stats is not None:
                     self._stats.trace("first sampler tick (video PTS=0 frame)", once=True)
 
-                # One frame per tick holds a constant input rate. When capture
-                # produced nothing new, re-enqueue the latest; skipping it would
-                # make the encoded timeline lag wall-clock and drain the TV.
-                if generation == self._last_sampled_generation:
-                    if self._stats is not None:
-                        self._stats.record_encode_repeat()
-                elif self._stats is not None and published_at is not None:
-                    self._stats.record_frame_age(time.monotonic() - published_at)
-                self._last_sampled_generation = generation
+                # Select by the tick's original time, not "whatever is latest"
+                # after a late wake. The short history lets catch-up ticks use
+                # the distinct captures that actually belonged to them instead
+                # of duplicating one current frame and visibly jumping forward.
+                _latest_frame, _latest_published_at, newest_generation = self._latest.peek()
                 enqueued = self._enqueue_frame(
-                    frame,
+                    selection.frame,
                     sampled_for_generation=current_ffmpeg_generation,
                 )
-                if (
-                    not enqueued
-                    or (
-                        sampled_ffmpeg_generation is not None
-                        and current_ffmpeg_generation
-                        != sampled_ffmpeg_generation
-                    )
-                ):
+                if enqueued:
+                    if self._stats is not None:
+                        if selection.repeated:
+                            self._stats.record_encode_repeat()
+                        self._stats.record_frame_age(
+                            max(0.0, time.monotonic() - selection.published_at)
+                        )
+                        source_interval = (
+                            None
+                            if previous_capture_at is None
+                            else selection.captured_at - previous_capture_at
+                        )
+                        self._stats.record_sampler_cadence(
+                            source_interval_s=source_interval,
+                            tick_late_s=tick_late_s,
+                            recovered_from_history=(
+                                not selection.used_future_fallback
+                                and selection.generation != newest_generation
+                            ),
+                        )
+                    self._last_sampled_generation = selection.generation
+                    previous_capture_at = selection.captured_at
+                if not enqueued:
                     # A relaunch already supplied the required timeline
                     # boundary. Reset the sampler cadence to the fresh
                     # generation instead of bursting missed old-generation
@@ -1366,9 +1503,7 @@ class HLSStreamer:
                     try:
                         written = stdin.write(frame)
                         if written != len(frame):
-                            raise OSError(
-                                f"short ffmpeg stdin write: {written}/{len(frame)} bytes"
-                            )
+                            raise OSError(f"short ffmpeg stdin write: {written}/{len(frame)} bytes")
                         stdin.flush()
                         write_s = time.monotonic() - write_started
                     except (BrokenPipeError, OSError, ValueError) as exc:

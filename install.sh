@@ -12,6 +12,7 @@ case "$DATA_HOME" in
 esac
 INSTALL_DATA_DIR="$DATA_HOME/fix-casting"
 AUDIOTEE_DEST="$INSTALL_DATA_DIR/bin/audiotee"
+INSTALL_PROVENANCE_PATH="$INSTALL_DATA_DIR/revision"
 mkdir -p "$INSTALL_DATA_DIR/bin"
 
 # --- preflight checks -------------------------------------------------------
@@ -30,8 +31,12 @@ fi
 # changing branches or editing this checkout must not silently change the
 # installed command. Export exact runtime constraints from the committed lock.
 LOCK_CONSTRAINTS="$(mktemp "${TMPDIR:-/tmp}/fix-casting-constraints.XXXXXX")"
+PROVENANCE_TEMP=""
 cleanup() {
   rm -f "$LOCK_CONSTRAINTS"
+  if [ -n "$PROVENANCE_TEMP" ]; then
+    rm -f "$PROVENANCE_TEMP"
+  fi
 }
 trap cleanup EXIT
 uv export \
@@ -41,11 +46,67 @@ uv export \
   --no-emit-project \
   --no-hashes \
   --output-file "$LOCK_CONSTRAINTS"
-uv tool install --force --constraints "$LOCK_CONSTRAINTS" "$ROOT"
 
-# Record exactly which source snapshot produced the installed command before
-# optional browser/native-helper setup. If one of those later steps fails, the
-# already-updated `cast` command must not retain a stale receipt.
+# Once replacement starts, an old receipt can no longer safely describe the
+# command on disk. Publish an atomic fail-closed marker first; a failed build or
+# verification will therefore never leave `cast --version` claiming a snapshot.
+PROVENANCE_TEMP="$(mktemp "$INSTALL_DATA_DIR/revision.XXXXXX")"
+printf '%s\n' "revision unknown (installation incomplete)" > "$PROVENANCE_TEMP"
+mv -f "$PROVENANCE_TEMP" "$INSTALL_PROVENANCE_PATH"
+PROVENANCE_TEMP=""
+
+# --force recreates the tool environment, but does not by itself invalidate a
+# wheel cached for this local directory. --reinstall-package implies a scoped
+# cache refresh and forces fix-casting itself to be rebuilt from this checkout.
+uv tool install \
+  --force \
+  --reinstall-package fix-casting \
+  --constraints "$LOCK_CONSTRAINTS" \
+  "$ROOT"
+
+TOOL_ENV_DIR="$(uv tool dir)/fix-casting"
+TOOL_PYTHON="$TOOL_ENV_DIR/bin/python"
+if [ ! -x "$TOOL_PYTHON" ]; then
+  echo "error: installed fix-casting Python was not found at $TOOL_PYTHON" >&2
+  exit 1
+fi
+
+# Run the helper from the isolated tool environment (`-I` excludes this
+# checkout from Python's import path). A stale wheel that predates the helper
+# fails here; one with different sources produces a different fingerprint.
+SOURCE_PACKAGE_FINGERPRINT="$(
+  "$TOOL_PYTHON" -I -c \
+    'import sys; from pathlib import Path; from cast_tab.cli import _package_fingerprint; print(_package_fingerprint(Path(sys.argv[1])))' \
+    "$ROOT/cast_tab"
+)"
+INSTALLED_PACKAGE_FINGERPRINT="$(
+  "$TOOL_PYTHON" -I -c \
+    'from pathlib import Path; import cast_tab.cli as cli; print(cli._package_fingerprint(Path(cli.__file__).resolve().parent))'
+)"
+for package_fingerprint in \
+  "$SOURCE_PACKAGE_FINGERPRINT" \
+  "$INSTALLED_PACKAGE_FINGERPRINT"
+do
+  if [ "${#package_fingerprint}" -ne 64 ]; then
+    echo "error: fix-casting package fingerprint was malformed" >&2
+    exit 1
+  fi
+  case "$package_fingerprint" in
+    *[!0-9a-f]*)
+      echo "error: fix-casting package fingerprint was malformed" >&2
+      exit 1
+      ;;
+  esac
+done
+if [ "$SOURCE_PACKAGE_FINGERPRINT" != "$INSTALLED_PACKAGE_FINGERPRINT" ]; then
+  echo "error: installed fix-casting sources do not match $ROOT/cast_tab" >&2
+  echo "       Refusing to publish an installation revision receipt." >&2
+  exit 1
+fi
+
+# Record exactly which verified source snapshot produced the installed command
+# before optional browser/native-helper setup. If one of those later steps
+# fails, the already-updated `cast` command still retains an accurate receipt.
 REVISION="unknown"
 BRANCH="unknown"
 DIRTY=""
@@ -56,22 +117,25 @@ if REVISION="$(git -C "$ROOT" rev-parse --verify HEAD 2>/dev/null)"; then
     DIRTY="-dirty"
   fi
 fi
-SOURCE_FINGERPRINT="$(
-  {
-    find "$ROOT/cast_tab" -type f -name '*.py' -print
-    printf '%s\n' "$ROOT/pyproject.toml" "$ROOT/uv.lock"
-  } | LC_ALL=C sort | while IFS= read -r source_file; do
-    shasum -a 256 "$source_file" | awk '{print $1}'
-  done | shasum -a 256 | awk '{print $1}'
-)"
-SOURCE_FINGERPRINT="${SOURCE_FINGERPRINT:0:16}"
+SOURCE_FINGERPRINT="${SOURCE_PACKAGE_FINGERPRINT:0:16}"
 INSTALL_REVISION="$BRANCH@$REVISION$DIRTY+source.$SOURCE_FINGERPRINT"
-printf '%s\n' "$INSTALL_REVISION" > "$INSTALL_DATA_DIR/revision"
+
+# The structured receipt lets the installed CLI recompute its own package
+# fingerprint before displaying the claimed revision. Build it beside the
+# destination and rename it into place so readers never observe a partial file.
+PROVENANCE_TEMP="$(mktemp "$INSTALL_DATA_DIR/revision.XXXXXX")"
+{
+  printf 'format=1\n'
+  printf 'revision=%s\n' "$INSTALL_REVISION"
+  printf 'package_fingerprint=%s\n' "$INSTALLED_PACKAGE_FINGERPRINT"
+} > "$PROVENANCE_TEMP"
+mv -f "$PROVENANCE_TEMP" "$INSTALL_PROVENANCE_PATH"
+PROVENANCE_TEMP=""
 
 # --- Playwright fallback browser (Chromium) ---------------------------------
 # Run the tool env's own playwright so the downloaded browser matches the
 # pinned version. Browsers go to the shared ~/Library/Caches/ms-playwright.
-TOOL_PLAYWRIGHT="$(uv tool dir)/fix-casting/bin/playwright"
+TOOL_PLAYWRIGHT="$TOOL_ENV_DIR/bin/playwright"
 if [ -x "$TOOL_PLAYWRIGHT" ]; then
   "$TOOL_PLAYWRIGHT" install chromium
 else

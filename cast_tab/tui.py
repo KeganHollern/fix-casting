@@ -174,82 +174,155 @@ class CastTUI(App):
             yield Section(
                 "①  Capture — CDP screencast + AudioTee (incoming)",
                 [
-                    MetricCard("cap_fps", "Capture FPS",
-                               "Frames/s the tab is producing via CDP screencast."),
-                    MetricCard("cap_lag", "Chrome→app lag",
-                               "Frame staleness on arrival (Chrome compositor → us)."),
-                    MetricCard("cap_decode", "Decode time",
-                               "Per-frame JPEG handling time in the capture loop."),
-                    MetricCard("aud_backlog", "Audio pipe backlog",
-                               "Unread AudioTee PCM; ~0 = ffmpeg reads it in time."),
-                    MetricCard("aud_warn", "Audio warnings",
-                               "AudioTee under/overruns reported this interval.",
-                               show_spark=False),
+                    MetricCard(
+                        "cap_fps",
+                        "Capture FPS",
+                        "Frames/s the tab is producing via CDP screencast.",
+                    ),
+                    MetricCard(
+                        "cap_lag",
+                        "Chrome→app lag",
+                        "Frame staleness on arrival (Chrome compositor → us).",
+                    ),
+                    MetricCard(
+                        "cap_decode",
+                        "Decode time",
+                        "Per-frame JPEG handling time in the capture loop.",
+                    ),
+                    MetricCard(
+                        "aud_backlog",
+                        "Audio pipe backlog",
+                        "Unread AudioTee PCM; ~0 = ffmpeg reads it in time.",
+                    ),
+                    MetricCard(
+                        "aud_warn",
+                        "Audio warnings",
+                        "AudioTee under/overruns reported this interval.",
+                        show_spark=False,
+                    ),
                 ],
             )
             yield Section(
                 "②  Encode pipeline — sampler → queue → ffmpeg (internal)",
                 [
-                    MetricCard("enc_fps", "Encode FPS",
-                               "Frames/s fed into ffmpeg (target in denominator)."),
-                    MetricCard("frame_age", "Frame age",
-                               "Age of frames when sampled (publish → sample)."),
-                    MetricCard("queue", "Queue peak",
-                               "Frames buffered before ffmpeg; spikes = stall absorbed."),
-                    MetricCard("write", "stdin write",
-                               "Time blocked writing to ffmpeg; high = backpressure."),
-                    MetricCard("repeats", "Repeats / re-anchor",
-                               "Held frames (no new capture) / A/V timeline resets.",
-                               show_spark=False),
-                    MetricCard("ff_err", "ffmpeg errors",
-                               "stderr lines from ffmpeg (encoder/mux errors).",
-                               show_spark=False),
+                    MetricCard(
+                        "enc_fps", "Encode FPS", "Frames/s fed into ffmpeg (target in denominator)."
+                    ),
+                    MetricCard(
+                        "frame_age", "Frame age", "Age of frames when sampled (publish → sample)."
+                    ),
+                    MetricCard(
+                        "queue",
+                        "Queue peak",
+                        "Frames buffered before ffmpeg; spikes = stall absorbed.",
+                    ),
+                    MetricCard(
+                        "write",
+                        "stdin write",
+                        "Time blocked writing to ffmpeg; high = backpressure.",
+                    ),
+                    MetricCard(
+                        "cadence",
+                        "Cadence error",
+                        "Content-time error vs CFR ticks; peaks reveal microstutter.",
+                    ),
+                    MetricCard(
+                        "repeats",
+                        "Holds / recovered",
+                        "Repeated output frames / late ticks restored from history.",
+                        show_spark=False,
+                    ),
+                    MetricCard(
+                        "ff_err",
+                        "ffmpeg errors",
+                        "stderr lines from ffmpeg (encoder/mux errors).",
+                        show_spark=False,
+                    ),
                 ],
             )
             yield Section(
                 "③  HLS stream (outgoing)",
                 [
-                    MetricCard("hls_segs", "Segments",
-                               "Live HLS .ts segments currently on disk.",
-                               show_spark=False),
-                    MetricCard("hls_age", "Newest segment age",
-                               "Age of the latest segment; rising = falling behind."),
-                    MetricCard("hls_del", "Deleted",
-                               "Segments rotated out this interval.",
-                               show_spark=False),
+                    MetricCard(
+                        "hls_segs",
+                        "Playlist",
+                        "Active playlist entries (excludes deletion-grace files).",
+                        show_spark=False,
+                    ),
+                    MetricCard(
+                        "hls_age",
+                        "Newest segment age",
+                        "Age of the latest segment; rising = falling behind.",
+                    ),
+                    MetricCard(
+                        "hls_publish",
+                        "Publish cadence",
+                        "Wall time between completed HLS segments.",
+                    ),
+                    MetricCard(
+                        "hls_delivery",
+                        "TV delivery",
+                        "Segment GETs; latest response time and LAN throughput.",
+                    ),
+                    MetricCard(
+                        "hls_http",
+                        "HTTP health",
+                        "Active requests / errors in this interval.",
+                        show_spark=False,
+                    ),
                 ],
             )
             yield Section(
                 "④  TV / Chromecast (playback)",
                 [
-                    MetricCard("tv_state", "State",
-                               "Chromecast player state.", show_spark=False),
-                    MetricCard("tv_pos", "Position",
-                               "Reported playback position on the TV.",
-                               show_spark=False),
-                    MetricCard("tv_delta", "Advance vs wall",
-                               "Playback advance per interval; < interval = buffering."),
-                    MetricCard("tv_stall", "Micro-stalls",
-                               "Accumulated brief playback stalls.",
-                               show_spark=False),
-                    MetricCard("tv_nonplay", "Non-playing",
-                               "Polls not in PLAYING (buffering/idle).",
-                               show_spark=False),
+                    MetricCard("tv_state", "State", "Chromecast player state.", show_spark=False),
+                    MetricCard(
+                        "tv_pos",
+                        "Position",
+                        "Reported playback position on the TV.",
+                        show_spark=False,
+                    ),
+                    MetricCard(
+                        "tv_delta",
+                        "Advance vs wall",
+                        "Playback advance per interval; < interval = buffering.",
+                    ),
+                    MetricCard(
+                        "tv_stall",
+                        "Coarse stalls",
+                        "Status-position gaps over ~1s; use HLS delivery for smaller ones.",
+                        show_spark=False,
+                    ),
+                    MetricCard(
+                        "tv_nonplay",
+                        "Non-playing",
+                        "Polls not in PLAYING (buffering/idle).",
+                        show_spark=False,
+                    ),
                 ],
             )
             yield Section(
                 "⑤  A/V sync",
                 [
-                    MetricCard("drift", "Timeline guard",
-                               "CFR loss triggers a joint audio/video re-anchor; "
-                               "queue depth is not an A/V-offset measurement.",
-                               show_spark=False),
-                    MetricCard("dropped", "Timeline loss",
-                               "Video CFR ticks skipped/discarded at guarded A/V boundaries.",
-                               show_spark=False),
-                    MetricCard("restarts", "ffmpeg restarts",
-                               "Relaunches (each glitches + re-anchors sync).",
-                               show_spark=False),
+                    MetricCard(
+                        "drift",
+                        "Timeline guard",
+                        "CFR loss triggers a joint audio/video re-anchor; "
+                        "queue depth is not an A/V-offset measurement.",
+                        show_spark=False,
+                    ),
+                    MetricCard(
+                        "dropped",
+                        "Timeline loss",
+                        "Video CFR ticks skipped/discarded at guarded A/V boundaries.",
+                        show_spark=False,
+                    ),
+                    MetricCard(
+                        "restarts",
+                        "ffmpeg restarts",
+                        "Relaunches (each glitches + re-anchors sync).",
+                        show_spark=False,
+                    ),
                 ],
             )
             with Horizontal(id="knob-row"):
@@ -314,6 +387,35 @@ class CastTUI(App):
     def _lvl(warn: bool, bad: bool = False) -> str:
         return "bad" if bad else ("warn" if warn else "ok")
 
+    @staticmethod
+    def _hls_delivery_health(s: StatsSnapshot) -> tuple[bool, bool]:
+        """Return warning/error state for receiver-facing segment delivery."""
+        target_ms = max(1000.0, s.hls_target_s * 1000)
+        fetch_warn = s.hls_delivery_ms is not None and s.hls_delivery_ms > 750
+        fetch_bad = s.hls_delivery_ms is not None and s.hls_delivery_ms > 2000
+        active_warn = (
+            s.hls_delivery_active_ms is not None
+            and s.hls_delivery_active_ms > 750
+        )
+        active_bad = (
+            s.hls_delivery_active_ms is not None
+            and s.hls_delivery_active_ms > max(2000.0, target_ms)
+        )
+        receiver_expected = s.tv_state == "PLAYING" and s.hls_count > 0
+        stale_warn = (
+            receiver_expected
+            and s.hls_delivery_idle_ms is not None
+            and s.hls_delivery_idle_ms > target_ms * 1.75
+        )
+        stale_bad = (
+            receiver_expected
+            and s.hls_delivery_idle_ms is not None
+            and s.hls_delivery_idle_ms > target_ms * 3.0
+        )
+        bad = fetch_bad or active_bad or stale_bad or s.hls_delivery_errors > 0
+        warn = bad or fetch_warn or active_warn or stale_warn
+        return warn, bad
+
     def _render(self, s: StatsSnapshot) -> None:
         def card(cid: str) -> MetricCard:
             return self.query_one(f"#card-{cid}", MetricCard)
@@ -322,78 +424,169 @@ class CastTUI(App):
 
         # ① Capture
         cap_lo = s.capture_fps < s.target_fps * 0.9
-        card("cap_fps").set(f"{s.capture_fps:.1f} / {s.target_fps:.0f}", s.capture_fps,
-                            level=lvl(cap_lo, s.capture_fps < s.target_fps * 0.5))
+        card("cap_fps").set(
+            f"{s.capture_fps:.1f} / {s.target_fps:.0f}",
+            s.capture_fps,
+            level=lvl(cap_lo, s.capture_fps < s.target_fps * 0.5),
+        )
         if s.screencast_lag_count:
-            card("cap_lag").set(f"{s.screencast_lag_ms:.0f} ms  (peak {s.screencast_lag_peak_ms:.0f})",
-                                s.screencast_lag_ms,
-                                level=lvl(s.screencast_lag_ms > 150, s.screencast_lag_ms > 400))
+            card("cap_lag").set(
+                f"{s.screencast_lag_ms:.0f} ms  (peak {s.screencast_lag_peak_ms:.0f})",
+                s.screencast_lag_ms,
+                level=lvl(s.screencast_lag_ms > 150, s.screencast_lag_ms > 400),
+            )
         else:
             card("cap_lag").set("—", 0.0)
-        card("cap_decode").set(f"{s.capture_ms:.0f} ms  (peak {s.capture_peak_ms:.0f})", s.capture_ms)
+        card("cap_decode").set(
+            f"{s.capture_ms:.0f} ms  (peak {s.capture_peak_ms:.0f})", s.capture_ms
+        )
         if s.audio_backlog_ms is not None:
-            card("aud_backlog").set(f"{s.audio_backlog_ms:.0f} ms  (peak {s.audio_backlog_peak_ms:.0f})",
-                                    s.audio_backlog_ms,
-                                    level=lvl(s.audio_backlog_ms > 250, s.audio_backlog_ms > 500))
+            card("aud_backlog").set(
+                f"{s.audio_backlog_ms:.0f} ms  (peak {s.audio_backlog_peak_ms:.0f})",
+                s.audio_backlog_ms,
+                level=lvl(s.audio_backlog_ms > 250, s.audio_backlog_ms > 500),
+            )
         else:
             card("aud_backlog").set("no audio", 0.0)
         card("aud_warn").set(str(s.audio_warnings), level=lvl(s.audio_warnings > 0))
 
         # ② Encode pipeline
         enc_lo = s.encode_fps < s.target_fps * 0.9
-        card("enc_fps").set(f"{s.encode_fps:.1f} / {s.target_fps:.0f}", s.encode_fps,
-                            level=lvl(enc_lo, s.encode_fps < s.target_fps * 0.5))
-        card("frame_age").set(f"{s.frame_age_ms:.0f} ms  (peak {s.frame_age_peak_ms:.0f})", s.frame_age_ms)
-        card("queue").set(f"{s.queue_peak}", float(s.queue_peak),
-                          level=lvl(s.queue_peak >= s.target_fps, s.queue_dropped > 0))
-        card("write").set(f"{s.write_ms:.1f} ms  (peak {s.write_peak_ms:.1f})", s.write_ms,
-                          level=lvl(s.write_peak_ms > 250, s.write_peak_ms > 1000))
-        card("repeats").set(f"{s.repeats} / {s.resyncs}", level=lvl(s.resyncs > 0))
+        card("enc_fps").set(
+            f"{s.encode_fps:.1f} / {s.target_fps:.0f}",
+            s.encode_fps,
+            level=lvl(enc_lo, s.encode_fps < s.target_fps * 0.5),
+        )
+        card("frame_age").set(
+            f"{s.frame_age_ms:.0f} ms  (peak {s.frame_age_peak_ms:.0f})", s.frame_age_ms
+        )
+        card("queue").set(
+            f"{s.queue_peak}",
+            float(s.queue_peak),
+            level=lvl(s.queue_peak >= s.target_fps, s.queue_dropped > 0),
+        )
+        card("write").set(
+            f"{s.write_ms:.1f} ms  (peak {s.write_peak_ms:.1f})",
+            s.write_ms,
+            level=lvl(s.write_peak_ms > 250, s.write_peak_ms > 1000),
+        )
+        frame_period_ms = 1000.0 / s.target_fps if s.target_fps else 0.0
+        cadence_bad = s.cadence_error_peak_ms >= frame_period_ms * 0.75
+        cadence_warn = s.cadence_error_peak_ms >= frame_period_ms * 0.35
+        card("cadence").set(
+            f"{s.cadence_error_ms:.1f} ms  (peak {s.cadence_error_peak_ms:.1f})",
+            s.cadence_error_peak_ms,
+            level=lvl(cadence_warn, cadence_bad),
+        )
+        card("repeats").set(
+            f"{s.repeats} / {s.history_recoveries}",
+            level=lvl(s.repeats > 0),
+        )
         card("ff_err").set(str(s.ffmpeg_errors), level=lvl(s.ffmpeg_errors > 0))
 
         # ③ HLS
         card("hls_segs").set(str(s.hls_count))
         if s.hls_age is not None:
-            card("hls_age").set(f"{s.hls_age:.1f} s", s.hls_age, level=lvl(s.hls_age > 6, s.hls_age > 12))
+            age_warn = max(2.0, s.hls_target_s * 2.0)
+            age_bad = max(4.0, s.hls_target_s * 3.0)
+            card("hls_age").set(
+                f"{s.hls_age:.1f} s",
+                s.hls_age,
+                level=lvl(s.hls_age > age_warn, s.hls_age > age_bad),
+            )
         else:
             card("hls_age").set("—", 0.0)
-        card("hls_del").set(str(s.hls_deleted))
+        if s.hls_publish_count:
+            publish_warn_ms = s.hls_target_s * 1250
+            publish_bad_ms = s.hls_target_s * 1750
+            card("hls_publish").set(
+                f"{s.hls_publish_ms / 1000:.2f} s  (peak {s.hls_publish_peak_ms / 1000:.2f})",
+                s.hls_publish_peak_ms,
+                level=lvl(
+                    s.hls_publish_peak_ms > publish_warn_ms,
+                    s.hls_publish_peak_ms > publish_bad_ms,
+                ),
+            )
+        else:
+            card("hls_publish").set("—", 0.0)
+        delivery_text = f"{s.hls_segment_requests} req"
+        if s.hls_delivery_ms is not None:
+            delivery_text += f"  {s.hls_delivery_ms:.0f} ms"
+        if s.hls_delivery_mbps is not None:
+            delivery_text += f"  {s.hls_delivery_mbps:.0f} Mb/s"
+        if s.hls_delivery_active:
+            delivery_text += f"  {s.hls_delivery_active} active"
+            if s.hls_delivery_active_ms is not None:
+                delivery_text += f" {s.hls_delivery_active_ms:.0f} ms"
+        elif s.hls_delivery_idle_ms is not None:
+            idle_label = "idle" if s.hls_delivery_seen else "waiting"
+            delivery_text += f"  {idle_label} {s.hls_delivery_idle_ms / 1000:.1f} s"
+        delivery_warn, delivery_bad = self._hls_delivery_health(s)
+        card("hls_delivery").set(
+            delivery_text,
+            max(
+                s.hls_delivery_ms or 0.0,
+                s.hls_delivery_active_ms or 0.0,
+                s.hls_delivery_idle_ms or 0.0,
+            ),
+            level=lvl(delivery_warn, delivery_bad),
+        )
+        card("hls_http").set(
+            f"{s.hls_delivery_active} / {s.hls_delivery_errors}",
+            level=lvl(delivery_warn, delivery_bad),
+        )
 
         # ④ TV
         tv_bad = s.tv_state not in ("PLAYING", "unknown")
         card("tv_state").set(s.tv_state, level=lvl(False, tv_bad))
         card("tv_pos").set("—" if s.tv_pos is None else f"{s.tv_pos:.0f} s")
         if s.pos_delta is not None:
-            card("tv_delta").set(f"+{s.pos_delta:.0f}s / {s.interval_s:.0f}s", s.pos_delta,
-                                 level=lvl(s.pos_delta + 1.0 < s.interval_s,
-                                           s.pos_delta + 2.0 < s.interval_s))
+            card("tv_delta").set(
+                f"+{s.pos_delta:.0f}s / {s.interval_s:.0f}s",
+                s.pos_delta,
+                level=lvl(s.pos_delta + 1.0 < s.interval_s, s.pos_delta + 2.0 < s.interval_s),
+            )
         else:
             card("tv_delta").set("—", 0.0)
         card("tv_stall").set(f"~{s.stall_accum:.0f} s", level=lvl(s.stall_accum >= 2.0))
-        card("tv_nonplay").set(f"{s.tv_non_playing} / {s.tv_polls}",
-                               level=lvl(s.tv_non_playing > 0))
+        card("tv_nonplay").set(
+            f"{s.tv_non_playing} / {s.tv_polls}", level=lvl(s.tv_non_playing > 0)
+        )
 
         # ⑤ Sync
-        timeline_state = (
-            "intact" if s.resyncs_total == 0 else f"re-anchored ×{s.resyncs_total}"
-        )
+        timeline_state = "intact" if s.resyncs_total == 0 else f"re-anchored ×{s.resyncs_total}"
         card("drift").set(timeline_state, level=lvl(s.resyncs > 0))
         card("dropped").set(str(s.dropped_total), level=lvl(s.dropped_total > 0))
         card("restarts").set(str(s.restarts_total), level=lvl(s.restarts_total > 0))
 
-        self._render_status_bar(s, cap_lo, enc_lo)
+        self._render_status_bar(s, cap_lo, enc_lo or cadence_warn)
 
     def _render_status_bar(self, s: StatsSnapshot, cap_lo: bool, enc_lo: bool) -> None:
         """One-line at-a-glance health summary with colored dots per segment."""
+
         def dot(label: str, bad: bool, warn: bool = False) -> str:
             color = "red" if bad else ("yellow" if warn else "green")
             return f"[{color}]●[/] {label}"
 
         tv_ok = s.tv_state in ("PLAYING", "unknown")
+        delivery_warn, delivery_bad = self._hls_delivery_health(s)
+        hls_production_warn = (
+            (s.hls_age or 0) > max(2.0, s.hls_target_s * 2.0)
+            or (s.hls_publish_count > 0 and s.hls_publish_peak_ms > s.hls_target_s * 1250)
+        )
+        hls_production_bad = (
+            (s.hls_age or 0) > max(4.0, s.hls_target_s * 3.0)
+            or (
+                s.hls_publish_count > 0
+                and s.hls_publish_peak_ms > s.hls_target_s * 1750
+            )
+        )
+        hls_warn = hls_production_warn or delivery_warn
+        hls_bad = hls_production_bad or delivery_bad
         parts = [
             dot(f"capture {s.capture_fps:.0f}fps", False, cap_lo),
             dot(f"encode {s.encode_fps:.0f}fps", False, enc_lo),
-            dot(f"hls {s.hls_count}seg", False, (s.hls_age or 0) > 6),
+            dot(f"hls {s.hls_count}seg", hls_bad, hls_warn),
             dot(f"tv {s.tv_state.lower()}", not tv_ok, s.stall_accum >= 2.0),
             dot(
                 "sync guarded" if s.resyncs_total == 0 else f"sync reset ×{s.resyncs_total}",
@@ -440,7 +633,10 @@ class CastTUI(App):
 
     # --- audio-offset knob ------------------------------------------------
     _OFFSET_STEP_BY_ID = {
-        "off_m100": -100, "off_m10": -10, "off_p10": +10, "off_p100": +100,
+        "off_m100": -100,
+        "off_m10": -10,
+        "off_p10": +10,
+        "off_p100": +100,
     }
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -476,9 +672,7 @@ class CastTUI(App):
         target = self._offset_pending
         self._applying = True
         self._refresh_knob()
-        self.run_worker(
-            lambda: self._do_apply(target), thread=True, exclusive=True
-        )
+        self.run_worker(lambda: self._do_apply(target), thread=True, exclusive=True)
 
     def _do_apply(self, target: int) -> None:
         applied = self._streamer.set_audio_offset_ms(target)
@@ -491,14 +685,16 @@ class CastTUI(App):
 
     def _refresh_knob(self) -> None:
         pending = (
-            "" if self._offset_pending == self._offset_applied
+            ""
+            if self._offset_pending == self._offset_applied
             else f"  →  {self._offset_pending} ms"
         )
         self.query_one("#knob-value", Label).update(
             f"🎚  Audio offset: {self._offset_applied} ms{pending}"
         )
         status = (
-            "applying… (brief glitch)" if self._applying
+            "applying… (brief glitch)"
+            if self._applying
             else "keys: [ ] { } offset   r reset   space pause   , . vol   m mute"
         )
         self.query_one("#knob-status", Label).update(status)

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import math
 import signal
 import sys
@@ -26,6 +28,60 @@ from cast_tab.streamer import (
 
 MAX_VIDEO_BITRATE_MBPS = 1_000.0
 MAX_ABS_AUDIO_DRIFT_PPM = 100_000.0
+INSTALL_RECEIPT_FORMAT = "1"
+
+
+def _package_fingerprint(package_dir: Path) -> str:
+    """Hash the relative paths and contents of an installed/source package tree."""
+    source_files = sorted(
+        (path for path in package_dir.rglob("*.py") if path.is_file()),
+        key=lambda path: path.relative_to(package_dir).as_posix(),
+    )
+    if not source_files:
+        raise ValueError(f"no Python sources found under {package_dir}")
+
+    digest = hashlib.sha256()
+    for source_file in source_files:
+        relative_path = source_file.relative_to(package_dir).as_posix().encode("utf-8")
+        digest.update(len(relative_path).to_bytes(4, "big"))
+        digest.update(relative_path)
+        digest.update(hashlib.sha256(source_file.read_bytes()).digest())
+    return digest.hexdigest()
+
+
+def _verified_install_provenance(package_dir: Path) -> str:
+    """Return receipt provenance only when it describes this package tree."""
+    try:
+        receipt_lines = INSTALL_PROVENANCE_PATH.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return "revision unknown"
+
+    fields: dict[str, str] = {}
+    for line in receipt_lines:
+        key, separator, value = line.partition("=")
+        if not separator or not key or key in fields:
+            return "revision unknown (unverified install receipt)"
+        fields[key] = value
+
+    revision = fields.get("revision", "")
+    expected_fingerprint = fields.get("package_fingerprint", "")
+    if (
+        fields.get("format") != INSTALL_RECEIPT_FORMAT
+        or not revision
+        or len(expected_fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in expected_fingerprint)
+    ):
+        return "revision unknown (unverified install receipt)"
+    if not revision.endswith(f"+source.{expected_fingerprint[:16]}"):
+        return "revision unknown (install receipt is internally inconsistent)"
+
+    try:
+        actual_fingerprint = _package_fingerprint(package_dir)
+    except (OSError, UnicodeError, ValueError):
+        return "revision unknown (could not verify installed source)"
+    if not hmac.compare_digest(actual_fingerprint, expected_fingerprint):
+        return "revision unknown (installed source does not match receipt)"
+    return revision
 
 
 def _positive_int(value: str) -> int:
@@ -101,16 +157,11 @@ def _version_text() -> str:
 
     # An editable install executes this checkout directly. Never label it with
     # a stale installation receipt from an earlier snapshot.
-    package_root = Path(__file__).resolve().parents[1]
-    if (package_root / ".git").exists():
+    package_dir = Path(__file__).resolve().parent
+    if (package_dir.parent / ".git").exists():
         provenance = "development checkout (editable/source import)"
     else:
-        try:
-            provenance = INSTALL_PROVENANCE_PATH.read_text(encoding="utf-8").strip()
-        except OSError:
-            provenance = "revision unknown"
-        if not provenance:
-            provenance = "revision unknown"
+        provenance = _verified_install_provenance(package_dir)
     try:
         audiotee_hash = AUDIOTEE_PROVENANCE_PATH.read_text(encoding="utf-8").strip()
     except OSError:

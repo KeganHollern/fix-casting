@@ -12,6 +12,7 @@ from cast_tab.encoder import (
     estimated_hls_holdback_s,
     hls_args,
     hls_playlist_retention_s,
+    hls_segment_duration_s,
     target_bitrate,
     video_encoder_args,
 )
@@ -63,11 +64,15 @@ def test_target_bitrate_resolution_tiers():
 def test_target_bitrate_override_ratios():
     # Buffered: roomy VBV (1.2x maxrate, 2.4x bufsize).
     assert target_bitrate(1920, 1080, buffered=True, override_mbps=10) == (
-        "10M", "12M", "24M",
+        "10M",
+        "12M",
+        "24M",
     )
     # Unbuffered: tight VBV (1.1x both).
     assert target_bitrate(1920, 1080, buffered=False, override_mbps=10) == (
-        "10M", "11M", "11M",
+        "10M",
+        "11M",
+        "11M",
     )
 
 
@@ -92,6 +97,7 @@ def test_hls_args_retention_and_estimated_holdback_are_consistent():
         args = hls_args(buffered=buffered)
         hls_time = int(args[args.index("-hls_time") + 1])
         list_size = int(args[args.index("-hls_list_size") + 1])
+        assert hls_segment_duration_s(buffered=buffered) == hls_time
         assert hls_playlist_retention_s(buffered=buffered) == hls_time * list_size
         assert estimated_hls_holdback_s(buffered=buffered) == hls_time * 3
         assert list_size >= 3

@@ -10,7 +10,9 @@ from cast_tab.browser import TabScreencaster
 
 
 def _screencaster() -> TabScreencaster:
-    return TabScreencaster("https://example.test", on_frame=lambda _frame: None)
+    return TabScreencaster(
+        "https://example.test", on_frame=lambda _frame, _captured_at: None
+    )
 
 
 def _mark_ready(screencaster: TabScreencaster) -> None:
@@ -130,7 +132,7 @@ def test_audio_capture_installs_and_resumes_inaudible_keepalive() -> None:
     screencaster = TabScreencaster(
         "https://example.test",
         capture_audio=True,
-        on_frame=lambda _frame: None,
+        on_frame=lambda _frame, _captured_at: None,
     )
     try:
         screencaster._install_audio_keepalive(Context())
@@ -163,3 +165,21 @@ def test_video_only_capture_does_not_touch_web_audio() -> None:
         screencaster._ensure_audio_keepalive(target)
     finally:
         shutil.rmtree(screencaster.user_data_dir, ignore_errors=True)
+
+
+def test_chrome_capture_timestamp_is_translated_to_monotonic_clock() -> None:
+    captured_at, lag = TabScreencaster._capture_monotonic_time(
+        999.975,
+        wall_now=1000.0,
+        monotonic_now=50.0,
+    )
+    assert lag == pytest.approx(0.025)
+    assert captured_at == pytest.approx(49.975)
+
+    fallback, invalid_lag = TabScreencaster._capture_monotonic_time(
+        900.0,
+        wall_now=1000.0,
+        monotonic_now=50.0,
+    )
+    assert fallback == 50.0
+    assert invalid_lag is None

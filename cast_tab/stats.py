@@ -60,6 +60,11 @@ class StatsSnapshot:
     queue_dropped: int
     queue_residence_ms: float
     repeats: int
+    history_recoveries: int
+    cadence_error_ms: float
+    cadence_error_peak_ms: float
+    sampler_late_ms: float
+    sampler_late_peak_ms: float
     resyncs: int
     resyncs_total: int
     resync_last_reason: str | None
@@ -73,6 +78,18 @@ class StatsSnapshot:
     hls_count: int
     hls_age: float | None
     hls_deleted: int
+    hls_target_s: float
+    hls_publish_ms: float
+    hls_publish_peak_ms: float
+    hls_publish_count: int
+    hls_segment_requests: int
+    hls_delivery_ms: float | None
+    hls_delivery_mbps: float | None
+    hls_delivery_active: int
+    hls_delivery_active_ms: float | None
+    hls_delivery_idle_ms: float | None
+    hls_delivery_seen: bool
+    hls_delivery_errors: int
     # --- TV / Chromecast (playback) ---
     tv_state: str
     tv_pos: float | None
@@ -100,9 +117,9 @@ class PipelineStats:
     _capture: _Window = field(default_factory=_Window, repr=False)
     _capture_behind: int = 0
     _capture_errors: int = 0
-    # How stale each frame is when it reaches us: time.time() - the Chrome
-    # capture timestamp on the screencast frame. This is the suspected home of
-    # the audio-ahead skew (video arriving from Chrome already seconds old).
+    # How stale each frame is when it reaches us: time.time() - Chrome's
+    # capture timestamp. Source timestamps also let the sampler preserve the
+    # original cadence when callback delivery or its own wake-up is bursty.
     _screencast_lag: _Window = field(default_factory=_Window, repr=False)
     # Bytes sitting unread in the audio pipe (ffmpeg's read backlog), in ms of
     # audio. Stays ~0 if ffmpeg keeps up; grows if audio is being delayed.
@@ -121,6 +138,9 @@ class PipelineStats:
     _frame_age: _Window = field(default_factory=_Window, repr=False)
     _encode: _Window = field(default_factory=_Window, repr=False)
     _encode_repeats: int = 0
+    _history_recoveries: int = 0
+    _cadence_error: _Window = field(default_factory=_Window, repr=False)
+    _sampler_late: _Window = field(default_factory=_Window, repr=False)
     _encode_resyncs: int = 0
     _encode_resyncs_total: int = 0
     _encode_last_resync: str | None = None
@@ -147,6 +167,16 @@ class PipelineStats:
     _hls_segment_age_s: float | None = None
     _hls_segment_count: int = 0
     _hls_segments_deleted: int = 0
+    _hls_target_s: float = 0.0
+    _hls_publish_interval: _Window = field(default_factory=_Window, repr=False)
+    _hls_segment_requests: int = 0
+    _hls_delivery_s: float | None = None
+    _hls_delivery_mbps: float | None = None
+    _hls_delivery_active: int = 0
+    _hls_delivery_active_s: float | None = None
+    _hls_delivery_idle_s: float | None = None
+    _hls_delivery_seen: bool = False
+    _hls_delivery_errors: int = 0
     _tv_state: str | None = None
     _tv_position_s: float | None = None
     _tv_idle_reason: str | None = None
@@ -205,6 +235,27 @@ class PipelineStats:
         """A tick re-sent the last frame because capture produced nothing new."""
         with self._lock:
             self._encode_repeats += 1
+
+    def record_sampler_cadence(
+        self,
+        *,
+        source_interval_s: float | None,
+        tick_late_s: float,
+        recovered_from_history: bool = False,
+    ) -> None:
+        """Record temporal sampling quality independently of output CFR.
+
+        FFmpeg gives every accepted frame an even output timestamp. This metric
+        checks whether the *captured content* selected for those ticks also
+        advanced evenly; a repeat at 30 fps is therefore a 33 ms cadence error.
+        """
+        with self._lock:
+            if source_interval_s is not None:
+                target_period = 1.0 / self.target_fps if self.target_fps else 0.0
+                self._cadence_error.add(abs(source_interval_s - target_period))
+            self._sampler_late.add(max(0.0, tick_late_s))
+            if recovered_from_history:
+                self._history_recoveries += 1
 
     def record_encode_resync(self, reason: str, *, lost_frames: int = 0) -> None:
         """A CFR break requested a fresh, jointly anchored ffmpeg generation."""
@@ -299,11 +350,38 @@ class PipelineStats:
         segment_count: int,
         newest_age_s: float | None,
         segments_deleted: int = 0,
+        target_duration_s: float = 0.0,
+        publish_intervals_s: tuple[float, ...] = (),
+        segment_requests: int = 0,
+        delivery_s: float | None = None,
+        delivery_mbps: float | None = None,
+        delivery_active: int = 0,
+        delivery_active_s: float | None = None,
+        delivery_idle_s: float | None = None,
+        delivery_seen: bool | None = None,
+        delivery_errors: int = 0,
     ) -> None:
         with self._lock:
             self._hls_segment_count = segment_count
             self._hls_segment_age_s = newest_age_s
             self._hls_segments_deleted += segments_deleted
+            self._hls_target_s = max(0.0, target_duration_s)
+            for interval in publish_intervals_s:
+                if interval >= 0:
+                    self._hls_publish_interval.add(interval)
+            self._hls_segment_requests += max(0, segment_requests)
+            self._hls_delivery_s = delivery_s
+            self._hls_delivery_mbps = delivery_mbps
+            self._hls_delivery_active = max(0, delivery_active)
+            self._hls_delivery_active_s = (
+                max(0.0, delivery_active_s) if delivery_active_s is not None else None
+            )
+            self._hls_delivery_idle_s = (
+                max(0.0, delivery_idle_s) if delivery_idle_s is not None else None
+            )
+            if delivery_seen is not None:
+                self._hls_delivery_seen = delivery_seen
+            self._hls_delivery_errors += max(0, delivery_errors)
 
     def record_tv_poll(
         self,
@@ -390,6 +468,11 @@ class PipelineStats:
                 queue_dropped=self._queue_dropped,
                 queue_residence_ms=queue_residence_ms,
                 repeats=self._encode_repeats,
+                history_recoveries=self._history_recoveries,
+                cadence_error_ms=self._cadence_error.avg() * 1000,
+                cadence_error_peak_ms=self._cadence_error.peak * 1000,
+                sampler_late_ms=self._sampler_late.avg() * 1000,
+                sampler_late_peak_ms=self._sampler_late.peak * 1000,
                 resyncs=self._encode_resyncs,
                 resyncs_total=self._encode_resyncs_total,
                 resync_last_reason=self._encode_last_resync,
@@ -401,6 +484,28 @@ class PipelineStats:
                 hls_count=self._hls_segment_count,
                 hls_age=self._hls_segment_age_s,
                 hls_deleted=self._hls_segments_deleted,
+                hls_target_s=self._hls_target_s,
+                hls_publish_ms=self._hls_publish_interval.avg() * 1000,
+                hls_publish_peak_ms=self._hls_publish_interval.peak * 1000,
+                hls_publish_count=self._hls_publish_interval.count,
+                hls_segment_requests=self._hls_segment_requests,
+                hls_delivery_ms=(
+                    self._hls_delivery_s * 1000 if self._hls_delivery_s is not None else None
+                ),
+                hls_delivery_mbps=self._hls_delivery_mbps,
+                hls_delivery_active=self._hls_delivery_active,
+                hls_delivery_active_ms=(
+                    self._hls_delivery_active_s * 1000
+                    if self._hls_delivery_active_s is not None
+                    else None
+                ),
+                hls_delivery_idle_ms=(
+                    self._hls_delivery_idle_s * 1000
+                    if self._hls_delivery_idle_s is not None
+                    else None
+                ),
+                hls_delivery_seen=self._hls_delivery_seen,
+                hls_delivery_errors=self._hls_delivery_errors,
                 tv_state=self._tv_state or "unknown",
                 tv_pos=tv_pos,
                 tv_idle=self._tv_idle_reason,
@@ -419,6 +524,9 @@ class PipelineStats:
             self._frame_age.reset()
             self._encode.reset()
             self._encode_repeats = 0
+            self._history_recoveries = 0
+            self._cadence_error.reset()
+            self._sampler_late.reset()
             self._encode_resyncs = 0
             self._encode_last_resync = None
             self._encode_write.reset()
@@ -430,6 +538,9 @@ class PipelineStats:
             self._ffmpeg_errors = 0
             self._audio_warnings = 0
             self._hls_segments_deleted = 0
+            self._hls_publish_interval.reset()
+            self._hls_segment_requests = 0
+            self._hls_delivery_errors = 0
             self._tv_polls = 0
             self._tv_non_playing_polls = 0
             self._tv_non_playing_states.clear()
@@ -462,7 +573,19 @@ class PipelineStats:
                 f"stdin write avg {s.write_ms:.1f}ms peak {s.write_peak_ms:.1f}ms"
                 + (f", queue peak {s.queue_peak}" if s.queue_peak else "")
                 + (f", timeline loss {s.queue_dropped}" if s.queue_dropped else "")
-                + (f", repeats {s.repeats}" if s.repeats else "")
+                + (f", held frames {s.repeats}" if s.repeats else "")
+                + (f", history recoveries {s.history_recoveries}" if s.history_recoveries else "")
+                + (
+                    f", cadence error avg {s.cadence_error_ms:.1f}ms "
+                    f"peak {s.cadence_error_peak_ms:.1f}ms"
+                    if s.cadence_error_peak_ms
+                    else ""
+                )
+                + (
+                    f", sampler wake peak {s.sampler_late_peak_ms:.1f}ms late"
+                    if s.sampler_late_peak_ms >= 1.0
+                    else ""
+                )
                 + (f", A/V re-anchors {s.resyncs}" if s.resyncs else "")
                 + (
                     f' (last: "{s.resync_last_reason}")'
@@ -479,9 +602,31 @@ class PipelineStats:
                 err_line += f' (last: "{s.ffmpeg_last_error}")'
             lines.append(err_line)
 
-        hls_line = f"hls     {s.hls_count} segments"
+        hls_line = f"hls     {s.hls_count} active playlist segments"
         if s.hls_age is not None:
             hls_line += f", newest segment {s.hls_age:.1f}s old"
+        if s.hls_publish_count:
+            hls_line += (
+                f", publish avg {s.hls_publish_ms / 1000:.2f}s "
+                f"peak {s.hls_publish_peak_ms / 1000:.2f}s"
+            )
+        if s.hls_segment_requests:
+            hls_line += f", TV requested {s.hls_segment_requests} segments"
+        if s.hls_delivery_ms is not None:
+            hls_line += f", latest fetch {s.hls_delivery_ms:.0f}ms"
+        if s.hls_delivery_mbps is not None:
+            hls_line += f" at {s.hls_delivery_mbps:.1f}Mbps"
+        if s.hls_delivery_active:
+            hls_line += f", {s.hls_delivery_active} segment fetches active"
+            if s.hls_delivery_active_ms is not None:
+                hls_line += f" for {s.hls_delivery_active_ms:.0f}ms"
+        elif s.hls_delivery_idle_ms is not None:
+            if s.hls_delivery_seen:
+                hls_line += f", last segment fetch {s.hls_delivery_idle_ms / 1000:.1f}s ago"
+            else:
+                hls_line += f", no segment fetch in {s.hls_delivery_idle_ms / 1000:.1f}s"
+        if s.hls_delivery_errors:
+            hls_line += f", {s.hls_delivery_errors} HTTP errors"
         if s.hls_deleted:
             hls_line += f", deleted {s.hls_deleted}"
         lines.append(hls_line)
