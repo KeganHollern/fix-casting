@@ -8,7 +8,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import pychromecast
-from pychromecast import Chromecast
+from pychromecast import IDLE_APP_ID, Chromecast
+from pychromecast.error import PyChromecastError
+from pychromecast.response_handler import WaitResponse
 
 from cast_tab.devices import CastDevice
 
@@ -33,6 +35,20 @@ BUFFERING_TIMEOUT_S = 30.0
 # poll time to finish, but never let a wedged receiver hang shutdown forever.
 WATCHDOG_JOIN_TIMEOUT_S = 2.0
 
+# How long to require the receiver to return to the home screen after quit_app.
+# Sending LOAD into an app that ignored the reset recreates the swallowed-LOAD
+# failure, so a reset that cannot be confirmed is an error, not best-effort.
+RECEIVER_RESET_TIMEOUT_S = 8.0
+RECEIVER_RESET_POLL_S = 0.25
+RECEIVER_RELAUNCH_DELAY_S = 0.5
+MEDIA_LOAD_TIMEOUT_S = 30.0
+PLAYBACK_VERIFY_TIMEOUT_S = 20.0
+RECEIVER_CLEANUP_TIMEOUT_S = 1.0
+
+
+class _CastingCancelled(Exception):
+    """A receiver operation lost ownership because the caster stopped."""
+
 
 class TabCaster:
     """Load an HLS mirror stream on the default media receiver."""
@@ -52,11 +68,17 @@ class TabCaster:
         self._monotonic = time.monotonic
         self.reconnects = 0
         self._watchdog_stop = threading.Event()
+        self._receiver_wait = self._watchdog_stop.wait
         self._watchdog_thread: threading.Thread | None = None
+        self._lifecycle_lock = threading.RLock()
+        self._stopped = False
 
     def connect(self) -> None:
         print(f"Connecting to {self.device.name}...")
-        self._chromecast = pychromecast.get_chromecast_from_host(
+        with self._lifecycle_lock:
+            if self._stopped:
+                raise RuntimeError("Chromecast session has already stopped.")
+        chromecast = pychromecast.get_chromecast_from_host(
             (
                 self.device.host,
                 self.device.port,
@@ -66,35 +88,160 @@ class TabCaster:
             ),
             timeout=10,
         )
-        self._chromecast.wait()
+        with self._lifecycle_lock:
+            if self._stopped:
+                should_disconnect = True
+            else:
+                self._chromecast = chromecast
+                should_disconnect = False
+        if should_disconnect:
+            chromecast.disconnect()
+            raise RuntimeError("Chromecast session stopped while connecting.")
+        try:
+            chromecast.wait()
+        except BaseException:
+            with self._lifecycle_lock:
+                if self._chromecast is chromecast:
+                    self._chromecast = None
+            try:
+                chromecast.disconnect()
+            except Exception:
+                pass
+            raise
+        with self._lifecycle_lock:
+            if self._stopped or self._chromecast is not chromecast:
+                raise RuntimeError("Chromecast session stopped while connecting.")
+
+    def _is_current_receiver(self, chromecast: Chromecast) -> bool:
+        with self._lifecycle_lock:
+            return not self._stopped and self._chromecast is chromecast
+
+    def _require_current_receiver(self, chromecast: Chromecast) -> None:
+        if not self._is_current_receiver(chromecast):
+            raise _CastingCancelled("Chromecast session stopped.")
 
     def play_hls(self, playlist_url: str, *, announce: bool = True) -> None:
-        if self._chromecast is None:
-            raise RuntimeError("Not connected to a Chromecast device.")
+        # Local snapshot: stop() nulls self._chromecast from another thread;
+        # a local keeps the object alive so we never deref None mid-call.
+        with self._lifecycle_lock:
+            chromecast = self._chromecast
+            if self._stopped or chromecast is None:
+                raise RuntimeError("Not connected to a Chromecast device.")
+            self._playlist_url = playlist_url
+        # A receiver app left over from an earlier cast (crashed sender, dead
+        # media session) can silently swallow the LOAD, leaving no new media
+        # session and never fetching the playlist. Seen on a Sony
+        # BRAVIA; the state survives standby and clean disconnects, and only
+        # quitting the app clears it. Always hand the LOAD a fresh receiver.
+        if self._receiver_app_running(chromecast):
+            self._reset_receiver(
+                chromecast, "a receiver app is already running", announce=announce
+            )
+        try:
+            self._load_media(chromecast, playlist_url, announce=announce)
+            self._verify_playback(chromecast, playlist_url, announce=announce)
+        except _CastingCancelled:
+            raise
+        except (RuntimeError, PyChromecastError):
+            # The wedge can also pre-exist without a visible resident app.
+            # One full receiver reset + reload recovers it; a second failure
+            # is a real error and propagates.
+            self._require_current_receiver(chromecast)
+            self._reset_receiver(
+                chromecast, "the Chromecast did not start playback", announce=announce
+            )
+            self._load_media(chromecast, playlist_url, announce=announce)
+            self._verify_playback(chromecast, playlist_url, announce=announce)
 
-        self._playlist_url = playlist_url
-        mc = self._chromecast.media_controller
+    def _load_media(
+        self,
+        chromecast: Chromecast,
+        playlist_url: str,
+        *,
+        announce: bool,
+    ) -> None:
+        self._require_current_receiver(chromecast)
+        mc = chromecast.media_controller
         if announce:
             print(f"Casting tab mirror stream: {playlist_url}")
-        mc.play_media(
-            playlist_url,
-            "application/vnd.apple.mpegurl",
-            stream_type="LIVE",
-            title="Cast Tab",
-            autoplay=True,
-        )
-        mc.block_until_active(timeout=30)
-        self._verify_playback(announce=announce)
+        response = WaitResponse(MEDIA_LOAD_TIMEOUT_S, "load cast stream")
+        # The lifecycle lock covers only the command send, not the response
+        # wait. This gives LOAD and stop() a total order without making an
+        # unresponsive TV block shutdown for the full media timeout.
+        with self._lifecycle_lock:
+            if self._stopped or self._chromecast is not chromecast:
+                raise _CastingCancelled("Chromecast session stopped.")
+            mc.play_media(
+                playlist_url,
+                "application/vnd.apple.mpegurl",
+                stream_type="LIVE",
+                title="Cast Tab",
+                autoplay=True,
+                callback_function=response.callback,
+            )
+        response.wait_response()
+        self._require_current_receiver(chromecast)
+        response_type = (response.response or {}).get("type")
+        # WaitResponse only proves that a correlated reply arrived; it treats
+        # INVALID_REQUEST and even an empty response as a successful send.
+        # MEDIA_STATUS is the sole successful LOAD reply from this receiver.
+        if response_type != "MEDIA_STATUS":
+            reply = response_type or "EMPTY_RESPONSE"
+            raise RuntimeError(f"Chromecast rejected the media LOAD request ({reply}).")
 
-    def _verify_playback(self, *, announce: bool = True) -> None:
-        if self._chromecast is None:
-            return
+    @staticmethod
+    def _receiver_app_running(chromecast: Chromecast) -> bool:
+        app_id = chromecast.app_id
+        return app_id is not None and app_id != IDLE_APP_ID
 
-        mc = self._chromecast.media_controller
-        for _ in range(20):
+    def _reset_receiver(
+        self, chromecast: Chromecast, reason: str, *, announce: bool
+    ) -> None:
+        """Quit the resident receiver app and require a clean home screen."""
+        self._require_current_receiver(chromecast)
+        if announce:
+            print(f"Resetting TV receiver app ({reason})...")
+        try:
+            chromecast.quit_app(timeout=RECEIVER_RESET_TIMEOUT_S)
+        except Exception as exc:
+            self._require_current_receiver(chromecast)
+            raise RuntimeError("Chromecast receiver app could not be reset.") from exc
+        self._require_current_receiver(chromecast)
+        deadline = self._monotonic() + RECEIVER_RESET_TIMEOUT_S
+        while self._receiver_app_running(chromecast):
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                raise RuntimeError("Chromecast receiver app did not exit.")
+            if self._receiver_wait(min(RECEIVER_RESET_POLL_S, remaining)):
+                raise _CastingCancelled("Chromecast session stopped.")
+            self._require_current_receiver(chromecast)
+        # The receiver needs a beat between quitting and relaunching; loading
+        # immediately after the app disappears can lose the LOAD again.
+        if self._receiver_wait(RECEIVER_RELAUNCH_DELAY_S):
+            raise _CastingCancelled("Chromecast session stopped.")
+        self._require_current_receiver(chromecast)
+
+    def _verify_playback(
+        self,
+        chromecast: Chromecast,
+        playlist_url: str,
+        *,
+        announce: bool = True,
+    ) -> None:
+        """Require a live media session for this exact playlist URL."""
+        mc = chromecast.media_controller
+        deadline = self._monotonic() + PLAYBACK_VERIFY_TIMEOUT_S
+        status = None
+        while self._monotonic() < deadline:
+            self._require_current_receiver(chromecast)
             mc.update_status()
             status = mc.status
-            if status and status.player_state == "PLAYING":
+            if (
+                status
+                and status.player_state == "PLAYING"
+                and getattr(status, "content_id", None) == playlist_url
+                and getattr(status, "media_session_id", None) is not None
+            ):
                 if announce:
                     print("Chromecast is playing.")
                 return
@@ -102,7 +249,9 @@ class TabCaster:
                 raise RuntimeError(
                     "Chromecast rejected the stream. The TV may show the idle backdrop."
                 )
-            time.sleep(1)
+            remaining = deadline - self._monotonic()
+            if remaining > 0 and self._receiver_wait(min(1.0, remaining)):
+                raise _CastingCancelled("Chromecast session stopped.")
 
         state = status.player_state if status else "UNKNOWN"
         idle = status.idle_reason if status else None
@@ -234,10 +383,6 @@ class TabCaster:
         The grace period keeps startup buffering from counting as idle.
         """
 
-        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
-            raise RuntimeError("TV watchdog is already running.")
-        self._watchdog_stop.clear()
-
         def run() -> None:
             if self._watchdog_stop.wait(grace_s):
                 return
@@ -250,10 +395,15 @@ class TabCaster:
                 if self._watchdog_stop.wait(interval_s):
                     return
 
-        self._watchdog_thread = threading.Thread(
-            target=run, name="tv-watchdog", daemon=True
-        )
-        self._watchdog_thread.start()
+        watchdog = threading.Thread(target=run, name="tv-watchdog", daemon=True)
+        with self._lifecycle_lock:
+            if self._stopped:
+                raise RuntimeError("Cannot start TV watchdog after caster stop.")
+            if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
+                raise RuntimeError("TV watchdog is already running.")
+            self._watchdog_stop.clear()
+            self._watchdog_thread = watchdog
+            watchdog.start()
 
     def poll_playback_stats(self) -> TvPlaybackSnapshot:
         chromecast = self._chromecast
@@ -274,12 +424,23 @@ class TabCaster:
         )
 
     def stop(self) -> None:
-        self._watchdog_stop.set()
-        chromecast = self._chromecast
-        self._chromecast = None
+        with self._lifecycle_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            self._watchdog_stop.set()
+            chromecast = self._chromecast
+            self._chromecast = None
         if chromecast is not None:
             try:
-                chromecast.media_controller.stop()
+                chromecast.media_controller.stop(timeout=RECEIVER_CLEANUP_TIMEOUT_S)
+            except Exception:
+                pass
+            # Leave the TV on its home screen rather than parked in the media
+            # receiver: a resident app with a dead session is exactly the
+            # state that swallows the next cast's LOAD (see play_hls).
+            try:
+                chromecast.quit_app(timeout=RECEIVER_CLEANUP_TIMEOUT_S)
             except Exception:
                 pass
             try:
