@@ -20,5 +20,4 @@ def user_data_dir() -> Path:
 
 INSTALL_DATA_DIR = user_data_dir()
 AUDIOTEE_INSTALL_PATH = INSTALL_DATA_DIR / "bin" / "audiotee"
-AUDIOTEE_PROVENANCE_PATH = INSTALL_DATA_DIR / "audiotee.sha256"
 INSTALL_PROVENANCE_PATH = INSTALL_DATA_DIR / "revision"

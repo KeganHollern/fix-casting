@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import base64
+import os
 import shutil
+import signal
+import subprocess
 import tempfile
 import threading
 import time
@@ -67,6 +70,12 @@ _AUDIO_KEEPALIVE_RESUME_SCRIPT = r"""
 }
 """
 
+BROWSER_LAUNCH_TIMEOUT_MS = 15_000
+BROWSER_NAVIGATION_TIMEOUT_MS = 30_000
+BROWSER_STOP_JOIN_S = 10.0
+BROWSER_TERMINATION_GRACE_S = 2.0
+BROWSER_POST_TERMINATE_JOIN_S = 3.0
+
 
 class TabScreencaster:
     """Mirror a browser tab by capturing frames at a steady pace."""
@@ -94,6 +103,9 @@ class TabScreencaster:
         self.fps = fps
         self.jpeg_quality = jpeg_quality
         self._on_frame = on_frame
+        self._frame_state_lock = threading.Lock()
+        self._latest_frame: tuple[bytes, float | None] | None = None
+        self._replay_latest = False
         self.headless = headless
         self.capture_audio = capture_audio
         self._stats = stats
@@ -111,14 +123,41 @@ class TabScreencaster:
         self._failure: BaseException | None = None
         self._capture_enabled = threading.Event()
         self._nudge_playback = threading.Event()
+        self._restore_local_audio = threading.Event()
+        self._chrome_may_be_alive = False
 
     @property
     def on_frame(self) -> Callable[[bytes, float | None], None]:
-        return self._on_frame
+        with self._frame_state_lock:
+            return self._on_frame
 
     @on_frame.setter
     def on_frame(self, callback: Callable[[bytes, float | None], None]) -> None:
-        self._on_frame = callback
+        # Callback execution remains browser-thread-owned. The setter only
+        # requests a replay, avoiding cross-thread reordering/deadlocks.
+        with self._frame_state_lock:
+            self._on_frame = callback
+            self._replay_latest = self._latest_frame is not None
+
+    def _deliver_frame(self, jpeg_data: bytes, captured_at: float | None) -> None:
+        """Publish a real frame and atomically satisfy any pending handoff."""
+        with self._frame_state_lock:
+            self._latest_frame = (jpeg_data, captured_at)
+            callback = self._on_frame
+            # A newer actual frame supersedes replaying the retained one.
+            self._replay_latest = False
+        callback(jpeg_data, captured_at)
+
+    def _replay_latest_if_requested(self) -> bool:
+        """Replay one retained frame on the browser worker after handoff."""
+        with self._frame_state_lock:
+            if not self._replay_latest or self._latest_frame is None:
+                return False
+            self._replay_latest = False
+            jpeg_data, captured_at = self._latest_frame
+            callback = self._on_frame
+        callback(jpeg_data, captured_at)
+        return True
 
     def start(self) -> None:
         if self._thread is not None:
@@ -175,6 +214,10 @@ class TabScreencaster:
         """Ask the browser thread to retry autoplay (helps audio tap attach)."""
         self._nudge_playback.set()
 
+    def restore_local_audio(self) -> None:
+        """Unmute page media after optional tab-audio capture degrades."""
+        self._restore_local_audio.set()
+
     def stop(self) -> None:
         self._stop.set()
         self._capture_enabled.set()
@@ -182,7 +225,39 @@ class TabScreencaster:
         # still be inside a long navigation while its bounded join runs.
         self._startup_finished.set()
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=10)
+            self._thread.join(timeout=BROWSER_STOP_JOIN_S)
+            if self._thread.is_alive():
+                self._terminate_owned_browser_processes()
+                self._thread.join(timeout=BROWSER_POST_TERMINATE_JOIN_S)
+            if self._thread.is_alive():
+                raise TimeoutError(
+                    "Browser capture did not stop after its bounded teardown; "
+                    f"profile retained at {self.user_data_dir}."
+                )
+
+        # Playwright can return/raise after its worker has already exited while
+        # a Chrome child launched with this exact profile remains alive. Never
+        # use worker liveness as a proxy for browser-process ownership.
+        if not self._chrome_may_be_alive:
+            shutil.rmtree(self.user_data_dir, ignore_errors=True)
+            return
+        owned = self._owned_browser_process_ids()
+        if owned is None or owned:
+            self._terminate_owned_browser_processes()
+            owned = self._owned_browser_process_ids()
+        if owned == []:
+            self._chrome_may_be_alive = False
+            shutil.rmtree(self.user_data_dir, ignore_errors=True)
+        elif owned is None:
+            raise RuntimeError(
+                "Could not verify that profile-owned Chrome processes stopped; "
+                f"profile retained at {self.user_data_dir}."
+            )
+        else:
+            raise TimeoutError(
+                "Profile-owned Chrome processes did not stop after termination; "
+                f"profile retained at {self.user_data_dir}."
+            )
 
     def _record_failure(self, failure: BaseException) -> None:
         # Keep the first/root failure if cleanup itself subsequently fails.
@@ -205,6 +280,10 @@ class TabScreencaster:
             # preserve its useful type and message in the owning thread.
             self._record_failure(exc)
         finally:
+            if self._chrome_may_be_alive:
+                owned = self._owned_browser_process_ids()
+                if owned == []:
+                    self._chrome_may_be_alive = False
             if not self._chrome_may_be_alive:
                 shutil.rmtree(self.user_data_dir, ignore_errors=True)
             self._finished.set()
@@ -221,28 +300,12 @@ class TabScreencaster:
                 "--no-default-browser-check",
             ]
 
-            try:
-                context = playwright.chromium.launch_persistent_context(
-                    str(self.user_data_dir),
-                    channel="chrome",
-                    headless=self.headless,
-                    args=launch_args,
-                    viewport={"width": self.width, "height": self.height},
-                    device_scale_factor=1,
-                    ignore_https_errors=True,
-                )
-            except Exception:
-                context = playwright.chromium.launch_persistent_context(
-                    str(self.user_data_dir),
-                    headless=self.headless,
-                    args=launch_args,
-                    viewport={"width": self.width, "height": self.height},
-                    device_scale_factor=1,
-                    ignore_https_errors=True,
-                )
+            context = self._launch_context(playwright.chromium, launch_args)
 
             self._chrome_may_be_alive = True
             try:
+                if self._stop.is_set():
+                    return
                 context.grant_permissions(["notifications", "geolocation"])
                 self._install_audio_keepalive(context)
                 page = context.pages[0] if context.pages else context.new_page()
@@ -253,7 +316,11 @@ class TabScreencaster:
 
                     apply_to_page(context.new_cdp_session(page), self._adblock_patterns)
                 print(f"Loading {self.url} ...")
-                page.goto(self.url, wait_until="load", timeout=120_000)
+                page.goto(
+                    self.url,
+                    wait_until="domcontentloaded",
+                    timeout=BROWSER_NAVIGATION_TIMEOUT_MS,
+                )
                 page.add_style_tag(
                     content="html,body{overflow:hidden!important;margin:0!important;}"
                 )
@@ -275,8 +342,119 @@ class TabScreencaster:
             finally:
                 # Close in all paths (goto/setup failures included) so Chrome
                 # is not left running against the profile dir we remove after.
-                context.close()
-                self._chrome_may_be_alive = False
+                try:
+                    context.close()
+                except BaseException:
+                    owned = self._owned_browser_process_ids()
+                    if owned == []:
+                        self._chrome_may_be_alive = False
+                    raise
+                else:
+                    self._chrome_may_be_alive = False
+
+    def _launch_context(self, chromium, launch_args: list[str]):
+        options = {
+            "headless": self.headless,
+            "args": launch_args,
+            "viewport": {"width": self.width, "height": self.height},
+            "device_scale_factor": 1,
+            "ignore_https_errors": True,
+            "timeout": BROWSER_LAUNCH_TIMEOUT_MS,
+        }
+        # A Playwright launch call can spawn Chrome and still time out/raise.
+        # Claim possible process ownership before entering that call so the
+        # worker-finally/stop path retains and scans the exact profile.
+        self._chrome_may_be_alive = True
+        try:
+            return chromium.launch_persistent_context(
+                str(self.user_data_dir),
+                channel="chrome",
+                **options,
+            )
+        except Exception as system_chrome_error:
+            if self._stop.is_set():
+                raise RuntimeError("Browser startup was cancelled.") from system_chrome_error
+            try:
+                context = chromium.launch_persistent_context(
+                    str(self.user_data_dir),
+                    **options,
+                )
+            except Exception as bundled_chromium_error:
+                raise ExceptionGroup(
+                    "Both system Chrome and bundled Chromium failed to launch.",
+                    [system_chrome_error, bundled_chromium_error],
+                ) from system_chrome_error
+            print(
+                "Warning: system Chrome failed "
+                f"({system_chrome_error}); using bundled Chromium.",
+                flush=True,
+            )
+            return context
+
+    def _owned_browser_process_ids(self) -> list[int] | None:
+        """Find only Chrome processes launched against this unique profile."""
+        try:
+            result = subprocess.run(
+                ["ps", "-axo", "pid=,command="],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        equals_marker = f"--user-data-dir={self.user_data_dir}"
+        spaced_marker = f"--user-data-dir {self.user_data_dir}"
+        pids: list[int] = []
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            pid_text, separator, command = stripped.partition(" ")
+            if not separator or (
+                equals_marker not in command and spaced_marker not in command
+            ):
+                continue
+            try:
+                pid = int(pid_text)
+            except ValueError:
+                continue
+            if pid != os.getpid():
+                pids.append(pid)
+        return pids
+
+    def _terminate_owned_browser_processes(self) -> int:
+        """Gracefully terminate Chrome processes tied to this exact profile."""
+        pids = self._owned_browser_process_ids()
+        if not pids:
+            return 0
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+        deadline = time.monotonic() + BROWSER_TERMINATION_GRACE_S
+        survivors = pids
+        while survivors and time.monotonic() < deadline:
+            time.sleep(0.05)
+            current = self._owned_browser_process_ids()
+            if current is None:
+                break
+            survivors = current
+        if survivors:
+            current = self._owned_browser_process_ids()
+            if current is not None:
+                for pid in current:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                kill_deadline = time.monotonic() + BROWSER_TERMINATION_GRACE_S
+                while current and time.monotonic() < kill_deadline:
+                    time.sleep(0.05)
+                    rescanned = self._owned_browser_process_ids()
+                    if rescanned is None:
+                        break
+                    current = rescanned
+        return len(pids)
 
     def _start_screencast(self, cdp) -> None:
         cdp.send(
@@ -331,11 +509,6 @@ class TabScreencaster:
 
         try:
             while not self._stop.is_set():
-                if self._nudge_playback.is_set():
-                    self._nudge_playback.clear()
-                    self._try_start_playback(page)
-                    self._ensure_audio_keepalive(page)
-
                 while pending:
                     data_b64, session_id, capture_ts = pending.popleft()
                     # Ack first so Chrome keeps the frames flowing.
@@ -364,7 +537,7 @@ class TabScreencaster:
                         if lag is not None:
                             self._stats.record_screencast_lag(lag)
                     try:
-                        self._on_frame(base64.b64decode(data_b64), captured_at)
+                        self._deliver_frame(base64.b64decode(data_b64), captured_at)
                     except Exception:
                         if self._stats is not None:
                             self._stats.record_capture_error()
@@ -374,6 +547,17 @@ class TabScreencaster:
                     if self._stats is not None:
                         latency = time.monotonic() - started
                         self._stats.record_capture(latency, behind=latency > pace_period)
+
+                try:
+                    self._replay_latest_if_requested()
+                except Exception:
+                    if self._stats is not None:
+                        self._stats.record_capture_error()
+                    if self._stop.is_set():
+                        return
+
+                self._service_playback_nudge(page)
+                self._service_local_audio_restore(page)
 
                 # Pump the Playwright/CDP event loop so new frames are delivered.
                 page.wait_for_timeout(5)
@@ -406,7 +590,7 @@ class TabScreencaster:
             pass
 
     def _try_start_playback(self, page) -> None:
-        """Click common play buttons so the user doesn't have to."""
+        """Click common play buttons, then enforce the capture audio policy."""
         play_selectors = [
             "button[aria-label*='Play' i]",
             "button[title*='Play' i]",
@@ -418,18 +602,105 @@ class TabScreencaster:
             try:
                 page.locator(selector).first.click(timeout=1_500)
                 print("Started playback automatically.")
-                return
+                break
             except Exception:
                 continue
 
         try:
             page.evaluate(
                 f"""() => {{
-                    for (const video of document.querySelectorAll('video')) {{
-                        video.muted = {str(not self.capture_audio).lower()};
-                        void video.play();
+                    for (const media of document.querySelectorAll('video,audio')) {{
+                        media.muted = {str(not self.capture_audio).lower()};
+                        const request = media.play();
+                        if (request && typeof request.catch === "function") {{
+                            void request.catch(() => {{}});
+                        }}
                     }}
                 }}"""
             )
         except Exception:
+            pass
+
+    def _service_playback_nudge(self, page) -> bool:
+        """Service one coalesced capture-time autoplay request."""
+        if not self._nudge_playback.is_set():
+            return False
+        self._nudge_playback.clear()
+        self._try_nudge_playback(page)
+        self._ensure_audio_keepalive(page)
+        return True
+
+    def _service_local_audio_restore(self, page) -> bool:
+        """Service one browser-thread-owned local-audio fallback request."""
+        if not self._restore_local_audio.is_set():
+            return False
+        self._restore_local_audio.clear()
+        try:
+            page.evaluate(
+                r"""
+() => {
+    for (const media of document.querySelectorAll("video,audio")) {
+        media.muted = false;
+        const request = media.play();
+        if (request && typeof request.catch === "function") {
+            void request.catch(() => {});
+        }
+    }
+}
+"""
+            )
+        except Exception:
+            # Navigation can invalidate the context; a later degradation or
+            # playback retry can request the operation again. Keep this one
+            # pending so the fallback cannot be lost in a navigation race.
+            self._restore_local_audio.set()
+            return False
+        self._ensure_audio_keepalive(page)
+        return True
+
+    def _try_nudge_playback(self, page) -> None:
+        """Retry playback without Playwright locator auto-waiting.
+
+        This runs inside the sole CDP pump, so it must be one synchronous DOM
+        evaluation with no awaited play promise or selector timeout.
+        """
+        try:
+            script = r"""
+() => {
+    const selectors = [
+        "button[aria-label*='Play' i]",
+        "button[title*='Play' i]",
+        ".vjs-big-play-button",
+        "[class*='play-button']"
+    ];
+    for (const selector of selectors) {
+        const button = Array.from(document.querySelectorAll(selector)).find((node) => {
+            const rect = node.getBoundingClientRect();
+            const style = getComputedStyle(node);
+            return rect.width > 0 && rect.height > 0 &&
+                style.visibility !== "hidden" && style.display !== "none";
+        });
+        if (button) {
+            button.click();
+            break;
+        }
+    }
+    for (const media of document.querySelectorAll("video,audio")) {
+        media.muted = __FIX_CASTING_MUTED__;
+        const request = media.play();
+        if (request && typeof request.catch === "function") {
+            void request.catch(() => {});
+        }
+    }
+}
+"""
+            page.evaluate(
+                script.replace(
+                    "__FIX_CASTING_MUTED__",
+                    str(not self.capture_audio).lower(),
+                )
+            )
+        except Exception:
+            # Navigation can invalidate the execution context. The next audio
+            # retry will coalesce into another bounded nudge.
             pass

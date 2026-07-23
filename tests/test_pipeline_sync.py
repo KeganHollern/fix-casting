@@ -39,7 +39,7 @@ def test_pipeline_av_offset_within_noise_floor():
         cwd=ROOT,
     )
     assert proc.returncode == 0, f"harness failed:\n{proc.stdout}\n{proc.stderr}"
-    match = re.search(r"median:\s*(-?\d+(?:\.\d+)?)\s*ms", proc.stdout)
+    match = re.search(r"median:\s*([+-]?\d+(?:\.\d+)?)\s*ms", proc.stdout)
     assert match, f"no median offset in output:\n{proc.stdout}"
     median_ms = float(match.group(1))
     assert abs(median_ms) <= TOLERANCE_MS, (
@@ -64,15 +64,11 @@ def test_pipeline_reanchors_after_encoder_stall_without_permanent_skew():
         cwd=ROOT,
     )
     assert proc.returncode == 0, f"harness failed:\n{proc.stdout}\n{proc.stderr}"
-    match = re.search(r"median:\s*(-?\d+(?:\.\d+)?)\s*ms", proc.stdout)
-    assert match, f"no median offset in output:\n{proc.stdout}"
-    median_ms = float(match.group(1))
-    assert abs(median_ms) <= TOLERANCE_MS, (
-        f"post-recovery A/V offset {median_ms:+.0f}ms exceeds "
-        f"±{TOLERANCE_MS}ms:\n{proc.stdout}"
-    )
+    # The combined diagnostic concatenates independent pre/post-discontinuity
+    # PTS-zero epochs, so its aggregate median is not a persistent-skew
+    # measurement. The isolated newest epoch below is the recovery invariant.
     post_match = re.search(
-        r"post-restart median:\s*(-?\d+(?:\.\d+)?)\s*ms", proc.stdout
+        r"post-restart median:\s*([+-]?\d+(?:\.\d+)?)\s*ms", proc.stdout
     )
     assert post_match, f"no post-restart offset in output:\n{proc.stdout}"
     post_median_ms = float(post_match.group(1))
@@ -81,10 +77,15 @@ def test_pipeline_reanchors_after_encoder_stall_without_permanent_skew():
         f"±{TOLERANCE_MS}ms:\n{proc.stdout}"
     )
     assert "stalled ffmpeg was replaced" in proc.stdout, proc.stdout
+    reanchors = re.search(r"A/V re-anchors\s+(\d+)", proc.stdout)
+    assert reanchors and int(reanchors.group(1)) == 1, (
+        "one injected encoder stall must create exactly one A/V boundary:\n"
+        f"{proc.stdout}"
+    )
     boundaries = re.search(
         r"HLS restart boundaries represented:\s*(\d+)", proc.stdout
     )
-    assert boundaries and int(boundaries.group(1)) >= 1, proc.stdout
+    assert boundaries and int(boundaries.group(1)) == 1, proc.stdout
     sequence = re.search(r"HLS discontinuity sequence:\s*(\d+)", proc.stdout)
     assert sequence and int(sequence.group(1)) >= 1, (
         "the real restart boundary never rolled out of the short playlist, so "

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import ipaddress
 import os
 import re
 import socket
@@ -75,7 +76,26 @@ class HLSDeliverySnapshot:
         return self.segment_response_bytes_total / self.segment_response_duration_s_total
 
 
+@dataclass(frozen=True)
+class HLSClientDeliverySnapshot:
+    """Successful media delivery attributable to one receiver address."""
+
+    segment_requests: int
+    active_segment_requests: int
+    oldest_active_segment_age_s: float | None
+    segment_responses: int
+    latest_segment_completed_at: float | None
+
+
 HLSDeliveryCallback = Callable[[HLSDeliverySnapshot], None]
+
+
+@dataclass(frozen=True)
+class ReceiverRoute:
+    """Frozen LAN route and numeric peer aliases for one Chromecast."""
+
+    local_ip: str
+    peer_hosts: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -84,6 +104,7 @@ class _RequestToken:
     method: str
     path: str
     kind: HLSRequestKind
+    client_host: str
     started_at: float
     started_monotonic: float
 
@@ -129,8 +150,17 @@ class _HLSDeliveryTelemetry:
         self._latest_segment_duration_s: float | None = None
         self._latest_segment_bytes = 0
         self._latest_segment_throughput_bps: float | None = None
+        self._client_segment_requests: dict[str, int] = {}
+        self._client_segment_responses: dict[str, int] = {}
+        self._client_latest_segment_completed_at: dict[str, float] = {}
 
-    def begin(self, method: str, path: str, kind: HLSRequestKind) -> _RequestToken:
+    def begin(
+        self,
+        method: str,
+        path: str,
+        kind: HLSRequestKind,
+        client_host: str,
+    ) -> _RequestToken:
         started_at = time.time()
         started_monotonic = time.monotonic()
         with self._lock:
@@ -141,6 +171,7 @@ class _HLSDeliveryTelemetry:
                 method=method,
                 path=path,
                 kind=kind,
+                client_host=client_host,
                 started_at=started_at,
                 started_monotonic=started_monotonic,
             )
@@ -148,6 +179,9 @@ class _HLSDeliveryTelemetry:
                 self._playlist_requests += 1
             elif kind == "segment":
                 self._segment_requests += 1
+                self._client_segment_requests[client_host] = (
+                    self._client_segment_requests.get(client_host, 0) + 1
+                )
             else:
                 self._other_requests += 1
             self._active_requests_by_kind[kind][sequence] = token
@@ -200,6 +234,11 @@ class _HLSDeliveryTelemetry:
                     self._latest_segment_throughput_bps = (
                         bytes_sent / duration_s if duration_s > 0 else None
                     )
+                    host = token.client_host
+                    self._client_segment_responses[host] = (
+                        self._client_segment_responses.get(host, 0) + 1
+                    )
+                    self._client_latest_segment_completed_at[host] = completed_at
 
             # An earlier concurrent request must not overwrite the request that
             # most recently started. Its totals still contribute above.
@@ -223,6 +262,28 @@ class _HLSDeliveryTelemetry:
     def snapshot(self) -> HLSDeliverySnapshot:
         with self._lock:
             return self._snapshot_locked()
+
+    def client_snapshot(self, client_host: str) -> HLSClientDeliverySnapshot:
+        with self._lock:
+            active = [
+                token
+                for token in self._active_requests_by_kind["segment"].values()
+                if token.client_host == client_host
+            ]
+            oldest = min(active, key=lambda token: token.started_monotonic, default=None)
+            return HLSClientDeliverySnapshot(
+                segment_requests=self._client_segment_requests.get(client_host, 0),
+                active_segment_requests=len(active),
+                oldest_active_segment_age_s=(
+                    max(0.0, time.monotonic() - oldest.started_monotonic)
+                    if oldest is not None
+                    else None
+                ),
+                segment_responses=self._client_segment_responses.get(client_host, 0),
+                latest_segment_completed_at=self._client_latest_segment_completed_at.get(
+                    client_host
+                ),
+            )
 
     def _snapshot_locked(self) -> HLSDeliverySnapshot:
         active_segments = self._active_requests_by_kind["segment"]
@@ -386,11 +447,51 @@ class HLSDiscontinuitySequenceNormalizer:
         return epoch
 
 
-def get_local_ip() -> str:
-    """Return the LAN IP address used for outbound traffic."""
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.connect(("8.8.8.8", 80))
-        return sock.getsockname()[0]
+def get_receiver_route(destination_host: str) -> ReceiverRoute:
+    """Return the local IPv4 route and numeric aliases for one receiver.
+
+    UDP ``connect`` only asks the kernel to select a route; it sends no packet.
+    Routing toward a public DNS server chooses the wrong interface under many
+    VPNs and fails entirely on internet-isolated LANs.
+    """
+    try:
+        resolved = socket.getaddrinfo(
+            destination_host,
+            8009,
+            family=socket.AF_INET,
+            type=socket.SOCK_DGRAM,
+        )
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect((destination_host, 8009))
+            local_ip = str(sock.getsockname()[0])
+            routed_peer = str(sock.getpeername()[0])
+    except OSError as exc:
+        raise RuntimeError(
+            "Could not determine the LAN interface used to reach Chromecast "
+            f"{destination_host!r}. Check the TV route/VPN configuration."
+        ) from exc
+    if not local_ip or local_ip == "0.0.0.0":
+        raise RuntimeError(
+            f"No usable IPv4 route to Chromecast {destination_host!r}."
+        )
+    peer_hosts: list[str] = []
+    for candidate in [routed_peer, *(str(item[4][0]) for item in resolved)]:
+        try:
+            normalized = str(ipaddress.IPv4Address(candidate))
+        except ipaddress.AddressValueError:
+            continue
+        if normalized not in peer_hosts:
+            peer_hosts.append(normalized)
+    if not peer_hosts:
+        raise RuntimeError(
+            f"No usable IPv4 address resolved for Chromecast {destination_host!r}."
+        )
+    return ReceiverRoute(local_ip=local_ip, peer_hosts=tuple(peer_hosts))
+
+
+def get_local_ip(destination_host: str) -> str:
+    """Return the IPv4 address routed toward the selected Chromecast."""
+    return get_receiver_route(destination_host).local_ip
 
 
 class HLSHTTPServer:
@@ -414,7 +515,9 @@ class HLSHTTPServer:
         self._delivery_telemetry = _HLSDeliveryTelemetry(on_delivery)
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
-        self._stop_lock = threading.Lock()
+        # Signal handlers can re-enter stop() on the interrupted start()/port
+        # call in the same thread, so this ownership lock must be reentrant.
+        self._stop_lock = threading.RLock()
         self._health_lock = threading.Lock()
         self._failure: BaseException | None = None
         self._finished = threading.Event()
@@ -430,6 +533,10 @@ class HLSHTTPServer:
     def delivery_snapshot(self) -> HLSDeliverySnapshot:
         """Return an immutable, thread-safe HTTP delivery snapshot."""
         return self._delivery_telemetry.snapshot()
+
+    def client_delivery_snapshot(self, client_host: str) -> HLSClientDeliverySnapshot:
+        """Return successful segment delivery for exactly one client address."""
+        return self._delivery_telemetry.client_snapshot(client_host)
 
     def _serve(self, server: ThreadingHTTPServer) -> None:
         failure: BaseException | None = None
@@ -490,6 +597,7 @@ class HLSHTTPServer:
                         self.command,
                         request_path,
                         self._request_kind(request_path),
+                        str(self.client_address[0]),
                     )
                     self._delivery_body_bytes = 0
                     self._delivery_status: int | None = None
@@ -579,6 +687,13 @@ class HLSHTTPServer:
             server: ThreadingHTTPServer | None = None
             try:
                 server = ThreadingHTTPServer(("0.0.0.0", self._requested_port), Handler)
+                if (
+                    self._lifecycle_state != "starting"
+                    or self._stop_requested.is_set()
+                ):
+                    server.server_close()
+                    self._lifecycle_state = "stopped"
+                    return
                 thread = threading.Thread(
                     target=self._serve,
                     args=(server,),

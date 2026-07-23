@@ -6,11 +6,24 @@ public enum MessageType: String, Codable {
   case metadata
   case streamStart = "stream_start"
   case streamStop = "stream_stop"
+  case heartbeat
 
   // Logging
   case info
   case error
   case debug
+}
+
+public struct AudioHeartbeat: Codable {
+  public let producerSequence: UInt64
+
+  public enum CodingKeys: String, CodingKey {
+    case producerSequence = "producer_sequence"
+  }
+
+  public init(producerSequence: UInt64) {
+    self.producerSequence = producerSequence
+  }
 }
 
 // Base message envelope that wraps all outputs

@@ -10,6 +10,8 @@ import cast_tab.server as server_module
 from cast_tab.server import (
     HLSDiscontinuitySequenceNormalizer,
     HLSHTTPServer,
+    get_local_ip,
+    get_receiver_route,
     parse_hls_segment_epoch,
 )
 
@@ -42,6 +44,92 @@ def _playlist(*lines: str, media_sequence: int = 0) -> bytes:
 )
 def test_parse_hls_segment_epoch(uri: str, expected: int | None):
     assert parse_hls_segment_epoch(uri) == expected
+
+
+def test_delivery_telemetry_attributes_success_to_exact_client():
+    telemetry = server_module._HLSDeliveryTelemetry(None)
+    selected = telemetry.begin("GET", "/selected.ts", "segment", "192.0.2.10")
+    unrelated = telemetry.begin("GET", "/other.ts", "segment", "192.0.2.20")
+
+    telemetry.finish(selected, bytes_sent=1024, status=200, failed=False)
+    telemetry.finish(unrelated, bytes_sent=0, status=404, failed=False)
+
+    selected_snapshot = telemetry.client_snapshot("192.0.2.10")
+    unrelated_snapshot = telemetry.client_snapshot("192.0.2.20")
+    absent_snapshot = telemetry.client_snapshot("192.0.2.30")
+
+    assert selected_snapshot.segment_requests == 1
+    assert selected_snapshot.segment_responses == 1
+    assert selected_snapshot.latest_segment_completed_at is not None
+    assert unrelated_snapshot.segment_requests == 1
+    assert unrelated_snapshot.segment_responses == 0
+    assert absent_snapshot.segment_requests == 0
+    assert absent_snapshot.segment_responses == 0
+
+
+def test_local_ip_route_is_selected_toward_chromecast(monkeypatch):
+    connected = []
+
+    class Socket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def connect(self, destination):
+            connected.append(destination)
+
+        def getsockname(self):
+            return ("192.168.50.12", 54321)
+
+        def getpeername(self):
+            return ("192.168.50.80", 8009)
+
+    monkeypatch.setattr(server_module.socket, "socket", lambda *_args: Socket())
+    monkeypatch.setattr(
+        server_module.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (
+                server_module.socket.AF_INET,
+                server_module.socket.SOCK_DGRAM,
+                17,
+                "",
+                ("192.168.50.80", 8009),
+            ),
+            (
+                server_module.socket.AF_INET,
+                server_module.socket.SOCK_DGRAM,
+                17,
+                "",
+                ("192.168.50.81", 8009),
+            ),
+        ],
+    )
+
+    route = get_receiver_route("den-tv.local.")
+    assert route.local_ip == "192.168.50.12"
+    assert route.peer_hosts == ("192.168.50.80", "192.168.50.81")
+    assert get_local_ip("den-tv.local.") == "192.168.50.12"
+    assert connected == [("den-tv.local.", 8009), ("den-tv.local.", 8009)]
+
+
+def test_local_ip_route_failure_is_actionable(monkeypatch):
+    class Socket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def connect(self, _destination):
+            raise OSError("no route")
+
+    monkeypatch.setattr(server_module.socket, "socket", lambda *_args: Socket())
+
+    with pytest.raises(RuntimeError, match="VPN"):
+        get_local_ip("192.0.2.10")
 
 
 @pytest.mark.parametrize(
@@ -636,6 +724,39 @@ def test_stop_waits_for_concurrent_start_transaction(
     assert not start_thread.is_alive()
     assert not stop_thread.is_alive()
     assert stop_returned.is_set()
+    assert server.port == 0
+
+
+def test_same_thread_stop_reenters_http_start_without_deadlock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    server = HLSHTTPServer(tmp_path)
+    constructed: list[_FakeHTTPServer] = []
+    failures: list[BaseException] = []
+
+    def reentrant_constructor(address, handler):
+        server.stop()
+        underlying = _FakeHTTPServer(address, handler)
+        constructed.append(underlying)
+        return underlying
+
+    monkeypatch.setattr(server_module, "ThreadingHTTPServer", reentrant_constructor)
+
+    def start() -> None:
+        try:
+            server.start()
+        except BaseException as exc:
+            failures.append(exc)
+
+    thread = threading.Thread(target=start)
+    thread.start()
+    thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert failures == []
+    assert len(constructed) == 1
+    assert constructed[0].close_calls == 1
     assert server.port == 0
 
 

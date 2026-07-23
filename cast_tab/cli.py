@@ -13,10 +13,11 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from pathlib import Path
 
+from cast_tab.audiotee_provenance import verify_installed_audiotee
 from cast_tab.caster import TabCaster
 from cast_tab.devices import discover_devices, find_device, select_device
 from cast_tab.encoder import estimated_hls_holdback_s, hls_playlist_retention_s
-from cast_tab.paths import AUDIOTEE_PROVENANCE_PATH, INSTALL_PROVENANCE_PATH
+from cast_tab.paths import AUDIOTEE_INSTALL_PATH, INSTALL_PROVENANCE_PATH
 from cast_tab.session import CastSession, SessionConfig
 from cast_tab.stats import PipelineStats
 from cast_tab.streamer import (
@@ -29,6 +30,10 @@ from cast_tab.streamer import (
 MAX_VIDEO_BITRATE_MBPS = 1_000.0
 MAX_ABS_AUDIO_DRIFT_PPM = 100_000.0
 INSTALL_RECEIPT_FORMAT = "1"
+
+
+class _ShutdownRequested(Exception):
+    """Internal control flow after an OS signal requested a clean shutdown."""
 
 
 def _package_fingerprint(package_dir: Path) -> str:
@@ -91,6 +96,13 @@ def _positive_int(value: str) -> int:
         raise argparse.ArgumentTypeError("must be an integer") from exc
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
+
+
+def _positive_even_int(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed % 2:
+        raise argparse.ArgumentTypeError("must be even for yuv420p video")
     return parsed
 
 
@@ -162,11 +174,16 @@ def _version_text() -> str:
         provenance = "development checkout (editable/source import)"
     else:
         provenance = _verified_install_provenance(package_dir)
-    try:
-        audiotee_hash = AUDIOTEE_PROVENANCE_PATH.read_text(encoding="utf-8").strip()
-    except OSError:
-        audiotee_hash = ""
-    helper = f"; AudioTee sha256:{audiotee_hash[:12]}" if audiotee_hash else ""
+    verified_helper, helper_failure = verify_installed_audiotee(AUDIOTEE_INSTALL_PATH)
+    if verified_helper is not None:
+        helper = (
+            f"; AudioTee sha256:{verified_helper.binary_sha256[:12]}"
+            f" source:{verified_helper.source_fingerprint[:12]}"
+        )
+    elif AUDIOTEE_INSTALL_PATH.exists() or AUDIOTEE_INSTALL_PATH.is_symlink():
+        helper = f"; AudioTee unverified ({helper_failure})"
+    else:
+        helper = ""
     return f"fix-casting {installed_version} ({provenance}{helper})"
 
 
@@ -187,13 +204,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("url", help="URL to open and mirror")
     parser.add_argument(
         "--width",
-        type=_positive_int,
+        type=_positive_even_int,
         default=1920,
         help="Viewport width (default: 1920)",
     )
     parser.add_argument(
         "--height",
-        type=_positive_int,
+        type=_positive_even_int,
         default=1080,
         help="Viewport height (default: 1080)",
     )
@@ -359,6 +376,12 @@ def main(argv: list[str] | None = None) -> int:
         print("Loading ad-block filter lists...")
         adblock_patterns = build_block_patterns()
 
+    # The signal handler below may interrupt any Python bytecode, including an
+    # Event/Condition critical section. A plain boolean assignment is the only
+    # operation it performs; session/caster workers poll this reader without
+    # asking the handler to acquire a lock or tear anything down.
+    stop_requested = False
+
     session = CastSession(
         SessionConfig(
             url=args.url,
@@ -377,6 +400,12 @@ def main(argv: list[str] | None = None) -> int:
         stats=stats,
     )
     caster = TabCaster(device)
+    set_session_cancellation = getattr(session, "set_cancellation_probe", None)
+    if set_session_cancellation is not None:
+        set_session_cancellation(lambda: stop_requested)
+    set_caster_cancellation = getattr(caster, "set_cancellation_probe", None)
+    if set_caster_cancellation is not None:
+        set_caster_cancellation(lambda: stop_requested)
 
     shutting_down = False
     started_at = time.monotonic()
@@ -413,33 +442,62 @@ def main(argv: list[str] | None = None) -> int:
         shutting_down = True
         print("\nStopping cast...")
         failures: list[tuple[str, BaseException]] = []
-        for name, stop in (("session", session.stop), ("Chromecast", caster.stop)):
+        # Stop the receiver/watchdog while HLS is still available. Otherwise a
+        # final watchdog poll can reload a URL as its server is disappearing.
+        cleanup_steps = (("Chromecast", caster.stop), ("session", session.stop))
+        for name, stop in cleanup_steps:
             try:
                 stop()
             except BaseException as exc:
                 # Cleanup is best-effort across independent components. A
                 # browser teardown failure must not leave the TV connected.
                 failures.append((name, exc))
+
+        # Component stop methods retain ownership of incomplete phases and are
+        # intentionally retryable. A process can miss its first bounded reap
+        # window while exiting normally; make one immediate second pass only
+        # over failed owners. Successful, potentially non-idempotent phases
+        # are never repeated, and only the final failure is reported.
+        if failures:
+            retry_steps = {name: stop for name, stop in cleanup_steps}
+            retry_failures: list[tuple[str, BaseException]] = []
+            for name, _first_failure in failures:
+                try:
+                    retry_steps[name]()
+                except BaseException as exc:
+                    retry_failures.append((name, exc))
+            failures = retry_failures
         _print_exit_summary()
         for name, failure in failures:
             print(f"Warning: failed to stop {name}: {failure}", file=sys.stderr)
 
     def handle_signal(_signum=None, _frame=None) -> None:
-        # A second Ctrl+C may arrive while the first handler is waiting for
-        # browser/ffmpeg cleanup. Returning lets the original handler resume
-        # instead of raising SystemExit in the middle of teardown.
-        if shutting_down:
-            return
-        shutdown()
-        raise SystemExit(0)
+        # A Python signal handler can run between the CALL and STORE bytecodes
+        # of any resource factory. Raising or tearing down here can therefore
+        # strand a newly spawned Chrome/AudioTee/ffmpeg before its owner stores
+        # it. Only publish a lock-free CPython boolean assignment; ordinary
+        # control flow reaches the single finally block that owns teardown.
+        nonlocal stop_requested
+        stop_requested = True
+
+    def raise_if_stop_requested() -> None:
+        if stop_requested:
+            raise _ShutdownRequested
+
+    def check_runtime_health() -> None:
+        raise_if_stop_requested()
+        session.raise_if_failed()
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
     try:
         session.start()
+        raise_if_stop_requested()
         streamer = session.streamer
         assert streamer is not None  # session.start() succeeded above
+        playlist_url = streamer.configure_receiver(device.host)
+        caster.set_delivery_probe(streamer.receiver_delivery_observation)
 
         audio_mode = "with tab audio" if session.audio_active else "video only"
         holdback = estimated_hls_holdback_s(buffered=args.buffered)
@@ -460,8 +518,11 @@ def main(argv: list[str] | None = None) -> int:
             f"{audio_mode} using {codec_label()}, {latency_mode}."
         )
 
+        raise_if_stop_requested()
         caster.connect()
-        caster.play_hls(session.playlist_url)
+        raise_if_stop_requested()
+        caster.play_hls(playlist_url)
+        raise_if_stop_requested()
         # Background watchdog: re-casts if the TV stops playing (app killed,
         # stream error). Off-loop so a ~50s dead-TV recovery never blocks
         # stats/TUI. In TUI mode the non-playing card shows the state, so no
@@ -483,10 +544,9 @@ def main(argv: list[str] | None = None) -> int:
                 caster=caster,
                 initial_offset_ms=streamer.audio_offset_ms,
                 tv_poll_interval=args.tv_poll_interval,
-                playlist_url=session.playlist_url,
-                health_check=session.raise_if_failed,
+                playlist_url=playlist_url,
+                health_check=check_runtime_health,
             )
-            shutdown()
             return 0
 
         print("Casting. Press Ctrl+C to stop.")
@@ -503,7 +563,7 @@ def main(argv: list[str] | None = None) -> int:
 
         next_stats_at = time.monotonic() + args.stats_interval
         next_tv_poll_at = time.monotonic()
-        while not shutting_down:
+        while not stop_requested:
             session.raise_if_failed()
             now = time.monotonic()
             if args.stats and now >= next_tv_poll_at:
@@ -523,10 +583,15 @@ def main(argv: list[str] | None = None) -> int:
                 print(stats.format_report(args.stats_interval), flush=True)
                 next_stats_at = now + args.stats_interval
             time.sleep(0.25)
+    except _ShutdownRequested:
+        return 0
     except Exception as exc:
+        if stop_requested:
+            return 0
         print(f"Error: {exc}", file=sys.stderr)
-        shutdown()
         return 1
+    finally:
+        shutdown()
 
     return 0
 

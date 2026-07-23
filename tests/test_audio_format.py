@@ -2,10 +2,15 @@
 
 import json
 
-from cast_tab.audio import DEFAULT_AUDIO_FORMAT, _parse_audio_format
+from cast_tab.audio import (
+    AUDIOTEE_PROTOCOL_VERSION,
+    DEFAULT_AUDIO_FORMAT,
+    _parse_audio_format,
+)
 
 
 def _meta(**data) -> str:
+    data.setdefault("protocol_version", AUDIOTEE_PROTOCOL_VERSION)
     return json.dumps({"message_type": "metadata", "data": data})
 
 
@@ -39,6 +44,18 @@ def test_parse_rejects_garbage():
     assert _parse_audio_format(_meta(sample_rate=48000)) is None  # missing fields
     assert _parse_audio_format(_meta(sample_rate="x", channels_per_frame=2,
                                      bits_per_channel=32, encoding="pcm_f32le")) is None
+    assert (
+        _parse_audio_format(
+            _meta(
+                protocol_version=AUDIOTEE_PROTOCOL_VERSION - 1,
+                sample_rate=48000,
+                channels_per_frame=2,
+                bits_per_channel=32,
+                encoding="pcm_f32le",
+            )
+        )
+        is None
+    )
 
 
 def test_default_format():

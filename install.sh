@@ -11,7 +11,6 @@ case "$DATA_HOME" in
     ;;
 esac
 INSTALL_DATA_DIR="$DATA_HOME/fix-casting"
-AUDIOTEE_DEST="$INSTALL_DATA_DIR/bin/audiotee"
 INSTALL_PROVENANCE_PATH="$INSTALL_DATA_DIR/revision"
 mkdir -p "$INSTALL_DATA_DIR/bin"
 
@@ -25,20 +24,94 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
   echo "warning: ffmpeg not found on PATH. Install it before casting:  brew install ffmpeg" >&2
 fi
 
+# Every remaining step mutates shared per-user state. Serialize the complete
+# Python + browser + native-helper + final-receipt transaction so concurrent
+# installs from different checkouts cannot publish a mixed installation.
+INSTALL_LOCK_DIR="$INSTALL_DATA_DIR/install.lock"
+INSTALL_LOCK_HELD=0
+LOCK_CONSTRAINTS=""
+PROVENANCE_TEMP=""
+cleanup() {
+  if [ -n "$LOCK_CONSTRAINTS" ]; then
+    rm -f "$LOCK_CONSTRAINTS"
+  fi
+  if [ -n "$PROVENANCE_TEMP" ]; then
+    rm -f "$PROVENANCE_TEMP"
+  fi
+  if [ "$INSTALL_LOCK_HELD" -eq 1 ]; then
+    lock_owner="$(sed -n '1p' "$INSTALL_LOCK_DIR/owner" 2>/dev/null || true)"
+    if [ -z "$lock_owner" ] || [ "$lock_owner" = "$$" ]; then
+      rm -f "$INSTALL_LOCK_DIR/owner"
+      rmdir "$INSTALL_LOCK_DIR" 2>/dev/null || true
+    fi
+  fi
+}
+trap cleanup EXIT
+
+acquire_install_lock() {
+  lock_timeout="${CAST_INSTALL_LOCK_TIMEOUT_SECONDS:-600}"
+  case "$lock_timeout" in
+    ''|*[!0-9]*)
+      echo "error: CAST_INSTALL_LOCK_TIMEOUT_SECONDS must be a nonnegative integer" >&2
+      return 1
+      ;;
+  esac
+  lock_deadline=$((SECONDS + lock_timeout))
+  lock_wait_reported=0
+  ownerless_observations=0
+  while ! mkdir "$INSTALL_LOCK_DIR" 2>/dev/null; do
+    lock_owner="$(sed -n '1p' "$INSTALL_LOCK_DIR/owner" 2>/dev/null || true)"
+    case "$lock_owner" in
+      ''|*[!0-9]*)
+        ownerless_observations=$((ownerless_observations + 1))
+        if [ "$ownerless_observations" -ge 20 ]; then
+          stale_lock="$INSTALL_LOCK_DIR.stale.$$.$RANDOM"
+          if mv "$INSTALL_LOCK_DIR" "$stale_lock" 2>/dev/null; then
+            rm -f "$stale_lock/owner"
+            rmdir "$stale_lock" 2>/dev/null || true
+          fi
+          ownerless_observations=0
+          continue
+        fi
+        ;;
+      *)
+        ownerless_observations=0
+        if ! kill -0 "$lock_owner" 2>/dev/null; then
+          stale_lock="$INSTALL_LOCK_DIR.stale.$$.$RANDOM"
+          if mv "$INSTALL_LOCK_DIR" "$stale_lock" 2>/dev/null; then
+            rm -f "$stale_lock/owner"
+            rmdir "$stale_lock" 2>/dev/null || true
+          fi
+          continue
+        fi
+        ;;
+    esac
+    if [ "$SECONDS" -ge "$lock_deadline" ]; then
+      echo "error: timed out waiting for another fix-casting install (owner PID: ${lock_owner:-unknown})" >&2
+      return 1
+    fi
+    if [ "$lock_wait_reported" -eq 0 ]; then
+      echo "Waiting for another fix-casting install to finish..."
+      lock_wait_reported=1
+    fi
+    sleep 0.1
+  done
+  INSTALL_LOCK_HELD=1
+  if ! printf '%s\n' "$$" > "$INSTALL_LOCK_DIR/owner"; then
+    rmdir "$INSTALL_LOCK_DIR" 2>/dev/null || true
+    INSTALL_LOCK_HELD=0
+    return 1
+  fi
+}
+
+acquire_install_lock
+
 # --- install the `cast` CLI -------------------------------------------------
 # `uv tool install` builds a snapshot in its own isolated environment and links
 # the `cast` entry point into uv's bin dir (~/.local/bin). Keep it non-editable:
 # changing branches or editing this checkout must not silently change the
 # installed command. Export exact runtime constraints from the committed lock.
 LOCK_CONSTRAINTS="$(mktemp "${TMPDIR:-/tmp}/fix-casting-constraints.XXXXXX")"
-PROVENANCE_TEMP=""
-cleanup() {
-  rm -f "$LOCK_CONSTRAINTS"
-  if [ -n "$PROVENANCE_TEMP" ]; then
-    rm -f "$PROVENANCE_TEMP"
-  fi
-}
-trap cleanup EXIT
 uv export \
   --project "$ROOT" \
   --locked \
@@ -104,9 +177,9 @@ if [ "$SOURCE_PACKAGE_FINGERPRINT" != "$INSTALLED_PACKAGE_FINGERPRINT" ]; then
   exit 1
 fi
 
-# Record exactly which verified source snapshot produced the installed command
-# before optional browser/native-helper setup. If one of those later steps
-# fails, the already-updated `cast` command still retains an accurate receipt.
+# Prepare the exact source identity now, but publish it only after browser and
+# native-helper setup succeed. Until then the fail-closed marker written above
+# truthfully reports that the multi-component installation is incomplete.
 REVISION="unknown"
 BRANCH="unknown"
 DIRTY=""
@@ -120,9 +193,37 @@ fi
 SOURCE_FINGERPRINT="${SOURCE_PACKAGE_FINGERPRINT:0:16}"
 INSTALL_REVISION="$BRANCH@$REVISION$DIRTY+source.$SOURCE_FINGERPRINT"
 
-# The structured receipt lets the installed CLI recompute its own package
-# fingerprint before displaying the claimed revision. Build it beside the
-# destination and rename it into place so readers never observe a partial file.
+# --- Playwright fallback browser (Chromium) ---------------------------------
+# Run the tool env's own playwright so the downloaded browser matches the
+# pinned version. Browsers go to the shared ~/Library/Caches/ms-playwright.
+TOOL_PLAYWRIGHT="$TOOL_ENV_DIR/bin/playwright"
+if [ -x "$TOOL_PLAYWRIGHT" ]; then
+  if ! "$TOOL_PLAYWRIGHT" install chromium; then
+    echo "warning: fallback Chromium download failed; Google Chrome remains the primary browser." >&2
+  fi
+else
+  echo "warning: could not locate the installed playwright; skipping Chromium download." >&2
+fi
+
+# --- AudioTee (per-tab audio capture, macOS) --------------------------------
+# Build in an isolated scratch directory from this checkout's vendored inputs.
+# Ignored repo/.build artifacts are never trusted: their existence says
+# nothing about which source revision produced them. The helper installer
+# publishes a versioned binary+receipt generation and atomically switches one
+# symlink only after architecture/protocol/hash validation succeeds.
+EXPECTED_AUDIOTEE_SOURCE_FINGERPRINT="$(
+  "$TOOL_PYTHON" -I -c \
+    'from cast_tab.audiotee_provenance import AUDIOTEE_SOURCE_FINGERPRINT; print(AUDIOTEE_SOURCE_FINGERPRINT)'
+)"
+bash "$ROOT/scripts/install_audiotee.sh" \
+  "$ROOT" \
+  "$INSTALL_DATA_DIR" \
+  "$TOOL_PYTHON" \
+  "$EXPECTED_AUDIOTEE_SOURCE_FINGERPRINT"
+
+# Publish overall success last. The structured receipt lets the installed CLI
+# recompute its package fingerprint before displaying the claimed revision.
+# Build beside the destination and rename so readers never see a partial file.
 PROVENANCE_TEMP="$(mktemp "$INSTALL_DATA_DIR/revision.XXXXXX")"
 {
   printf 'format=1\n'
@@ -131,110 +232,6 @@ PROVENANCE_TEMP="$(mktemp "$INSTALL_DATA_DIR/revision.XXXXXX")"
 } > "$PROVENANCE_TEMP"
 mv -f "$PROVENANCE_TEMP" "$INSTALL_PROVENANCE_PATH"
 PROVENANCE_TEMP=""
-
-# --- Playwright fallback browser (Chromium) ---------------------------------
-# Run the tool env's own playwright so the downloaded browser matches the
-# pinned version. Browsers go to the shared ~/Library/Caches/ms-playwright.
-TOOL_PLAYWRIGHT="$TOOL_ENV_DIR/bin/playwright"
-if [ -x "$TOOL_PLAYWRIGHT" ]; then
-  "$TOOL_PLAYWRIGHT" install chromium
-else
-  echo "warning: could not locate the installed playwright; skipping Chromium download." >&2
-fi
-
-# --- AudioTee (per-tab audio capture, macOS) --------------------------------
-# Resolution order: existing repo build → prebuilt download (no Swift needed)
-# → swift build from vendor/. Copy the result outside the checkout so the
-# non-editable tool can find it after the source tree moves or changes branches.
-# The prebuilt is published by the
-# release-audiotee.yml workflow when an `audiotee-v*` tag is pushed.
-AUDIOTEE_RELEASE_URL="${AUDIOTEE_RELEASE_URL:-https://github.com/KeganHollern/fix-casting/releases/latest/download/audiotee-macos-$(uname -m)}"
-AUDIOTEE_CHECKSUM_URL="${AUDIOTEE_CHECKSUM_URL:-${AUDIOTEE_RELEASE_URL%/*}/checksums.txt}"
-AUDIOTEE_SHA256="${AUDIOTEE_SHA256:-}"
-
-have_audiotee() {
-  [ -x "$AUDIOTEE_DEST" ] && file "$AUDIOTEE_DEST" | grep -q "Mach-O"
-}
-
-repo_audiotee() {
-  for candidate in \
-    "$ROOT/bin/audiotee" \
-    "$ROOT/vendor/audiotee/.build/arm64-apple-macosx/release/audiotee" \
-    "$ROOT/vendor/audiotee/.build/release/audiotee"
-  do
-    if [ -x "$candidate" ] && file "$candidate" | grep -q "Mach-O"; then
-      echo "$candidate"
-      return 0
-    fi
-  done
-  return 1
-}
-
-record_audiotee_hash() {
-  shasum -a 256 "$AUDIOTEE_DEST" | awk '{print $1}' \
-    > "$INSTALL_DATA_DIR/audiotee.sha256"
-}
-
-if EXISTING_AUDIOTEE="$(repo_audiotee)"; then
-  install -m 755 "$EXISTING_AUDIOTEE" "$AUDIOTEE_DEST"
-  record_audiotee_hash
-  echo "Installed existing AudioTee -> $AUDIOTEE_DEST"
-else
-  echo "Fetching prebuilt AudioTee..."
-  AUDIOTEE_TEMP="$INSTALL_DATA_DIR/bin/audiotee.tmp"
-  AUDIOTEE_CHECKSUM_TEMP="$INSTALL_DATA_DIR/bin/checksums.tmp"
-  EXPECTED_AUDIOTEE_SHA256="$AUDIOTEE_SHA256"
-  if curl -fsSL --retry 2 -o "$AUDIOTEE_TEMP" "$AUDIOTEE_RELEASE_URL" 2>/dev/null; then
-    if [ -z "$EXPECTED_AUDIOTEE_SHA256" ] \
-      && curl -fsSL --retry 2 -o "$AUDIOTEE_CHECKSUM_TEMP" "$AUDIOTEE_CHECKSUM_URL" 2>/dev/null; then
-      AUDIOTEE_ASSET_NAME="$(basename "$AUDIOTEE_RELEASE_URL")"
-      EXPECTED_AUDIOTEE_SHA256="$(
-        awk -v asset="$AUDIOTEE_ASSET_NAME" '$2 == asset {print $1; exit}' \
-          "$AUDIOTEE_CHECKSUM_TEMP"
-      )"
-    fi
-    ACTUAL_AUDIOTEE_SHA256="$(shasum -a 256 "$AUDIOTEE_TEMP" | awk '{print $1}')"
-  else
-    ACTUAL_AUDIOTEE_SHA256=""
-  fi
-  if [ "${#EXPECTED_AUDIOTEE_SHA256}" -eq 64 ] \
-    && [ "$ACTUAL_AUDIOTEE_SHA256" = "$EXPECTED_AUDIOTEE_SHA256" ] \
-    && file "$AUDIOTEE_TEMP" | grep -q "Mach-O"; then
-    mv "$AUDIOTEE_TEMP" "$AUDIOTEE_DEST"
-    chmod +x "$AUDIOTEE_DEST"
-    record_audiotee_hash
-    echo "Installed prebuilt AudioTee -> $AUDIOTEE_DEST"
-  else
-    rm -f "$AUDIOTEE_TEMP"
-    if have_audiotee; then
-      echo "Could not verify refreshed AudioTee; keeping the installed binary."
-      record_audiotee_hash
-    else
-      echo "No verified prebuilt AudioTee available; falling back to a source build."
-    fi
-  fi
-  rm -f "$AUDIOTEE_CHECKSUM_TEMP"
-fi
-
-if ! have_audiotee; then
-  if command -v swift >/dev/null 2>&1; then
-    echo "Building AudioTee for per-tab audio capture..."
-    if [ ! -d "$ROOT/vendor/audiotee" ]; then
-      git clone --depth 1 https://github.com/makeusabrew/audiotee.git "$ROOT/vendor/audiotee"
-    fi
-    (cd "$ROOT/vendor/audiotee" && swift build -c release)
-    if BUILT_AUDIOTEE="$(repo_audiotee)"; then
-      install -m 755 "$BUILT_AUDIOTEE" "$AUDIOTEE_DEST"
-      record_audiotee_hash
-      echo "Installed built AudioTee -> $AUDIOTEE_DEST"
-    else
-      echo "warning: AudioTee build completed but its binary was not found." >&2
-    fi
-  else
-    echo "warning: no prebuilt AudioTee and swift not found — per-tab audio capture won't work." >&2
-    echo "         Install Xcode command line tools (xcode-select --install) and re-run." >&2
-  fi
-fi
 
 # --- done -------------------------------------------------------------------
 BIN_DIR="$(uv tool dir --bin 2>/dev/null || echo "$HOME/.local/bin")"

@@ -21,9 +21,16 @@ let package = Package(
     )
   ],
   targets: [
+    .target(
+      name: "CAudioTeeAtomics",
+      path: "Sources/CAudioTeeAtomics",
+      publicHeadersPath: "include"
+    ),
+
     // Core library with all business logic
     .target(
       name: "AudioTeeCore",
+      dependencies: ["CAudioTeeAtomics"],
       path: "Sources/AudioTeeCore"
     ),
     

@@ -50,10 +50,123 @@ def test_owned_work_dir_lifecycle():
     assert not wd.exists()
 
 
+@pytest.mark.parametrize(("width", "height"), [(319, 240), (320, 239)])
+def test_streamer_rejects_odd_yuv420p_dimensions(
+    tmp_path: Path,
+    width: int,
+    height: int,
+):
+    with pytest.raises(ValueError, match="positive even numbers"):
+        HLSStreamer(width=width, height=height, work_dir=tmp_path)
+
+
+def test_deferred_audio_is_accepted_only_after_streamer_is_running(tmp_path: Path):
+    streamer = HLSStreamer(work_dir=tmp_path)
+    assert not streamer.accepts_deferred_audio
+    streamer._lifecycle_state = "running"
+    assert streamer.accepts_deferred_audio
+    streamer.stop()
+    assert not streamer.accepts_deferred_audio
+
+
 def test_explicit_work_dir_preserved(tmp_path: Path):
     s = HLSStreamer(width=320, height=240, fps=30, work_dir=tmp_path)
     s.stop()
     assert tmp_path.exists()
+
+
+def test_receiver_delivery_observation_is_client_specific_and_time_bounded(
+    tmp_path: Path, monkeypatch
+):
+    streamer = HLSStreamer(work_dir=tmp_path, buffered=True)
+    calls = []
+    snapshot = SimpleNamespace(
+        segment_responses=4,
+        active_segment_requests=0,
+        oldest_active_segment_age_s=None,
+        latest_segment_completed_at=98.0,
+    )
+
+    class HTTP:
+        def client_delivery_snapshot(self, host):
+            calls.append(host)
+            return snapshot
+
+    streamer._http = HTTP()
+    monkeypatch.setattr(streamer_module.time, "time", lambda: 100.0)
+
+    assert streamer.receiver_delivery_observation("192.0.2.10") == (4, True)
+    assert calls == ["192.0.2.10"]
+
+    snapshot.latest_segment_completed_at = 90.0
+    assert streamer.receiver_delivery_observation("192.0.2.10") == (4, False)
+
+
+def test_receiver_routed_playlist_url_is_frozen_once(tmp_path: Path, monkeypatch):
+    streamer = HLSStreamer(work_dir=tmp_path)
+    streamer._http = SimpleNamespace(port=4321)
+    routed_hosts = []
+
+    def routed_ip(host):
+        routed_hosts.append(host)
+        return SimpleNamespace(
+            local_ip="192.168.50.12",
+            peer_hosts=("192.168.50.80",),
+        )
+
+    monkeypatch.setattr(streamer_module, "get_receiver_route", routed_ip)
+
+    url = streamer.configure_receiver("192.168.50.80")
+
+    assert url == "http://192.168.50.12:4321/stream.m3u8"
+    assert streamer.playlist_url == url
+    assert streamer.configure_receiver("192.168.50.80") == url
+    assert routed_hosts == ["192.168.50.80"]
+    with pytest.raises(RuntimeError, match="already configured"):
+        streamer.configure_receiver("192.168.50.81")
+
+
+def test_hostname_receiver_uses_numeric_http_peers_for_delivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    streamer = HLSStreamer(work_dir=tmp_path, buffered=True)
+    snapshots = {
+        "192.0.2.10": SimpleNamespace(
+            segment_responses=7,
+            active_segment_requests=0,
+            oldest_active_segment_age_s=None,
+            latest_segment_completed_at=98.0,
+        ),
+        "192.0.2.11": SimpleNamespace(
+            segment_responses=0,
+            active_segment_requests=0,
+            oldest_active_segment_age_s=None,
+            latest_segment_completed_at=None,
+        ),
+    }
+    calls: list[str] = []
+    streamer._http = SimpleNamespace(  # type: ignore[assignment]
+        port=4321,
+        client_delivery_snapshot=lambda host: (
+            calls.append(host) or snapshots[host]
+        ),
+    )
+    monkeypatch.setattr(
+        streamer_module,
+        "get_receiver_route",
+        lambda _host: SimpleNamespace(
+            local_ip="192.0.2.50",
+            peer_hosts=("192.0.2.10", "192.0.2.11"),
+        ),
+    )
+    monkeypatch.setattr(streamer_module.time, "time", lambda: 100.0)
+
+    assert streamer.configure_receiver("den-tv.local.") == (
+        "http://192.0.2.50:4321/stream.m3u8"
+    )
+    assert streamer.receiver_delivery_observation() == (7, True)
+    assert calls == ["192.0.2.10", "192.0.2.11"]
 
 
 def test_hls_stats_count_playlist_and_measure_publish_and_tv_delivery(tmp_path: Path):
@@ -294,6 +407,11 @@ def test_persistent_ffmpeg_failure_opens_circuit_without_restart_storm(
     monkeypatch.setattr(streamer_module, "FFMPEG_RESTART_MAX_FAILURES", 4)
     monkeypatch.setattr(streamer_module, "FFMPEG_RESTART_BASE_DELAY_S", 0.0)
     monkeypatch.setattr(streamer_module, "FFMPEG_RESTART_MAX_DELAY_S", 0.0)
+    monkeypatch.setattr(
+        streamer_module,
+        "preferred_video_encoder",
+        lambda: streamer_module.SOFTWARE_VIDEO_ENCODER,
+    )
 
     streamer = HLSStreamer(width=320, height=240, fps=30, work_dir=tmp_path)
     spawned: list[_DeadFfmpeg] = []
@@ -382,6 +500,117 @@ class _RecordingFfmpeg:
         self.killed = True
 
 
+def test_videotoolbox_runtime_failure_falls_back_to_x264_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    commands: list[list[str]] = []
+    processes: list[_RecordingFfmpeg] = []
+
+    def process_factory(cmd, **_kwargs):
+        commands.append(cmd)
+        process = _RecordingFfmpeg()
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(
+        streamer_module,
+        "preferred_video_encoder",
+        lambda: streamer_module.HARDWARE_VIDEO_ENCODER,
+    )
+    monkeypatch.setattr(streamer_module, "FfmpegProcess", process_factory)
+    monkeypatch.setattr(streamer_module, "FFMPEG_RESTART_BASE_DELAY_S", 0.0)
+    monkeypatch.setattr(streamer_module, "FFMPEG_RESTART_MAX_DELAY_S", 0.0)
+
+    streamer = HLSStreamer(fps=30, work_dir=tmp_path)
+    streamer._start_ffmpeg()
+    first = streamer._ffmpeg
+    assert first is processes[0]
+    assert commands[0][commands[0].index("-c:v") + 1] == "h264_videotoolbox"
+
+    assert streamer._recover_ffmpeg(
+        first,
+        streamer._ffmpeg_generation,
+        BrokenPipeError("hardware encoder rejected the frame"),
+    )
+    assert streamer._video_encoder == streamer_module.SOFTWARE_VIDEO_ENCODER
+    assert commands[1][commands[1].index("-c:v") + 1] == "libx264"
+    assert commands[1][commands[1].index("-level") + 1] == "4.1"
+
+    # Manual/audio-offset relaunches must never silently opt back into the
+    # runtime-broken hardware encoder during this cast.
+    assert streamer._relaunch_ffmpeg(reset_failures=True)
+    assert commands[2][commands[2].index("-c:v") + 1] == "libx264"
+    assert sum("h264_videotoolbox" in command for command in commands) == 1
+    streamer.stop()
+
+
+def test_stale_hardware_failure_cannot_downgrade_concurrent_relaunch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    diagnostic_started = threading.Event()
+    release_diagnostic = threading.Event()
+
+    class SlowDiagnosticFfmpeg(_RecordingFfmpeg):
+        def stderr_text(self, *, join_timeout=1.0):
+            del join_timeout
+            diagnostic_started.set()
+            assert release_diagnostic.wait(timeout=1)
+            return "stale VideoToolbox failure"
+
+    monkeypatch.setattr(
+        streamer_module,
+        "preferred_video_encoder",
+        lambda: streamer_module.HARDWARE_VIDEO_ENCODER,
+    )
+    streamer = HLSStreamer(fps=30, work_dir=tmp_path)
+    failed = SlowDiagnosticFfmpeg()
+    healthy = _RecordingFfmpeg()
+    streamer._ffmpeg = failed  # type: ignore[assignment]
+    streamer._ffmpeg_generation = 1
+    starts: list[bool] = []
+
+    def start_healthy() -> None:
+        starts.append(True)
+        streamer._ffmpeg = healthy  # type: ignore[assignment]
+        streamer._ffmpeg_generation += 1
+        streamer._ffmpeg_started_at = time.monotonic()
+
+    monkeypatch.setattr(streamer, "_start_ffmpeg", start_healthy)
+    results: list[bool] = []
+    failures: list[BaseException] = []
+
+    def recover_stale_failure() -> None:
+        try:
+            results.append(
+                streamer._recover_ffmpeg(
+                    failed,  # type: ignore[arg-type]
+                    1,
+                    BrokenPipeError("old hardware pipe broke"),
+                )
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    recovery = threading.Thread(target=recover_stale_failure)
+    recovery.start()
+    assert diagnostic_started.wait(timeout=1)
+
+    assert streamer._relaunch_ffmpeg(expected_generation=1, reset_failures=True)
+    assert streamer._ffmpeg is healthy
+    release_diagnostic.set()
+    recovery.join(timeout=1)
+
+    assert not recovery.is_alive()
+    assert failures == []
+    assert results == [True]
+    assert starts == [True]
+    assert streamer._video_encoder == streamer_module.HARDWARE_VIDEO_ENCODER
+    assert streamer._ffmpeg is healthy
+    streamer.stop()
+
+
 def test_video_demux_queue_is_bounded_to_one_second(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -456,6 +685,99 @@ def test_stop_kills_ffmpeg_before_joining_wedged_writer(tmp_path: Path):
     assert elapsed < 1.0
 
 
+def test_streamer_retains_ffmpeg_until_retry_confirms_cleanup(tmp_path: Path):
+    streamer = HLSStreamer(work_dir=tmp_path)
+
+    class FlakyFfmpeg:
+        def __init__(self):
+            self.kill_calls = 0
+
+        def kill(self, *, graceful=False):
+            del graceful
+            self.kill_calls += 1
+            if self.kill_calls == 1:
+                raise TimeoutError("ffmpeg still alive")
+
+    process = FlakyFfmpeg()
+    streamer._ffmpeg = process  # type: ignore[assignment]
+
+    with pytest.raises(TimeoutError, match="still alive"):
+        streamer.stop()
+
+    assert streamer._ffmpeg is process
+    assert streamer._lifecycle_state == "stopping"
+
+    streamer.stop()
+    assert process.kill_calls == 2
+    assert streamer._ffmpeg is None
+    assert streamer._lifecycle_state == "stopped"
+
+
+def test_streamer_retains_ffmpeg_after_repeated_cleanup_failure(tmp_path: Path):
+    streamer = HLSStreamer(work_dir=tmp_path)
+
+    class UnreapableFfmpeg:
+        kill_calls = 0
+
+        def kill(self, *, graceful=False):
+            del graceful
+            self.kill_calls += 1
+            raise TimeoutError(f"ffmpeg cleanup attempt {self.kill_calls} failed")
+
+    process = UnreapableFfmpeg()
+    streamer._ffmpeg = process  # type: ignore[assignment]
+
+    for attempt in (1, 2):
+        with pytest.raises(TimeoutError, match=f"attempt {attempt} failed"):
+            streamer.stop()
+
+    assert process.kill_calls == 2
+    assert streamer._ffmpeg is process
+    assert streamer._lifecycle_state == "stopping"
+
+
+@pytest.mark.parametrize(
+    ("thread_attr", "stops_after", "message"),
+    [
+        ("_sampler_thread", 2, "sampler thread did not stop"),
+        # Writer gets a short grace join and a final post-kill completion join
+        # on its first pass, then exits during the second pass's grace join.
+        ("_writer_thread", 3, "writer thread did not stop"),
+    ],
+)
+def test_streamer_retries_live_worker_thread_join(
+    tmp_path: Path,
+    thread_attr: str,
+    stops_after: int,
+    message: str,
+) -> None:
+    streamer = HLSStreamer(work_dir=tmp_path)
+
+    class SlowThread:
+        def __init__(self):
+            self.join_calls = 0
+
+        def is_alive(self):
+            return self.join_calls < stops_after
+
+        def join(self, *, timeout):
+            del timeout
+            self.join_calls += 1
+
+    thread = SlowThread()
+    setattr(streamer, thread_attr, thread)
+
+    with pytest.raises(TimeoutError, match=message):
+        streamer.stop()
+
+    assert getattr(streamer, thread_attr) is thread
+    assert streamer._lifecycle_state == "stopping"
+
+    streamer.stop()
+    assert not thread.is_alive()
+    assert streamer._lifecycle_state == "stopped"
+
+
 def test_audio_offset_is_clamped_for_storage_filter_and_return_value(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -488,6 +810,175 @@ def test_audio_offset_is_clamped_for_storage_filter_and_return_value(
     streamer.stop()
 
 
+def test_replace_audio_source_swaps_pipe_at_joint_timeline_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_format = streamer_module.AudioFormat(48_000, 2, "f32le", 4)
+    new_format = streamer_module.AudioFormat(44_100, 2, "s16le", 2)
+    streamer = HLSStreamer(
+        width=320,
+        height=240,
+        audio_fd=11,
+        audio_format=old_format,
+        work_dir=tmp_path,
+    )
+    streamer._lifecycle_state = "running"
+    streamer._ffmpeg = object()  # type: ignore[assignment]
+    streamer._pending_timeline_resync = (0, "old boundary")
+    events: list[object] = []
+
+    def kill_ffmpeg(*, graceful=False):
+        events.append(("kill", graceful))
+        streamer._ffmpeg = None
+
+    def clear_queue():
+        events.append("clear")
+        return 3
+
+    def start_ffmpeg():
+        events.append(("start", streamer.audio_fd, streamer.audio_format))
+        streamer._ffmpeg = object()  # type: ignore[assignment]
+
+    monkeypatch.setattr(streamer, "_kill_ffmpeg", kill_ffmpeg)
+    monkeypatch.setattr(streamer._queue, "clear", clear_queue)
+    monkeypatch.setattr(streamer, "_start_ffmpeg", start_ffmpeg)
+
+    assert streamer.begin_audio_source_replacement()
+    assert streamer.complete_audio_source_replacement(22, new_format)
+
+    assert events == [
+        ("kill", False),
+        "clear",
+        ("start", 22, new_format),
+    ]
+    assert streamer.audio_fd == 22
+    assert streamer.audio_format == new_format
+    assert streamer._pending_timeline_resync is None
+    streamer._ffmpeg = None
+    streamer.stop()
+
+
+def test_replace_audio_source_during_startup_preserves_first_frame_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    new_format = streamer_module.AudioFormat(44_100, 2, "s16le", 2)
+    streamer = HLSStreamer(audio_fd=11, work_dir=tmp_path)
+    streamer._lifecycle_state = "starting"
+    monkeypatch.setattr(
+        streamer,
+        "_start_ffmpeg",
+        lambda: (_ for _ in ()).throw(AssertionError("spawned before first frame")),
+    )
+
+    assert streamer.begin_audio_source_replacement()
+    assert streamer.complete_audio_source_replacement(22, new_format)
+    assert streamer.audio_fd == 22
+    assert streamer.audio_format == new_format
+    streamer.stop()
+
+
+def test_replace_audio_source_rejects_shutdown_without_mutating_input(
+    tmp_path: Path,
+) -> None:
+    original_format = streamer_module.AudioFormat(48_000, 2, "f32le", 4)
+    streamer = HLSStreamer(
+        audio_fd=11,
+        audio_format=original_format,
+        work_dir=tmp_path,
+    )
+    streamer.stop()
+
+    assert not streamer.begin_audio_source_replacement()
+    assert streamer.audio_fd == 11
+    assert streamer.audio_format == original_format
+
+
+def test_audio_replacement_blocks_every_other_ffmpeg_relaunch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    streamer = HLSStreamer(audio_fd=11, work_dir=tmp_path)
+    streamer._lifecycle_state = "running"
+    streamer._ffmpeg = object()  # type: ignore[assignment]
+    starts: list[int | None] = []
+
+    def kill_ffmpeg(*, graceful=False):
+        del graceful
+        streamer._ffmpeg = None
+
+    def start_ffmpeg():
+        starts.append(streamer.audio_fd)
+        streamer._ffmpeg = object()  # type: ignore[assignment]
+
+    monkeypatch.setattr(streamer, "_kill_ffmpeg", kill_ffmpeg)
+    monkeypatch.setattr(streamer, "_start_ffmpeg", start_ffmpeg)
+
+    generation = streamer._ffmpeg_generation
+    assert streamer.begin_audio_source_replacement()
+    assert streamer.set_audio_offset_ms(25) == 25
+    assert not streamer._relaunch_ffmpeg(expected_generation=generation)
+    assert starts == []
+
+    assert streamer.complete_audio_source_replacement(22)
+    assert starts == [22]
+    streamer._ffmpeg = None
+    streamer.stop()
+
+
+def test_audio_replacement_spawn_failure_is_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    streamer = HLSStreamer(audio_fd=11, work_dir=tmp_path)
+    streamer._lifecycle_state = "running"
+    streamer._ffmpeg = object()  # type: ignore[assignment]
+
+    def kill_ffmpeg(*, graceful=False):
+        del graceful
+        streamer._ffmpeg = None
+
+    monkeypatch.setattr(streamer, "_kill_ffmpeg", kill_ffmpeg)
+    monkeypatch.setattr(
+        streamer,
+        "_start_ffmpeg",
+        lambda: (_ for _ in ()).throw(OSError("spawn broke")),
+    )
+
+    assert streamer.begin_audio_source_replacement()
+    with pytest.raises(OSError, match="spawn broke"):
+        streamer.complete_audio_source_replacement(22)
+
+    assert streamer._stopped.is_set()
+    assert streamer.fatal_error is not None
+    assert "committing replacement audio" in str(streamer.fatal_error)
+    assert not streamer._audio_replacement_in_progress
+    streamer.stop()
+
+
+def test_reentrant_stop_during_audio_teardown_does_not_deadlock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    streamer = HLSStreamer(audio_fd=11, work_dir=tmp_path)
+    streamer._lifecycle_state = "running"
+    streamer._ffmpeg = object()  # type: ignore[assignment]
+    kill_calls = 0
+
+    def reentrant_kill(*, graceful=False):
+        nonlocal kill_calls
+        del graceful
+        kill_calls += 1
+        streamer._ffmpeg = None
+        if kill_calls == 1:
+            streamer.stop()
+
+    monkeypatch.setattr(streamer, "_kill_ffmpeg", reentrant_kill)
+
+    started = time.monotonic()
+    assert not streamer.begin_audio_source_replacement()
+
+    assert time.monotonic() - started < 1.0
+    assert kill_calls == 2
+    assert not streamer._audio_replacement_in_progress
+
+
 def test_start_polls_external_health_while_waiting_for_first_frame(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -500,6 +991,186 @@ def test_start_polls_external_health_while_waiting_for_first_frame(
 
     assert caught.value is failure
     assert streamer._ffmpeg is None
+    streamer.stop()
+
+
+def test_first_frame_wait_drains_more_than_audio_pipe_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(write_fd, False)
+    streamer = HLSStreamer(audio_fd=read_fd, work_dir=tmp_path)
+    streamer.FIRST_FRAME_TIMEOUT_S = 2.0
+    monkeypatch.setattr(streamer_module, "HEALTH_POLL_S", 0.0001)
+    calls = 0
+
+    def produce_audio() -> None:
+        nonlocal calls
+        calls += 1
+        # 1024 writes are 64x this Mac's 64KiB pipe capacity. Without a
+        # startup consumer, the 17th nonblocking write deterministically fails.
+        os.write(write_fd, b"\0" * 4096)
+        if calls >= 1024:
+            streamer._first_frame.set()
+
+    try:
+        assert streamer._wait_for_first_frame(produce_audio)
+        assert calls >= 1024
+        assert streamer_module._pipe_bytes_available(read_fd) == 0
+    finally:
+        streamer.stop()
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_first_frame_wait_drains_audio_fd_replaced_by_health_check(
+    tmp_path: Path,
+) -> None:
+    old_read, old_write = os.pipe()
+    new_read, new_write = os.pipe()
+    streamer = HLSStreamer(audio_fd=old_read, work_dir=tmp_path)
+    os.write(old_write, b"old pre-roll")
+    health_calls = 0
+
+    def replace_audio() -> None:
+        nonlocal health_calls
+        health_calls += 1
+        if health_calls == 1:
+            streamer.audio_fd = new_read
+            os.write(new_write, b"new pre-roll")
+            streamer._first_frame.set()
+
+    try:
+        assert streamer._wait_for_first_frame(replace_audio)
+        assert streamer_module._pipe_bytes_available(old_read) == 0
+        assert streamer_module._pipe_bytes_available(new_read) == 0
+    finally:
+        streamer.stop()
+        for fd in (old_read, old_write, new_read, new_write):
+            os.close(fd)
+
+
+def test_final_audio_drain_precedes_ffmpeg_process_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b"buffered-before-joint-boundary")
+    observed: list[tuple[int, tuple[int, ...]]] = []
+    process = _RecordingFfmpeg()
+
+    def process_factory(_cmd, *, pass_fds=(), **_kwargs):
+        observed.append(
+            (streamer_module._pipe_bytes_available(read_fd), pass_fds)
+        )
+        return process
+
+    monkeypatch.setattr(streamer_module, "FfmpegProcess", process_factory)
+    monkeypatch.setattr(
+        streamer_module, "video_encoder_args", lambda *_args, **_kwargs: []
+    )
+    streamer = HLSStreamer(audio_fd=read_fd, work_dir=tmp_path)
+    try:
+        streamer._start_ffmpeg()
+        assert observed == [(0, (read_fd,))]
+    finally:
+        streamer.stop()
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_audio_drain_budget_covers_native_relaunch_runway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    streamer = HLSStreamer(audio_fd=123, work_dir=tmp_path)
+    remaining = streamer.audio_format.bytes_per_second * 5
+
+    def available(_fd):
+        return min(remaining, 1 << 16)
+
+    def read(_fd, count):
+        nonlocal remaining
+        consumed = min(count, remaining)
+        remaining -= consumed
+        return b"\0" * consumed
+
+    monkeypatch.setattr(streamer_module, "_pipe_bytes_available", available)
+    monkeypatch.setattr(streamer_module.os, "read", read)
+
+    dropped = streamer._drain_audio_fd(report=False)
+
+    assert remaining == 0
+    assert dropped == streamer.audio_format.bytes_per_second * 5
+    streamer.stop()
+
+
+def test_ffmpeg_teardown_drains_audio_concurrently_with_slow_reap(
+    tmp_path: Path,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(write_fd, False)
+    streamer = HLSStreamer(audio_fd=read_fd, work_dir=tmp_path)
+    kill_started = threading.Event()
+    producer_done = threading.Event()
+
+    class SlowFfmpeg:
+        def kill(self, *, graceful=False):
+            del graceful
+            kill_started.set()
+            assert producer_done.wait(timeout=1)
+            time.sleep(0.05)
+
+    streamer._ffmpeg = SlowFfmpeg()  # type: ignore[assignment]
+    producer_failures: list[BaseException] = []
+
+    def produce() -> None:
+        try:
+            assert kill_started.wait(timeout=1)
+            for _ in range(128):
+                os.write(write_fd, b"\0" * 4096)
+                time.sleep(0.001)
+        except BaseException as exc:
+            producer_failures.append(exc)
+        finally:
+            producer_done.set()
+
+    producer = threading.Thread(target=produce)
+    producer.start()
+    try:
+        streamer._kill_ffmpeg()
+        producer.join(timeout=1)
+
+        assert not producer.is_alive()
+        assert producer_failures == []
+        assert streamer_module._pipe_bytes_available(read_fd) == 0
+        assert streamer._ffmpeg is None
+    finally:
+        if producer.is_alive():
+            producer.join(timeout=1)
+        streamer.stop()
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_start_without_first_video_frame_never_spawns_ffmpeg(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    streamer = HLSStreamer(audio_fd=11, work_dir=tmp_path)
+    streamer.FIRST_FRAME_TIMEOUT_S = 0.01
+    monkeypatch.setattr(streamer_module.shutil, "which", lambda _name: "/fake/ffmpeg")
+    monkeypatch.setattr(
+        streamer,
+        "_start_ffmpeg",
+        lambda: (_ for _ in ()).throw(AssertionError("ffmpeg must not spawn")),
+    )
+
+    with pytest.raises(TimeoutError, match="first captured video frame"):
+        streamer.start()
+
+    assert streamer._ffmpeg is None
+    assert streamer._sampler_thread is None
+    assert streamer._writer_thread is None
+    assert streamer._http is None
     streamer.stop()
 
 
@@ -560,6 +1231,11 @@ def test_one_accepted_frame_does_not_reset_restart_circuit(
     monkeypatch.setattr(streamer_module, "FFMPEG_RESTART_BASE_DELAY_S", 0.0)
     monkeypatch.setattr(streamer_module, "FFMPEG_RESTART_MAX_DELAY_S", 0.0)
     monkeypatch.setattr(streamer_module, "FFMPEG_RESTART_STABLE_S", 60.0)
+    monkeypatch.setattr(
+        streamer_module,
+        "preferred_video_encoder",
+        lambda: streamer_module.SOFTWARE_VIDEO_ENCODER,
+    )
 
     streamer = HLSStreamer(width=320, height=240, fps=30, work_dir=tmp_path)
     spawned: list[_OneFrameFfmpeg] = []
@@ -594,6 +1270,11 @@ def test_health_check_recovers_wedged_writes_then_opens_circuit(
     monkeypatch.setattr(streamer_module, "FFMPEG_RESTART_BASE_DELAY_S", 0.0)
     monkeypatch.setattr(streamer_module, "FFMPEG_RESTART_MAX_DELAY_S", 0.0)
     monkeypatch.setattr(streamer_module, "FFMPEG_WRITE_STALL_S", 0.0)
+    monkeypatch.setattr(
+        streamer_module,
+        "preferred_video_encoder",
+        lambda: streamer_module.HARDWARE_VIDEO_ENCODER,
+    )
 
     streamer = HLSStreamer(width=320, height=240, fps=30, work_dir=tmp_path)
     spawned: list[_WedgedFfmpeg] = []
@@ -610,17 +1291,60 @@ def test_health_check_recovers_wedged_writes_then_opens_circuit(
     spawn_wedged_ffmpeg()
     streamer._start_writer_thread()
 
-    for failure_number in range(1, streamer_module.FFMPEG_RESTART_MAX_FAILURES + 1):
+    total_failures = streamer_module.FFMPEG_RESTART_MAX_FAILURES * 2
+    for failure_number in range(1, total_failures + 1):
         process = spawned[-1]
         assert process.stdin.entered.wait(timeout=1)
-        if failure_number < streamer_module.FFMPEG_RESTART_MAX_FAILURES:
+        if failure_number < total_failures:
             streamer.raise_if_failed()
         else:
             with pytest.raises(RuntimeError, match="encoder recovery stopped"):
                 streamer.raise_if_failed()
 
-    assert len(spawned) == streamer_module.FFMPEG_RESTART_MAX_FAILURES
+    # Hardware gets its bounded recovery budget, then x264 gets an independent
+    # budget before the stream becomes terminal.
+    assert len(spawned) == total_failures
+    assert streamer._video_encoder == streamer_module.SOFTWARE_VIDEO_ENCODER
     assert streamer.fatal_error is not None
+    streamer.stop()
+
+
+def test_pipe_failure_after_hardware_resync_budget_still_attempts_x264(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(streamer_module, "FFMPEG_RESTART_MAX_FAILURES", 3)
+    monkeypatch.setattr(streamer_module, "FFMPEG_RESTART_BASE_DELAY_S", 0.0)
+    monkeypatch.setattr(streamer_module, "FFMPEG_RESTART_MAX_DELAY_S", 0.0)
+    monkeypatch.setattr(
+        streamer_module,
+        "preferred_video_encoder",
+        lambda: streamer_module.HARDWARE_VIDEO_ENCODER,
+    )
+    streamer = HLSStreamer(work_dir=tmp_path)
+    old = _DeadFfmpeg()
+    replacement = _RecordingFfmpeg()
+    starts: list[str] = []
+    streamer._ffmpeg = old  # type: ignore[assignment]
+    streamer._ffmpeg_generation = 7
+    streamer._consecutive_ffmpeg_failures = (
+        streamer_module.FFMPEG_RESTART_MAX_FAILURES - 1
+    )
+
+    def start_replacement() -> None:
+        starts.append(streamer._video_encoder)
+        streamer._ffmpeg = replacement  # type: ignore[assignment]
+        streamer._ffmpeg_generation += 1
+        streamer._ffmpeg_started_at = time.monotonic()
+
+    monkeypatch.setattr(streamer, "_start_ffmpeg", start_replacement)
+
+    assert streamer._recover_ffmpeg(old, 7, BrokenPipeError("VT pipe failed"))
+
+    assert starts == [streamer_module.SOFTWARE_VIDEO_ENCODER]
+    assert streamer._video_encoder == streamer_module.SOFTWARE_VIDEO_ENCODER
+    assert streamer._consecutive_ffmpeg_failures == 0
+    assert streamer.fatal_error is None
     streamer.stop()
 
 
@@ -808,6 +1532,60 @@ def test_sampler_new_generation_holds_static_page_and_rejects_delayed_old_frame(
     streamer.stop()
 
 
+def test_sampler_refreshes_clock_after_waiting_for_generation_reanchor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(streamer_module, "SAMPLER_MAX_CATCHUP_S", 0.02)
+    stats = PipelineStats(target_fps=100.0)
+    streamer = HLSStreamer(fps=100, work_dir=tmp_path, stats=stats)
+    streamer._ffmpeg = _RecordingFfmpeg()  # type: ignore[assignment]
+    streamer._ffmpeg_generation = 1
+    streamer._ffmpeg_video_boundary = (1, None)
+    streamer._latest.publish(b"initial")
+
+    real_lock = streamer._ffmpeg_lock
+    sampler_blocked = threading.Event()
+    release_sampler = threading.Event()
+
+    class ThirdEntryGate:
+        def __init__(self) -> None:
+            self.entries = 0
+
+        def __enter__(self):
+            self.entries += 1
+            # First sampler tick enters once to snapshot the generation and
+            # once to enqueue. Block its next generation snapshot after that
+            # tick's monotonic timestamp has already been captured.
+            if self.entries == 3:
+                sampler_blocked.set()
+                assert release_sampler.wait(timeout=1.0)
+            real_lock.acquire()
+            return self
+
+        def __exit__(self, *_exc_info):
+            real_lock.release()
+
+    streamer._ffmpeg_lock = ThirdEntryGate()  # type: ignore[assignment]
+    streamer._start_sampler_thread()
+    assert sampler_blocked.wait(timeout=1.0)
+
+    # Exceed both a frame period and the reduced catch-up budget while the
+    # sampler is waiting to observe a completed generation change.
+    time.sleep(0.08)
+    with real_lock:
+        streamer._ffmpeg_generation = 2
+        boundary_at = time.monotonic()
+        streamer._ffmpeg_video_boundary = (2, boundary_at)
+        assert streamer._latest.reanchor_latest(boundary_at) is not None
+    release_sampler.set()
+    time.sleep(0.08)
+
+    assert streamer._pending_timeline_resync is None
+    assert stats.snapshot(0.2).resyncs == 0
+    streamer.stop()
+
+
 def test_sampler_clock_skip_requests_generation_boundary_and_counts_loss(
     tmp_path: Path,
 ):
@@ -939,6 +1717,24 @@ def test_stop_cannot_return_before_concurrent_start_publishes_resources(
         streamer.start()
 
 
+def test_same_thread_stop_reenters_guarded_streamer_startup_without_deadlock(
+    tmp_path: Path,
+):
+    streamer = HLSStreamer(work_dir=tmp_path)
+    streamer._lifecycle_state = "starting"
+    results: list[bool] = []
+
+    thread = threading.Thread(
+        target=lambda: results.append(streamer._startup_step(streamer.stop))
+    )
+    thread.start()
+    thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert results == [False]
+    assert streamer._lifecycle_state == "stopped"
+
+
 def test_stop_continues_http_and_workdir_cleanup_after_ffmpeg_failure():
     streamer = HLSStreamer(width=320, height=240)
     work_dir = streamer.work_dir
@@ -1012,6 +1808,11 @@ def test_recovery_does_not_replace_new_generation_during_backoff(
             self.killed = True
 
     monkeypatch.setattr(streamer_module, "FFMPEG_RESTART_BASE_DELAY_S", 1.0)
+    monkeypatch.setattr(
+        streamer_module,
+        "preferred_video_encoder",
+        lambda: streamer_module.SOFTWARE_VIDEO_ENCODER,
+    )
     streamer = HLSStreamer(work_dir=tmp_path)
     gate = GateEvent()
     streamer._stopped = gate  # type: ignore[assignment]

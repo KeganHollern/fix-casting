@@ -2,14 +2,18 @@
 
 import io
 import subprocess
+import threading
 from collections import deque
 from types import SimpleNamespace
+
+import pytest
 
 import cast_tab.encoder as encoder
 from cast_tab.encoder import (
     FfmpegProcess,
     default_fps_for_resolution,
     estimated_hls_holdback_s,
+    h264_main_level,
     hls_args,
     hls_playlist_retention_s,
     hls_segment_duration_s,
@@ -17,6 +21,159 @@ from cast_tab.encoder import (
     video_encoder_args,
 )
 from cast_tab.stats import PipelineStats
+
+
+def test_ffmpeg_constructor_reaps_child_when_stderr_thread_cannot_start(
+    monkeypatch,
+):
+    class FakeProcess:
+        def __init__(self):
+            self.stdin = io.BytesIO()
+            self.stdout = None
+            self.stderr = io.BytesIO()
+            self.returncode = None
+            self.terminated = False
+            self.killed = False
+            self.wait_timeouts = []
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, *, timeout):
+            self.wait_timeouts.append(timeout)
+            self.returncode = -15
+            return self.returncode
+
+    class BrokenThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("thread creation failed")
+
+    proc = FakeProcess()
+    monkeypatch.setattr(encoder.subprocess, "Popen", lambda *_a, **_kw: proc)
+    monkeypatch.setattr(encoder.threading, "Thread", BrokenThread)
+
+    with pytest.raises(RuntimeError, match="thread creation failed"):
+        FfmpegProcess(["ffmpeg"])
+
+    assert proc.terminated is True
+    assert proc.killed is False
+    assert proc.wait_timeouts == [1]
+    assert proc.stdin.closed
+    assert proc.stderr.closed
+
+
+def test_ffmpeg_kill_surfaces_unreaped_child_for_owner_retry():
+    class Process:
+        def __init__(self):
+            self.stdin = io.BytesIO()
+            self.returncode = None
+            self.wait_calls = 0
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+        def wait(self, *, timeout):
+            del timeout
+            self.wait_calls += 1
+            if self.wait_calls <= 2:
+                raise subprocess.TimeoutExpired("ffmpeg", 3)
+            self.returncode = -9
+            return self.returncode
+
+    process = FfmpegProcess.__new__(FfmpegProcess)
+    process._proc = Process()
+
+    with pytest.raises(TimeoutError, match="reaped after SIGKILL"):
+        process.kill()
+
+    assert process.poll() is None
+    process.kill()
+    assert process.poll() == -9
+    assert process.stdin.closed
+
+
+def test_ffmpeg_kill_does_not_close_locked_stdin_until_child_is_reaped():
+    class LockedStdin:
+        def __init__(self, owner):
+            self.owner = owner
+            self.close_calls = 0
+            self.release = threading.Event()
+
+        def close(self):
+            self.close_calls += 1
+            if self.owner.returncode is None:
+                # Model BufferedWriter.close() waiting on the lock held by a
+                # writer whose pipe write cannot finish while ffmpeg is live.
+                self.release.wait(timeout=10)
+
+    class Process:
+        def __init__(self):
+            self.returncode = None
+            self.wait_calls = 0
+            self.stdin = LockedStdin(self)
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+        def wait(self, *, timeout):
+            del timeout
+            self.wait_calls += 1
+            if self.wait_calls <= 2:
+                raise subprocess.TimeoutExpired("ffmpeg", 3)
+            self.returncode = -9
+            return self.returncode
+
+    child = Process()
+    process = FfmpegProcess.__new__(FfmpegProcess)
+    process._proc = child
+    failures = []
+    completed = threading.Event()
+
+    def first_cleanup_attempt():
+        try:
+            process.kill()
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            completed.set()
+
+    worker = threading.Thread(target=first_cleanup_attempt)
+    worker.start()
+    try:
+        assert completed.wait(timeout=0.5), "kill blocked trying to close live stdin"
+    finally:
+        child.stdin.release.set()
+        worker.join(timeout=1)
+
+    assert len(failures) == 1
+    assert isinstance(failures[0], TimeoutError)
+    assert child.returncode is None
+    assert child.stdin.close_calls == 0
+
+    process.kill()
+    assert child.returncode == -9
+    assert child.stdin.close_calls == 1
 
 
 def test_quiet_summary_stats_do_not_suppress_ffmpeg_diagnostics(capsys):
@@ -90,6 +247,77 @@ def test_video_encoder_args_gop():
     assert keyint == "30"
     args = video_encoder_args(30, 1920, 1080, buffered=False)
     assert args[args.index("-g") + 1] == "30"  # 1s GOP unbuffered
+
+
+def test_software_encoder_advertises_a_valid_level_for_each_video_mode():
+    cases = (
+        (640, 480, 30, "3.0"),
+        (1280, 720, 30, "3.1"),
+        (1280, 720, 60, "3.2"),
+        # The production profile's 36M VBV requires Level 4.1 even though
+        # 1080p30's macroblock rate alone fits Level 4.0.
+        (1920, 1080, 30, "4.1"),
+        (1920, 1080, 60, "4.2"),
+        (3840, 2160, 60, "5.2"),
+    )
+    for width, height, fps, expected_level in cases:
+        args = video_encoder_args(
+            fps,
+            width,
+            height,
+            buffered=True,
+            encoder=encoder.SOFTWARE_VIDEO_ENCODER,
+        )
+        assert args[args.index("-level") + 1] == expected_level
+
+
+def test_h264_level_accounts_for_main_profile_bitrate_limit():
+    assert h264_main_level(1280, 720, 30, maxrate_mbps=14) == "3.1"
+    assert h264_main_level(1280, 720, 30, maxrate_mbps=20) == "3.2"
+
+
+def test_h264_level_accounts_for_coded_picture_buffer_limit():
+    assert (
+        h264_main_level(
+            1920,
+            1080,
+            30,
+            maxrate_mbps=18,
+            bufsize_mbits=25,
+        )
+        == "4.0"
+    )
+    assert (
+        h264_main_level(
+            1920,
+            1080,
+            30,
+            maxrate_mbps=18,
+            bufsize_mbits=36,
+        )
+        == "4.1"
+    )
+
+
+def test_h264_level_accounts_for_per_dimension_macroblock_limit():
+    # Product-only MaxFS checks would incorrectly choose 3.0 for this shape;
+    # Annex A also caps either picture dimension to sqrt(MaxFS * 8).
+    assert h264_main_level(3000, 16, 30, maxrate_mbps=1) == "3.2"
+
+
+def test_video_encoder_args_rejects_unknown_encoder():
+    try:
+        video_encoder_args(
+            30,
+            1920,
+            1080,
+            buffered=True,
+            encoder="mystery_h264",
+        )
+    except ValueError as exc:
+        assert "Unsupported H.264 encoder" in str(exc)
+    else:
+        raise AssertionError("unknown encoder was accepted")
 
 
 def test_hls_args_retention_and_estimated_holdback_are_consistent():

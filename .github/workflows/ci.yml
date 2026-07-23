@@ -20,6 +20,13 @@ jobs:
       - name: Unit tests
         run: uv run pytest -q
 
+  native-audiotee:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native AudioTee tests
+        run: swift test --package-path vendor/audiotee
+
   pipeline-sync:
     # The A/V-sync regression needs ffmpeg with h264 encoding; macOS matches
     # the platform the tool actually runs on (VideoToolbox path).

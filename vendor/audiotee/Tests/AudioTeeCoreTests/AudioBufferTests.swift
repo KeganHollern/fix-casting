@@ -38,8 +38,9 @@ final class AudioBufferTests: XCTestCase {
 
   /// Appends Data to an AudioBuffer via the raw pointer path,
   /// matching how processAudio() calls append(from:count:).
-  private func appendData(_ data: Data, to buffer: AudioBuffer) {
-    data.withUnsafeBytes { bytes in
+  @discardableResult
+  private func appendData(_ data: Data, to buffer: AudioBuffer) -> Bool {
+    return data.withUnsafeBytes { bytes in
       buffer.append(from: bytes.baseAddress!, count: bytes.count)
     }
   }
@@ -170,7 +171,7 @@ final class AudioBufferTests: XCTestCase {
     appendData(makeData(byte: 0x01, count: maxBuffer), to: buffer)
 
     // Try to append more — should be silently rejected (overflow guard)
-    appendData(makeData(byte: 0x02, count: 100), to: buffer)
+    XCTAssertFalse(appendData(makeData(byte: 0x02, count: 100), to: buffer))
 
     // Drain and verify we only got the original data
     let chunks = collectChunks(from: buffer)

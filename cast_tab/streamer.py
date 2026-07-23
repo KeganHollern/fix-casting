@@ -20,11 +20,14 @@ from typing import Callable
 from cast_tab.audio import DEFAULT_AUDIO_FORMAT, AudioFormat, _pipe_bytes_available
 from cast_tab.encoder import (  # re-exported for callers (cli, tools)
     DEFAULT_JPEG_QUALITY,
+    HARDWARE_VIDEO_ENCODER,
+    SOFTWARE_VIDEO_ENCODER,
     FfmpegProcess,
     codec_label,
     default_fps_for_resolution,
     hls_args,
     hls_segment_duration_s,
+    preferred_video_encoder,
     video_encoder_args,
 )
 from cast_tab.pacing import BoundedFrameQueue, LatestFrame
@@ -32,6 +35,7 @@ from cast_tab.server import (
     HLSDiscontinuitySequenceNormalizer,
     HLSHTTPServer,
     get_local_ip,
+    get_receiver_route,
 )
 from cast_tab.stats import PipelineStats
 
@@ -109,6 +113,10 @@ class HLSStreamer:
         work_dir: Path | None = None,
         stats: PipelineStats | None = None,
     ) -> None:
+        if width <= 0 or height <= 0 or width % 2 or height % 2:
+            raise ValueError(
+                "HLS video dimensions must be positive even numbers for yuv420p"
+            )
         self.width = width
         self.height = height
         self.fps = fps
@@ -148,14 +156,26 @@ class HLSStreamer:
         self._writer_thread: threading.Thread | None = None
         self._http: HLSHTTPServer | None = None
         self._port = port
+        self._receiver_host: str | None = None
+        self._receiver_client_hosts: tuple[str, ...] = ()
+        self._playlist_url: str | None = None
         self._stopped = threading.Event()
         self._stats = stats
-        self._ffmpeg_lock = threading.Lock()
+        # Signal handlers can re-enter stop() on the main thread during an
+        # audio-source/ffmpeg transaction. Reentrancy avoids self-deadlock;
+        # generation checks still protect ordinary cross-thread races.
+        self._ffmpeg_lock = threading.RLock()
         self._stop_lock = threading.Lock()
-        self._lifecycle_lock = threading.Lock()
+        # A POSIX signal handler runs on the interrupted main thread and may
+        # re-enter stop() while start() is inside a guarded resource factory.
+        self._lifecycle_lock = threading.RLock()
         self._lifecycle_state = "new"
         self._fatal_lock = threading.Lock()
         self._fatal_error: RuntimeError | None = None
+        # Encoder availability only proves ffmpeg was built with VideoToolbox;
+        # the hardware session can still fail at runtime. Once that happens,
+        # every later generation in this stream stays on libx264.
+        self._video_encoder = preferred_video_encoder()
         self._consecutive_ffmpeg_failures = 0
         self._ffmpeg_generation = 0
         self._ffmpeg_started_at: float | None = None
@@ -198,13 +218,80 @@ class HLSStreamer:
         # generation tag prevents an old overflow/stall request from killing a
         # fresh process installed concurrently by a manual offset relaunch.
         self._pending_timeline_resync: tuple[int, str] | None = None
+        self._audio_replacement_in_progress = False
+        self._audio_replacement_ready = threading.Event()
+        self._audio_replacement_ready.set()
 
     @property
     def playlist_url(self) -> str:
-        host = get_local_ip()
+        playlist_url = self._playlist_url
+        if playlist_url is None:
+            raise RuntimeError("Chromecast destination has not been configured.")
+        return playlist_url
+
+    @property
+    def accepts_deferred_audio(self) -> bool:
+        """Whether ffmpeg exists to consume a newly proven PCM source promptly."""
+        with self._lifecycle_lock:
+            return self._lifecycle_state == "running" and not self._stopped.is_set()
+
+    def configure_receiver(self, receiver_host: str) -> str:
+        """Freeze the receiver-routed public URL used for this whole cast."""
+        if not receiver_host:
+            raise ValueError("receiver_host is required")
+        existing = self._playlist_url
+        if existing is not None:
+            if receiver_host != self._receiver_host:
+                raise RuntimeError("HLS receiver destination is already configured.")
+            return existing
         http = self._http
         port = self._port or (http.port if http is not None else 0)
-        return f"http://{host}:{port}/stream.m3u8"
+        if port <= 0:
+            raise RuntimeError("HLS server is not running.")
+        route = get_receiver_route(receiver_host)
+        playlist_url = f"http://{route.local_ip}:{port}/stream.m3u8"
+        self._receiver_host = receiver_host
+        self._receiver_client_hosts = route.peer_hosts
+        self._playlist_url = playlist_url
+        return playlist_url
+
+    def receiver_delivery_observation(
+        self,
+        client_host: str | None = None,
+    ) -> tuple[int, bool] | None:
+        """Return (successful segment count, currently fresh) for one receiver.
+
+        A newly started segment request is temporarily healthy, but only a
+        completed non-empty response advances the count used to validate LOAD.
+        This prevents a browser probe or a stale receiver from proving that the
+        selected Chromecast consumed the new media session.
+        """
+        http = self._http
+        if http is None:
+            return None
+        client_hosts = self._receiver_client_hosts
+        if not client_hosts:
+            if not client_host:
+                return None
+            client_hosts = (client_host,)
+        stale_after_s = float(hls_segment_duration_s(buffered=self.buffered) * 3)
+        segment_responses = 0
+        fresh = False
+        for host in client_hosts:
+            snapshot = http.client_delivery_snapshot(host)
+            segment_responses += snapshot.segment_responses
+            active_fresh = (
+                snapshot.active_segment_requests > 0
+                and snapshot.oldest_active_segment_age_s is not None
+                and snapshot.oldest_active_segment_age_s <= stale_after_s
+            )
+            completed_fresh = (
+                snapshot.latest_segment_completed_at is not None
+                and max(0.0, time.time() - snapshot.latest_segment_completed_at)
+                <= stale_after_s
+            )
+            fresh = fresh or active_fresh or completed_fresh
+        return segment_responses, fresh
 
     @property
     def fatal_error(self) -> RuntimeError | None:
@@ -281,6 +368,7 @@ class HLSStreamer:
         generation = self._ffmpeg_generation
         if (
             self._stopped.is_set()
+            or self._audio_replacement_in_progress
             or self._ffmpeg is None
             or (expected_generation is not None and expected_generation != generation)
         ):
@@ -333,13 +421,16 @@ class HLSStreamer:
         self._consecutive_ffmpeg_failures += 1
         failures = self._consecutive_ffmpeg_failures
         if failures >= FFMPEG_RESTART_MAX_FAILURES:
-            self._fail(
-                "ffmpeg encoder recovery stopped after "
-                f"{failures} consecutive CFR timeline recovery attempts "
-                f"({reason})"
-            )
-            self._kill_ffmpeg()
-            return True
+            if not self._fallback_to_software_encoder_locked(
+                f"{failures} consecutive CFR timeline recoveries ({reason})"
+            ):
+                self._fail(
+                    "ffmpeg encoder recovery stopped after "
+                    f"{failures} consecutive CFR timeline recovery attempts "
+                    f"({reason})"
+                )
+                self._kill_ffmpeg()
+                return True
 
         self._kill_ffmpeg()
         discarded = self._queue.clear()
@@ -381,9 +472,9 @@ class HLSStreamer:
     def _clamp_audio_offset_ms(offset_ms: int) -> int:
         return min(MAX_AUTO_AV_OFFSET_MS, max(0, int(offset_ms)))
 
-    # How long to wait for Chrome's screencast to deliver its first frame
-    # before spawning ffmpeg anyway. Chrome's screencast can take several
-    # seconds to warm up; we'd rather wait than anchor audio without video.
+    # How long to wait for Chrome's screencast to deliver its first frame.
+    # No valid HLS stream can be produced without video, and opening only the
+    # real-time PCM input destroys the joint PTS-zero boundary.
     FIRST_FRAME_TIMEOUT_S = 30.0
 
     def _startup_step(self, action: Callable[[], None]) -> bool:
@@ -392,7 +483,7 @@ class HLSStreamer:
             if self._lifecycle_state != "starting" or self._stopped.is_set():
                 return False
             action()
-            return True
+            return self._lifecycle_state == "starting" and not self._stopped.is_set()
 
     def _wait_for_first_frame(
         self,
@@ -400,14 +491,24 @@ class HLSStreamer:
     ) -> bool:
         deadline = time.monotonic() + self.FIRST_FRAME_TIMEOUT_S
         while True:
+            # AudioTee begins producing as soon as it attaches, while the first
+            # paint-driven Chrome frame can legitimately take many seconds.
+            # Its native queue plus the OS pipe holds under a second of PCM;
+            # discard uncommitted samples on every health tick so that queue
+            # never overflows before ffmpeg exists. Draining both sides of the
+            # health callback also follows a replacement audio fd immediately.
+            self._drain_audio_fd(report=False)
             if health_check is not None:
                 health_check()
+            self._drain_audio_fd(report=False)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
             if self._first_frame.wait(min(HEALTH_POLL_S, remaining)):
+                self._drain_audio_fd(report=False)
                 if health_check is not None:
                     health_check()
+                self._drain_audio_fd(report=False)
                 return True
 
     def start(
@@ -430,11 +531,10 @@ class HLSStreamer:
         # PTS=0 to "now + warmup", baking that whole gap in as audio-ahead skew.
         # Waiting for the first frame anchors both inputs to the same moment.
         if not self._wait_for_first_frame(health_check):
-            print(
-                "Warning: no captured frame after "
-                f"{self.FIRST_FRAME_TIMEOUT_S:.0f}s; starting ffmpeg anyway "
-                "(audio may lead video).",
-                flush=True,
+            raise TimeoutError(
+                "Timed out after "
+                f"{self.FIRST_FRAME_TIMEOUT_S:.0f}s waiting for the first captured "
+                "video frame; refusing to start an unsynchronized A/V stream."
             )
         if self._stopped.is_set():
             # Shut down before the first frame arrived; don't spawn anything.
@@ -710,6 +810,7 @@ class HLSStreamer:
                 # Unblock start(), the sampler sleep, and an empty queue wait.
                 self._first_frame.set()
                 self._queue.wake_all()
+                self._audio_replacement_ready.set()
 
             failures: list[tuple[str, BaseException]] = []
 
@@ -727,6 +828,8 @@ class HLSStreamer:
                     and thread.is_alive()
                 ):
                     thread.join(timeout=1)
+                    if thread.is_alive():
+                        raise TimeoutError("HLS sampler thread did not stop")
 
             attempt("sampler thread", join_sampler)
 
@@ -759,6 +862,8 @@ class HLSStreamer:
                     and writer.is_alive()
                 ):
                     writer.join(timeout=1)
+                    if writer.is_alive():
+                        raise TimeoutError("HLS writer thread did not stop")
 
             attempt("writer thread", join_writer)
 
@@ -776,8 +881,9 @@ class HLSStreamer:
                     lambda: shutil.rmtree(self.work_dir, ignore_errors=True),
                 )
 
-            with self._lifecycle_lock:
-                self._lifecycle_state = "stopped"
+            if not failures:
+                with self._lifecycle_lock:
+                    self._lifecycle_state = "stopped"
 
             if len(failures) == 1:
                 name, failure = failures[0]
@@ -857,7 +963,7 @@ class HLSStreamer:
         print(f"A/V sync: delaying audio {self.audio_offset_ms}ms (adelay).", flush=True)
         return ["-af", f"adelay={self.audio_offset_ms}:all=1"]
 
-    def _drain_audio_fd(self) -> None:
+    def _drain_audio_fd(self, *, report: bool = True) -> int:
         """Discard PCM that buffered in the pipe before ffmpeg attaches.
 
         AudioTee streams into the pipe from the moment it starts, but ffmpeg
@@ -867,8 +973,11 @@ class HLSStreamer:
         both effectively begin "now". Bounded so a live writer can't spin us.
         """
         if self.audio_fd is None:
-            return
-        max_drop = self.audio_format.bytes_per_second * 2
+            return 0
+        # AudioTee intentionally retains ten seconds across a slow ffmpeg
+        # teardown. Bound above that native runway so a concurrently flushing
+        # writer cannot leave stale pre-boundary PCM for the next process.
+        max_drop = self.audio_format.bytes_per_second * 12
         dropped = 0
         try:
             while dropped < max_drop:
@@ -880,19 +989,65 @@ class HLSStreamer:
                     break
                 dropped += len(chunk)
         except OSError:
-            return
-        if dropped:
+            return dropped
+        if dropped and report:
             ms = dropped / self.audio_format.bytes_per_second * 1000
             print(f"A/V sync: dropped {ms:.0f}ms of buffered pre-roll audio.", flush=True)
             if self._stats is not None:
                 self._stats.trace(f"audio pre-roll drained ({ms:.0f}ms)")
+        return dropped
 
     def _kill_ffmpeg(self, *, graceful: bool = False) -> None:
-        if self._ffmpeg is None:
+        ffmpeg = self._ffmpeg
+        if ffmpeg is None:
             return
-        self._ffmpeg.kill(graceful=graceful)
-        self._ffmpeg = None
-        self._ffmpeg_started_at = None
+
+        if self.audio_fd is None:
+            ffmpeg.kill(graceful=graceful)
+        else:
+            # Once a relaunch boundary is requested, samples consumed by the
+            # old generation are no longer committed output. Drain AudioTee in
+            # parallel with the bounded TERM/KILL wait so its real-time queue
+            # never fills while ffmpeg's inherited reader is disappearing.
+            # The final synchronous drain below removes the last uncommitted
+            # bytes before a replacement process establishes fresh PTS zero.
+            finished = threading.Event()
+            failures: list[BaseException] = []
+
+            def stop_process() -> None:
+                try:
+                    ffmpeg.kill(graceful=graceful)
+                except BaseException as exc:
+                    failures.append(exc)
+                finally:
+                    finished.set()
+
+            self._drain_audio_fd(report=False)
+            killer = threading.Thread(
+                target=stop_process,
+                name="ffmpeg-stop",
+                daemon=True,
+            )
+            try:
+                killer.start()
+            except BaseException:
+                # The ten-second native queue exceeds kill()'s full bounded
+                # wait, so synchronous fallback remains safe. A helper-thread
+                # failure is immaterial if process cleanup itself succeeds.
+                ffmpeg.kill(graceful=graceful)
+            else:
+                while not finished.wait(0.01):
+                    self._drain_audio_fd(report=False)
+                killer.join()
+                self._drain_audio_fd(report=False)
+                if failures:
+                    raise failures[0]
+
+        # A failed kill above deliberately leaves ownership for stop()'s next
+        # bounded pass. Only discard the handle after confirmed child reap.
+        if self._ffmpeg is ffmpeg:
+            self._ffmpeg = None
+            self._ffmpeg_started_at = None
 
     def set_audio_offset_ms(self, offset_ms: int) -> int:
         """Change the A/V audio delay live and apply it.
@@ -913,6 +1068,106 @@ class HLSStreamer:
                 self._stats.record_ffmpeg_restart()
         return offset_ms
 
+    def begin_audio_source_replacement(self) -> bool:
+        """Quiesce ffmpeg before a replacement AudioTee starts producing.
+
+        Starting the helper first is unsafe: killing a wedged ffmpeg can take
+        seconds, while the native lossless PCM queue is intentionally bounded
+        to less than a second. Quiescing first prevents the fresh capture from
+        overflowing before its descriptor is committed.
+        """
+        with self._ffmpeg_lock:
+            if self._stopped.is_set():
+                return False
+            if self._audio_replacement_in_progress:
+                raise RuntimeError("Audio source replacement is already in progress.")
+            self._audio_replacement_in_progress = True
+            self._audio_replacement_ready.clear()
+            try:
+                self._kill_ffmpeg()
+                if self._stopped.is_set():
+                    self._audio_replacement_in_progress = False
+                    self._audio_replacement_ready.set()
+                    return False
+                discarded = self._queue.clear()
+                if discarded and self._stats is not None:
+                    self._stats.record_timeline_loss(discarded)
+                self._pending_timeline_resync = None
+                self._backpressure_started_at = None
+                self._backpressure_generation = None
+            except BaseException:
+                self._audio_replacement_in_progress = False
+                self._audio_replacement_ready.set()
+                raise
+        return True
+
+    def complete_audio_source_replacement(
+        self,
+        audio_fd: int | None,
+        audio_format: AudioFormat | None = None,
+    ) -> bool:
+        """Commit a fresh PCM pipe and create a joint A/V boundary.
+
+        AudioTee recovery must never reuse the old pipe: ffmpeg can retain
+        demuxer buffers from that descriptor even after its producer stalls.
+        begin_audio_source_replacement() has already removed the old encoder;
+        this method swaps the descriptor and starts both raw timelines at zero.
+        """
+        if audio_fd is not None and audio_fd < 0:
+            raise ValueError("audio_fd must be a valid descriptor or None")
+        replacement_format = audio_format or DEFAULT_AUDIO_FORMAT
+
+        with self._ffmpeg_lock:
+            if not self._audio_replacement_in_progress:
+                raise RuntimeError("Audio source replacement was not started.")
+            if self._stopped.is_set():
+                self._audio_replacement_in_progress = False
+                self._audio_replacement_ready.set()
+                return False
+
+            self.audio_fd = audio_fd
+            self.audio_format = replacement_format
+            self._consecutive_ffmpeg_failures = 0
+
+            # start() still owns the initial PTS-zero transaction. Spawning
+            # here before its first captured frame would recreate the startup
+            # skew this class deliberately avoids.
+            if self._lifecycle_state in ("new", "starting"):
+                self._audio_replacement_in_progress = False
+                self._audio_replacement_ready.set()
+                return True
+
+            try:
+                self._start_ffmpeg()
+            except Exception as exc:
+                self._audio_replacement_in_progress = False
+                self._audio_replacement_ready.set()
+                self._fail("ffmpeg failed while committing replacement audio", exc)
+                raise
+            self._audio_replacement_in_progress = False
+            self._audio_replacement_ready.set()
+
+        if self._stats is not None:
+            self._stats.record_encode_resync("audio capture reattached")
+            self._stats.record_ffmpeg_restart()
+        print(
+            "Re-anchored A/V with a fresh audio capture."
+            if audio_fd is not None
+            else "Re-anchored video with silence after audio capture failed.",
+            flush=True,
+        )
+        return True
+
+    def fail_audio_source_replacement(self, failure: BaseException) -> None:
+        """Make an uncommitted replacement terminal instead of auto-reusing stale input."""
+        with self._ffmpeg_lock:
+            if not self._audio_replacement_in_progress:
+                return
+            self._audio_replacement_in_progress = False
+            self._audio_replacement_ready.set()
+            if not self._stopped.is_set():
+                self._fail("Audio capture recovery failed", failure)
+
     def _relaunch_ffmpeg(
         self,
         *,
@@ -920,6 +1175,8 @@ class HLSStreamer:
         reset_failures: bool = False,
     ) -> bool:
         with self._ffmpeg_lock:
+            if self._audio_replacement_in_progress:
+                return False
             if expected_generation is not None and self._ffmpeg_generation != expected_generation:
                 return False
             self._kill_ffmpeg()
@@ -980,6 +1237,20 @@ class HLSStreamer:
                 pass
         return "; ".join(details)
 
+    def _fallback_to_software_encoder_locked(self, reason: str) -> bool:
+        """Give libx264 a fresh bounded recovery budget after VT fails."""
+        if self._video_encoder != HARDWARE_VIDEO_ENCODER:
+            return False
+        self._video_encoder = SOFTWARE_VIDEO_ENCODER
+        self._consecutive_ffmpeg_failures = 0
+        print(
+            f"VideoToolbox failed at runtime; falling back to libx264 ({reason}).",
+            flush=True,
+        )
+        if self._stats is not None:
+            self._stats.trace("encoder fallback VideoToolbox -> libx264")
+        return True
+
     def _recover_ffmpeg(
         self,
         failed_ffmpeg: FfmpegProcess | None,
@@ -1000,6 +1271,35 @@ class HLSStreamer:
                 # process alone and let its first write determine its health.
                 return True
         detail = self._ffmpeg_failure_detail(failed_ffmpeg, write_error)
+        with self._ffmpeg_lock:
+            if (
+                self._ffmpeg_generation != failed_generation
+                or self._ffmpeg is not failed_ffmpeg
+            ):
+                # stderr collection deliberately happens outside the lock and
+                # may block briefly. A manual/audio relaunch that won during
+                # that window owns the encoder choice for its fresh process;
+                # never let this stale failure downgrade later generations.
+                return True
+            fell_back_to_software = self._fallback_to_software_encoder_locked(
+                detail or "encoder process or input pipe failed"
+            )
+        if fell_back_to_software:
+            # This launch is x264's first chance to run, not an x264 failure.
+            # Give the software backend its complete independent circuit
+            # budget, even if VideoToolbox had already consumed all of its own.
+            try:
+                restarted = self._restart_ffmpeg(
+                    "VideoToolbox runtime failure",
+                    expected_generation=failed_generation,
+                )
+            except Exception as exc:
+                # A failed x264 spawn is its first real failure and enters the
+                # ordinary bounded loop below.
+                detail = str(exc) or type(exc).__name__
+                failed_ffmpeg = None
+            else:
+                return restarted or not self._stopped.is_set()
         while not self._stopped.is_set():
             with self._ffmpeg_lock:
                 if self._ffmpeg_generation != failed_generation:
@@ -1260,6 +1560,7 @@ class HLSStreamer:
                 self.height,
                 buffered=self.buffered,
                 bitrate_mbps=self.video_bitrate_mbps,
+                encoder=self._video_encoder,
             ),
             *self._audio_delay_filter_args(),
             "-c:a",
@@ -1313,6 +1614,11 @@ class HLSStreamer:
         # put() reports a lost CFR tick, no writer can obtain the old ffmpeg
         # under this lock without first observing the pending re-anchor.
         with self._ffmpeg_lock:
+            if self._audio_replacement_in_progress:
+                # Deliberately do not build a hidden video backlog while no
+                # matching audio producer exists. The latest-frame holder will
+                # seed the fresh joint boundary when replacement commits.
+                return False
             if (
                 sampled_for_generation is not None
                 and sampled_for_generation != self._ffmpeg_generation
@@ -1367,6 +1673,12 @@ class HLSStreamer:
                 with self._ffmpeg_lock:
                     current_ffmpeg_generation = self._ffmpeg_generation
                     boundary_generation, video_boundary_at = self._ffmpeg_video_boundary
+                # Recovery can hold _ffmpeg_lock while terminating a wedged
+                # process. Refresh the cadence clock after that wait: using
+                # the pre-lock timestamp would make a newly observed generation
+                # appear seconds late on the next loop and trigger a redundant
+                # second re-anchor for the same stall.
+                now = time.monotonic()
                 if boundary_generation != current_ffmpeg_generation:
                     # Tests and failed partial starts can install a process
                     # without the production boundary transaction. Never apply
@@ -1469,9 +1781,17 @@ class HLSStreamer:
                 # relaunch instead of seeding the new generation with stale
                 # pre-boundary video.
                 with self._ffmpeg_lock:
-                    if self._process_pending_timeline_resync_locked():
+                    audio_replacement = self._audio_replacement_in_progress
+                    if (
+                        not audio_replacement
+                        and self._process_pending_timeline_resync_locked()
+                    ):
                         continue
                     queued_for_generation = self._ffmpeg_generation
+
+                if audio_replacement:
+                    self._audio_replacement_ready.wait(HEALTH_POLL_S)
+                    continue
 
                 frame = self._queue.get(self._stopped)
                 if frame is None:
@@ -1485,7 +1805,11 @@ class HLSStreamer:
                 with self._ffmpeg_lock:
                     reanchored = self._process_pending_timeline_resync_locked()
                     generation = self._ffmpeg_generation
-                    stale_frame = reanchored or generation != queued_for_generation
+                    stale_frame = (
+                        reanchored
+                        or self._audio_replacement_in_progress
+                        or generation != queued_for_generation
+                    )
                     ffmpeg = None if stale_frame else self._ffmpeg
 
                 if stale_frame:
