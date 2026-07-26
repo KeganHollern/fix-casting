@@ -3,29 +3,188 @@
 from __future__ import annotations
 
 import argparse
-import json
+import hashlib
+import hmac
+import math
 import signal
 import sys
 import time
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
+from pathlib import Path
 
-from cast_tab.audio import (
-    AudioCapture,
-    AudioCaptureError,
-    audiotee_available,
-    install_hint,
-    try_start_chrome_audio_capture,
-    stop_audio_capture,
-)
-from cast_tab.browser import TabScreencaster
+from cast_tab.audiotee_provenance import verify_installed_audiotee
 from cast_tab.caster import TabCaster
-from cast_tab.devices import discover_devices, select_device
+from cast_tab.devices import discover_devices, find_device, select_device
+from cast_tab.encoder import estimated_hls_holdback_s, hls_playlist_retention_s
+from cast_tab.paths import AUDIOTEE_INSTALL_PATH, INSTALL_PROVENANCE_PATH
+from cast_tab.session import CastSession, SessionConfig
 from cast_tab.stats import PipelineStats
 from cast_tab.streamer import (
-    HLSStreamer,
+    DEFAULT_JPEG_QUALITY,
+    MAX_AUTO_AV_OFFSET_MS,
     codec_label,
     default_fps_for_resolution,
-    default_jpeg_quality,
 )
+
+MAX_VIDEO_BITRATE_MBPS = 1_000.0
+MAX_ABS_AUDIO_DRIFT_PPM = 100_000.0
+INSTALL_RECEIPT_FORMAT = "1"
+
+
+class _ShutdownRequested(Exception):
+    """Internal control flow after an OS signal requested a clean shutdown."""
+
+
+def _package_fingerprint(package_dir: Path) -> str:
+    """Hash the relative paths and contents of an installed/source package tree."""
+    source_files = sorted(
+        (path for path in package_dir.rglob("*.py") if path.is_file()),
+        key=lambda path: path.relative_to(package_dir).as_posix(),
+    )
+    if not source_files:
+        raise ValueError(f"no Python sources found under {package_dir}")
+
+    digest = hashlib.sha256()
+    for source_file in source_files:
+        relative_path = source_file.relative_to(package_dir).as_posix().encode("utf-8")
+        digest.update(len(relative_path).to_bytes(4, "big"))
+        digest.update(relative_path)
+        digest.update(hashlib.sha256(source_file.read_bytes()).digest())
+    return digest.hexdigest()
+
+
+def _verified_install_provenance(package_dir: Path) -> str:
+    """Return receipt provenance only when it describes this package tree."""
+    try:
+        receipt_lines = INSTALL_PROVENANCE_PATH.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return "revision unknown"
+
+    fields: dict[str, str] = {}
+    for line in receipt_lines:
+        key, separator, value = line.partition("=")
+        if not separator or not key or key in fields:
+            return "revision unknown (unverified install receipt)"
+        fields[key] = value
+
+    revision = fields.get("revision", "")
+    expected_fingerprint = fields.get("package_fingerprint", "")
+    if (
+        fields.get("format") != INSTALL_RECEIPT_FORMAT
+        or not revision
+        or len(expected_fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in expected_fingerprint)
+    ):
+        return "revision unknown (unverified install receipt)"
+    if not revision.endswith(f"+source.{expected_fingerprint[:16]}"):
+        return "revision unknown (install receipt is internally inconsistent)"
+
+    try:
+        actual_fingerprint = _package_fingerprint(package_dir)
+    except (OSError, UnicodeError, ValueError):
+        return "revision unknown (could not verify installed source)"
+    if not hmac.compare_digest(actual_fingerprint, expected_fingerprint):
+        return "revision unknown (installed source does not match receipt)"
+    return revision
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
+
+
+def _positive_even_int(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed % 2:
+        raise argparse.ArgumentTypeError("must be even for yuv420p video")
+    return parsed
+
+
+def _jpeg_quality(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > 100:
+        raise argparse.ArgumentTypeError("must be between 1 and 100")
+    return parsed
+
+
+def _audio_offset_ms(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if not 0 <= parsed <= MAX_AUTO_AV_OFFSET_MS:
+        raise argparse.ArgumentTypeError(
+            f"must be between 0 and {MAX_AUTO_AV_OFFSET_MS}"
+        )
+    return parsed
+
+
+def _finite_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError("must be finite")
+    return parsed
+
+
+def _positive_finite_float(value: str) -> float:
+    parsed = _finite_float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
+
+
+def _video_bitrate_mbps(value: str) -> float:
+    parsed = _positive_finite_float(value)
+    if parsed > MAX_VIDEO_BITRATE_MBPS:
+        raise argparse.ArgumentTypeError(
+            f"must be at most {MAX_VIDEO_BITRATE_MBPS:g} Mbps"
+        )
+    return parsed
+
+
+def _audio_drift_ppm(value: str) -> float:
+    parsed = _finite_float(value)
+    if abs(parsed) > MAX_ABS_AUDIO_DRIFT_PPM:
+        raise argparse.ArgumentTypeError(
+            f"must be between {-MAX_ABS_AUDIO_DRIFT_PPM:g} and "
+            f"{MAX_ABS_AUDIO_DRIFT_PPM:g}"
+        )
+    return parsed
+
+
+def _version_text() -> str:
+    try:
+        installed_version = package_version("fix-casting")
+    except PackageNotFoundError:
+        installed_version = "unknown"
+
+    # An editable install executes this checkout directly. Never label it with
+    # a stale installation receipt from an earlier snapshot.
+    package_dir = Path(__file__).resolve().parent
+    if (package_dir.parent / ".git").exists():
+        provenance = "development checkout (editable/source import)"
+    else:
+        provenance = _verified_install_provenance(package_dir)
+    verified_helper, helper_failure = verify_installed_audiotee(AUDIOTEE_INSTALL_PATH)
+    if verified_helper is not None:
+        helper = (
+            f"; AudioTee sha256:{verified_helper.binary_sha256[:12]}"
+            f" source:{verified_helper.source_fingerprint[:12]}"
+        )
+    elif AUDIOTEE_INSTALL_PATH.exists() or AUDIOTEE_INSTALL_PATH.is_symlink():
+        helper = f"; AudioTee unverified ({helper_failure})"
+    else:
+        helper = ""
+    return f"fix-casting {installed_version} ({provenance}{helper})"
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -36,28 +195,37 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "it to your TV — does not use Chrome's dominant-video detection."
         ),
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=_version_text(),
+        help="show installed version and source provenance",
+    )
     parser.add_argument("url", help="URL to open and mirror")
     parser.add_argument(
         "--width",
-        type=int,
+        type=_positive_even_int,
         default=1920,
         help="Viewport width (default: 1920)",
     )
     parser.add_argument(
         "--height",
-        type=int,
+        type=_positive_even_int,
         default=1080,
         help="Viewport height (default: 1080)",
     )
     parser.add_argument(
         "--fps",
-        type=int,
+        type=_positive_int,
         default=None,
-        help="Encode frame rate (default: 30 buffered, 23 at 1080p / 24 at 720p otherwise)",
+        help=(
+            "Encode frame rate (default: 30 in the production profile; "
+            "23 at 1080p / 24 at 720p with --no-buffered)"
+        ),
     )
     parser.add_argument(
         "--jpeg-quality",
-        type=int,
+        type=_jpeg_quality,
         default=None,
         metavar="Q",
         help=(
@@ -67,18 +235,28 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--video-bitrate",
-        type=float,
+        type=_video_bitrate_mbps,
         default=None,
         metavar="MBPS",
         help=(
-            "Override the H.264 target bitrate in Mbps (default: chosen by "
-            "resolution, 15 at 1080p). Raise it with --stats to find how high "
-            "your Chromecast's network sustains before it buffers."
+            f"Override the H.264 target bitrate in Mbps, up to "
+            f"{MAX_VIDEO_BITRATE_MBPS:g} (default: chosen by resolution, 15 at "
+            "1080p). Raise it with --stats to find how high your Chromecast's "
+            "network sustains before it buffers."
+        ),
+    )
+    parser.add_argument(
+        "--device",
+        metavar="NAME",
+        default=None,
+        help=(
+            "Cast to the device with this name, skipping the interactive "
+            "picker (case-insensitive; a unique substring works too)."
         ),
     )
     parser.add_argument(
         "--discovery-timeout",
-        type=float,
+        type=_positive_finite_float,
         default=5.0,
         help="Seconds to search for Chromecast devices (default: 5)",
     )
@@ -98,27 +276,28 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=True,
         help=(
             "Block ads/trackers in the captured tab using uBlock Origin's "
-            "default filter lists + EasyList (default: on). Use --no-adblock "
-            "to disable."
+            "network filter lists + Peter Lowe's ad-server list (default: on). "
+            "Use --no-adblock to disable."
         ),
     )
     parser.add_argument(
         "--audio-offset-ms",
-        type=int,
+        type=_audio_offset_ms,
         default=0,
         help=(
-            "Manual A/V trim in ms (default: 0). Positive delays audio (use if "
-            "audio is ahead of video); negative advances it. Use to dial in "
-            "lip-sync."
+            f"Manual A/V trim in ms, 0-{MAX_AUTO_AV_OFFSET_MS} (default: 0). "
+            "Positive delays audio (use if audio is ahead of video)."
         ),
     )
     parser.add_argument(
         "--audio-drift-ppm",
-        type=float,
+        type=_audio_drift_ppm,
         default=0.0,
         metavar="PPM",
         help=(
-            "Correct slow audio clock drift in parts-per-million (default: 0). "
+            "Correct slow audio clock drift in parts-per-million "
+            f"({-MAX_ABS_AUDIO_DRIFT_PPM:g} to {MAX_ABS_AUDIO_DRIFT_PPM:g}; "
+            "default: 0). "
             "If audio drifts AHEAD of video over a long session, set this "
             "positive; ffmpeg constant-resamples audio to lock it to real time "
             "(smooth, inaudible). Measure your value with "
@@ -130,8 +309,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Buffer ~45s on the TV for higher quality and smoother playback "
-            "(default: on). Use --no-buffered for lower latency."
+            "Use the production encode profile with 2s HLS segments and a 12s "
+            "rolling playlist (default: on). Use --no-buffered for the existing "
+            "1s/4s low-latency profile; actual TV delay is receiver-controlled."
         ),
     )
     parser.add_argument(
@@ -141,13 +321,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--stats-interval",
-        type=float,
+        type=_positive_finite_float,
         default=10.0,
         help="Seconds between stats reports when --stats is set (default: 10)",
     )
     parser.add_argument(
         "--tv-poll-interval",
-        type=float,
+        type=_positive_finite_float,
         default=2.0,
         help="Seconds between Chromecast status polls when --stats is set (default: 2)",
     )
@@ -157,33 +337,37 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Show a live full-screen dashboard of all pipeline stats with a "
         "real-time audio-offset knob (instead of the scrolling --stats text).",
     )
-    args = parser.parse_args(argv)
-    if args.video_bitrate is not None and args.video_bitrate <= 0:
-        parser.error("--video-bitrate must be greater than 0 (Mbps)")
-    return args
+    return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
     print("Searching for Chromecast devices...")
-    devices = discover_devices(timeout=args.discovery_timeout)
-    device = select_device(devices)
+    try:
+        devices = discover_devices(timeout=args.discovery_timeout)
+        if args.device:
+            device = find_device(devices, args.device)
+            print(f"Casting to {device.name}.")
+        else:
+            device = select_device(devices)
+    except RuntimeError as exc:
+        # No devices / bad --device: a clean one-line error, not a traceback.
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
     encode_fps = args.fps or default_fps_for_resolution(
         args.width, args.height, buffered=args.buffered
     )
-    # Oversample capture so a fresh frame is ready at every encoder tick.
-    capture_fps = max(encode_fps, round(encode_fps * 1.5))
-    jpeg_quality = (
-        max(1, min(100, args.jpeg_quality))
-        if args.jpeg_quality is not None
-        else default_jpeg_quality(args.width, args.height)
-    )
-    capture_audio = not args.no_audio
+    jpeg_quality = args.jpeg_quality or DEFAULT_JPEG_QUALITY
     # The TUI is a live view of the same stats, so it needs them collected too.
     collect_stats = args.stats or args.tui
-    stats = PipelineStats(target_fps=float(encode_fps)) if collect_stats else None
+    # Keep cumulative counters even in the default quiet mode so the exit
+    # summary can report lost video timeline ticks and ffmpeg restarts.
+    stats = PipelineStats(
+        target_fps=float(encode_fps),
+        trace_enabled=collect_stats,
+    )
 
     adblock_patterns = None
     if args.adblock:
@@ -192,138 +376,137 @@ def main(argv: list[str] | None = None) -> int:
         print("Loading ad-block filter lists...")
         adblock_patterns = build_block_patterns()
 
-    screencaster = TabScreencaster(
-        args.url,
-        width=args.width,
-        height=args.height,
-        fps=capture_fps,
-        pace_fps=encode_fps,
-        jpeg_quality=jpeg_quality,
-        on_frame=lambda _frame: None,
-        headless=args.headless,
-        capture_audio=capture_audio,
+    # The signal handler below may interrupt any Python bytecode, including an
+    # Event/Condition critical section. A plain boolean assignment is the only
+    # operation it performs; session/caster workers poll this reader without
+    # asking the handler to acquire a lock or tear anything down.
+    stop_requested = False
+
+    session = CastSession(
+        SessionConfig(
+            url=args.url,
+            width=args.width,
+            height=args.height,
+            fps=encode_fps,
+            jpeg_quality=jpeg_quality,
+            buffered=args.buffered,
+            headless=args.headless,
+            capture_audio=not args.no_audio,
+            audio_offset_ms=args.audio_offset_ms,
+            audio_drift_ppm=args.audio_drift_ppm,
+            video_bitrate_mbps=args.video_bitrate,
+            adblock_patterns=adblock_patterns,
+        ),
         stats=stats,
-        adblock_patterns=adblock_patterns,
     )
-    streamer: HLSStreamer | None = None
-    audio_capture: AudioCapture | None = None
     caster = TabCaster(device)
+    set_session_cancellation = getattr(session, "set_cancellation_probe", None)
+    if set_session_cancellation is not None:
+        set_session_cancellation(lambda: stop_requested)
+    set_caster_cancellation = getattr(caster, "set_cancellation_probe", None)
+    if set_caster_cancellation is not None:
+        set_caster_cancellation(lambda: stop_requested)
 
     shutting_down = False
+    started_at = time.monotonic()
 
-    def shutdown(_signum=None, _frame=None) -> None:
+    def _print_exit_summary() -> None:
+        elapsed = int(time.monotonic() - started_at)
+        hours, rest = divmod(elapsed, 3600)
+        minutes, seconds = divmod(rest, 60)
+        duration = (
+            f"{hours}h{minutes:02d}m{seconds:02d}s" if hours
+            else f"{minutes}m{seconds:02d}s" if minutes
+            else f"{seconds}s"
+        )
+        parts = [f"cast ran {duration}"]
+        if caster.reconnects:
+            parts.append(f"{caster.reconnects} TV re-casts")
+        dropped_total, restarts_total = stats.totals()
+        if dropped_total:
+            parts.append(
+                f"{dropped_total} video timeline ticks discarded/skipped "
+                "during A/V re-anchors"
+            )
+        if restarts_total:
+            parts.append(f"{restarts_total} ffmpeg restarts")
+        print(f"Summary: {', '.join(parts)}.")
+
+    def shutdown() -> None:
+        """Stop all components (idempotent). Exit codes are the caller's job:
+        an embedded sys.exit(0) here would eat the error path's non-zero exit
+        (SystemExit raised mid-handler preempts its `return 1`)."""
         nonlocal shutting_down
         if shutting_down:
             return
         shutting_down = True
         print("\nStopping cast...")
-        screencaster.stop()
-        if streamer is not None:
-            streamer.stop()
-        stop_audio_capture(audio_capture)
-        caster.stop()
-        sys.exit(0)
+        failures: list[tuple[str, BaseException]] = []
+        # Stop the receiver/watchdog while HLS is still available. Otherwise a
+        # final watchdog poll can reload a URL as its server is disappearing.
+        cleanup_steps = (("Chromecast", caster.stop), ("session", session.stop))
+        for name, stop in cleanup_steps:
+            try:
+                stop()
+            except BaseException as exc:
+                # Cleanup is best-effort across independent components. A
+                # browser teardown failure must not leave the TV connected.
+                failures.append((name, exc))
 
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
+        # Component stop methods retain ownership of incomplete phases and are
+        # intentionally retryable. A process can miss its first bounded reap
+        # window while exiting normally; make one immediate second pass only
+        # over failed owners. Successful, potentially non-idempotent phases
+        # are never repeated, and only the final failure is reported.
+        if failures:
+            retry_steps = {name: stop for name, stop in cleanup_steps}
+            retry_failures: list[tuple[str, BaseException]] = []
+            for name, _first_failure in failures:
+                try:
+                    retry_steps[name]()
+                except BaseException as exc:
+                    retry_failures.append((name, exc))
+            failures = retry_failures
+        _print_exit_summary()
+        for name, failure in failures:
+            print(f"Warning: failed to stop {name}: {failure}", file=sys.stderr)
+
+    def handle_signal(_signum=None, _frame=None) -> None:
+        # A Python signal handler can run between the CALL and STORE bytecodes
+        # of any resource factory. Raising or tearing down here can therefore
+        # strand a newly spawned Chrome/AudioTee/ffmpeg before its owner stores
+        # it. Only publish a lock-free CPython boolean assignment; ordinary
+        # control flow reaches the single finally block that owns teardown.
+        nonlocal stop_requested
+        stop_requested = True
+
+    def raise_if_stop_requested() -> None:
+        if stop_requested:
+            raise _ShutdownRequested
+
+    def check_runtime_health() -> None:
+        raise_if_stop_requested()
+        session.raise_if_failed()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
 
     try:
-        screencaster.start()
-        screencaster.wait_until_ready()
-        screencaster.enable_capture()
-        if stats is not None:
-            stats.trace("enable_capture")
+        session.start()
+        raise_if_stop_requested()
+        streamer = session.streamer
+        assert streamer is not None  # session.start() succeeded above
+        playlist_url = streamer.configure_receiver(device.host)
+        caster.set_delivery_probe(streamer.receiver_delivery_observation)
 
-        if capture_audio:
-            if not audiotee_available():
-                print(f"Audio unavailable: AudioTee not found.\n{install_hint()}")
-                capture_audio = False
-            else:
-                print("Waiting for cast browser audio...")
-                audio_attached = False
-
-                def on_audio_stderr(line: str) -> None:
-                    mtype = "log"
-                    text = line
-                    try:
-                        parsed = json.loads(line)
-                        mtype = str(parsed.get("message_type", "log"))
-                        data = parsed.get("data") or {}
-                        text = str(data.get("message", line))
-                        context = data.get("context")
-                        if context:
-                            text += f" {context}"
-                    except (ValueError, AttributeError):
-                        pass
-                    # Debug lines are high-volume (per-PID tap attempts); keep
-                    # them out of the log but still surface info/warning/error.
-                    if mtype == "debug":
-                        return
-                    # AudioTee probes PID candidates that do not tap on modern
-                    # macOS (renderers). "failed to translate" only happens
-                    # during that probing, so it is always search noise; a bare
-                    # "failure" is suppressed only until a tap succeeds, so a
-                    # mid-stream AudioTee death still surfaces.
-                    low = text.strip().lower()
-                    if "failed to translate" in low:
-                        return
-                    if not audio_attached and (
-                        low in ("error: failure", "failure")
-                        or low.startswith("starting audiotee")
-                    ):
-                        return
-                    print(f"[audio:{mtype}] {text}", flush=True)
-                    if stats is not None and (
-                        mtype in ("error", "warning")
-                        or any(
-                            kw in text.lower()
-                            for kw in (
-                                "drop", "underrun", "overrun",
-                                "glitch", "discontinu", "xrun",
-                            )
-                        )
-                    ):
-                        stats.record_audio_warning(text)
-
-                if stats is not None:
-                    stats.trace("audio try_start begin")
-                try:
-                    audio_capture = try_start_chrome_audio_capture(
-                        screencaster.user_data_dir,
-                        on_retry=screencaster.nudge_playback,
-                        on_stderr=on_audio_stderr,
-                    )
-                    audio_attached = True
-                    if stats is not None:
-                        stats.trace(f"audio attached (pids={audio_capture.pids})")
-                    print(
-                        "Capturing audio from cast browser only "
-                        f"(PIDs: {', '.join(str(pid) for pid in audio_capture.pids)})."
-                    )
-                    print("Other Mac apps keep their normal audio output.")
-                except AudioCaptureError as exc:
-                    print(f"Audio unavailable: {exc}")
-                    print(install_hint())
-                    capture_audio = False
-
-        streamer = HLSStreamer(
-            width=args.width,
-            height=args.height,
-            fps=encode_fps,
-            buffered=args.buffered,
-            audio_fd=audio_capture.read_fd if audio_capture else None,
-            audio_format=audio_capture.audio_format if audio_capture else None,
-            audio_offset_ms=args.audio_offset_ms,
-            audio_drift_ppm=args.audio_drift_ppm,
-            video_bitrate_mbps=args.video_bitrate,
-            stats=stats,
+        audio_mode = "with tab audio" if session.audio_active else "video only"
+        holdback = estimated_hls_holdback_s(buffered=args.buffered)
+        retention = hls_playlist_retention_s(buffered=args.buffered)
+        profile_name = "production HLS" if args.buffered else "low-latency HLS"
+        latency_mode = (
+            f"{profile_name} (~{holdback}s estimated player holdback, "
+            f"{retention}s playlist retention)"
         )
-        screencaster.on_frame = streamer.publish_frame
-        if stats is not None:
-            stats.trace("on_frame wired to streamer")
-
-        audio_mode = "with tab audio" if capture_audio else "video only"
-        latency_mode = "buffered (~45s TV delay)" if args.buffered else "low-latency"
         bitrate_note = (
             f", {args.video_bitrate:g}M video bitrate"
             if args.video_bitrate is not None
@@ -335,11 +518,21 @@ def main(argv: list[str] | None = None) -> int:
             f"{audio_mode} using {codec_label()}, {latency_mode}."
         )
 
-        streamer.start()
-        streamer.wait_until_ready()
-
+        raise_if_stop_requested()
         caster.connect()
-        caster.play_hls(streamer.playlist_url)
+        raise_if_stop_requested()
+        caster.play_hls(playlist_url)
+        raise_if_stop_requested()
+        # Background watchdog: re-casts if the TV stops playing (app killed,
+        # stream error). Off-loop so a ~50s dead-TV recovery never blocks
+        # stats/TUI. In TUI mode the non-playing card shows the state, so no
+        # print callback (it would write over the full-screen UI).
+        caster.start_watchdog(
+            on_event=None if args.tui else (
+                lambda event: print(f"[recover] {event}", flush=True)
+            ),
+            announce_recovery=not args.tui,
+        )
 
         if args.tui:
             # Full-screen dashboard owns the terminal and its own poll loop.
@@ -349,20 +542,20 @@ def main(argv: list[str] | None = None) -> int:
                 stats=stats,
                 streamer=streamer,
                 caster=caster,
-                initial_offset_ms=args.audio_offset_ms,
+                initial_offset_ms=streamer.audio_offset_ms,
                 tv_poll_interval=args.tv_poll_interval,
-                playlist_url=streamer.playlist_url,
+                playlist_url=playlist_url,
+                health_check=check_runtime_health,
             )
-            shutdown()
             return 0
 
         print("Casting. Press Ctrl+C to stop.")
         print(f"Source page: {args.url}")
         if not args.headless:
             print("A browser window is rendering the page locally.")
-        if capture_audio:
+        if session.audio_active:
             print("Cast browser audio plays on your TV only; other Mac audio is unchanged.")
-        if stats is not None:
+        if args.stats:
             print(
                 f"Stats enabled (every {args.stats_interval:.0f}s, "
                 f"tv polls every {args.tv_poll_interval:.0f}s)."
@@ -370,9 +563,10 @@ def main(argv: list[str] | None = None) -> int:
 
         next_stats_at = time.monotonic() + args.stats_interval
         next_tv_poll_at = time.monotonic()
-        while not shutting_down:
+        while not stop_requested:
+            session.raise_if_failed()
             now = time.monotonic()
-            if stats is not None and now >= next_tv_poll_at:
+            if args.stats and now >= next_tv_poll_at:
                 streamer.poll_audio_backlog()
                 for event in streamer.poll_hls_stats():
                     print(f"[stats] {event}", flush=True)
@@ -385,14 +579,19 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"[stats] {event}", flush=True)
                 next_tv_poll_at = now + args.tv_poll_interval
 
-            if stats is not None and now >= next_stats_at:
+            if args.stats and now >= next_stats_at:
                 print(stats.format_report(args.stats_interval), flush=True)
                 next_stats_at = now + args.stats_interval
             time.sleep(0.25)
+    except _ShutdownRequested:
+        return 0
     except Exception as exc:
+        if stop_requested:
+            return 0
         print(f"Error: {exc}", file=sys.stderr)
-        shutdown()
         return 1
+    finally:
+        shutdown()
 
     return 0
 

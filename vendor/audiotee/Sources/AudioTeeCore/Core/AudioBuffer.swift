@@ -53,22 +53,10 @@ public class AudioBuffer {
   /// This is the fast path used by the IO proc callback: one memcpy from
   /// the Core Audio buffer into our ring buffer, with no intermediate
   /// Data allocation.
-  public func append(from source: UnsafeRawPointer, count: Int) {
-    guard count >= 0 else {
-      AudioTeeLogging.logger.error(
-        "Audio buffer append called with negative count",
-        context: ["count": String(count)])
-      return
-    }
-
-    guard availableBytes + count <= maxBufferSize else {
-      AudioTeeLogging.logger.error(
-        "Audio buffer overflow",
-        context: [
-          "requested": String(count),
-          "available": String(maxBufferSize - availableBytes),
-        ])
-      return
+  @discardableResult
+  public func append(from source: UnsafeRawPointer, count: Int) -> Bool {
+    guard count >= 0, availableBytes + count <= maxBufferSize else {
+      return false
     }
 
     if writeIndex + count <= maxBufferSize {
@@ -87,6 +75,7 @@ public class AudioBuffer {
     }
 
     availableBytes += count
+    return true
   }
 
   /// Calls `handler` once for each complete chunk available in the buffer.

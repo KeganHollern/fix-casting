@@ -1,0 +1,57 @@
+name: Release AudioTee
+
+# Publishes a prebuilt AudioTee binary and a source-bound manifest so
+# install.sh can use it without silently substituting code from another
+# checkout. Trigger by pushing a tag:
+#
+#   git tag audiotee-v1 && git push origin audiotee-v1
+#
+# install.sh resolves releases/latest/download/audiotee-macos-<arch>.
+
+on:
+  push:
+    tags: ["audiotee-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test AudioTee
+        run: swift test --package-path vendor/audiotee
+      - name: Build AudioTee
+        run: swift build --package-path vendor/audiotee -c release
+      - name: Stage source-matched release assets
+        run: |
+          set -euo pipefail
+          ARCH=$(uname -m)
+          BIN=$(find vendor/audiotee/.build -type f -name audiotee -path "*release*" | head -1)
+          ASSET="audiotee-macos-$ARCH"
+          MANIFEST="audiotee-manifest-$ARCH.txt"
+          SOURCE_FINGERPRINT=$(python3 scripts/audiotee_source_fingerprint.py vendor/audiotee)
+          RUNTIME_FINGERPRINT=$(python3 -c 'from cast_tab.audiotee_provenance import AUDIOTEE_SOURCE_FINGERPRINT; print(AUDIOTEE_SOURCE_FINGERPRINT)')
+          test "$SOURCE_FINGERPRINT" = "$RUNTIME_FINGERPRINT"
+          install -m 755 "$BIN" "$ASSET"
+          file "$ASSET"
+          test "$("./$ASSET" --protocol-version)" = 2
+          BINARY_SHA256=$(shasum -a 256 "$ASSET" | awk '{print $1}')
+          {
+            printf 'format=1\n'
+            printf 'source_fingerprint=%s\n' "$SOURCE_FINGERPRINT"
+            printf 'binary_sha256=%s\n' "$BINARY_SHA256"
+            printf 'architecture=%s\n' "$ARCH"
+            printf 'protocol_version=2\n'
+          } > "$MANIFEST"
+          shasum -a 256 "$ASSET" "$MANIFEST" > checksums.txt
+      - name: Create release with source-matched binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ARCH=$(uname -m)
+          gh release create "${{ github.ref_name }}" \
+            --title "AudioTee prebuilt (${{ github.ref_name }})" \
+            --notes "Source-matched AudioTee for install.sh. Integrity metadata is included in the architecture-specific manifest." \
+            "audiotee-macos-$ARCH" "audiotee-manifest-$ARCH.txt" checksums.txt

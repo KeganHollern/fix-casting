@@ -14,19 +14,24 @@ cast "https://example.com/watch"
 4. Encodes video + audio to HLS with ffmpeg
 5. Tells your Chromecast to play the stream
 
-Buffered mode is on by default (~45s delay on the TV) for smoother, higher-quality playback.
+The production profile is on by default: it keeps the 30fps/high-bitrate encode
+settings while using 2-second HLS segments and a six-entry rolling playlist
+(12 seconds retained). A conventional player holdback is roughly three target
+durations (~6 seconds), but the TV chooses its actual live position. The cast
+waits for three complete segments before loading the receiver, giving startup
+the same standards-conservative runway.
 
 ## Requirements
 
 | Requirement | Notes |
 |---|---|
 | **macOS 14.2+** | Required for per-tab audio capture via [AudioTee](https://github.com/makeusabrew/audiotee) |
-| **Python 3.10+** | |
+| **Python 3.11+** | |
 | **[uv](https://docs.astral.sh/uv/)** | Used by `install.sh` to install the `cast` CLI |
 | **Google Chrome** | Used via Playwright (`channel="chrome"`) |
 | **ffmpeg** | With H.264 encoding (`h264_videotoolbox` on Apple Silicon recommended) |
 | **Chromecast / Google TV** | On the same LAN as your Mac |
-| **Swift** (optional) | Only needed to build AudioTee if not pre-built |
+| **Swift** (optional) | Only needed to build AudioTee when no prebuilt binary is available |
 
 ## Install
 
@@ -44,7 +49,16 @@ cd fix-casting
 ./install.sh
 ```
 
-This uses [`uv tool install`](https://docs.astral.sh/uv/) to install the `cast` command into `~/.local/bin` (in its own isolated environment), downloads Playwright's Chromium (fallback), and builds AudioTee when Swift is available.
+This uses [`uv tool install`](https://docs.astral.sh/uv/) to install a
+**non-editable snapshot** of the current checkout into `~/.local/bin`, with
+runtime dependency versions constrained by `uv.lock`. Changing branches or
+editing this checkout therefore does not silently change the installed
+command. It also downloads Playwright's Chromium (fallback) and installs
+AudioTee under `~/.local/share/fix-casting` for per-tab audio — preferring a
+SHA-256-verified prebuilt binary from this repo's GitHub releases and building
+from `vendor/audiotee` with Swift only when no verified prebuilt is available.
+(Maintainers: push an `audiotee-v*` tag to publish a new prebuilt via the
+release workflow.)
 
 Make sure `~/.local/bin` is on your `PATH`:
 
@@ -52,7 +66,12 @@ Make sure `~/.local/bin` is on your `PATH`:
 uv tool update-shell    # or: export PATH="$HOME/.local/bin:$PATH"
 ```
 
-To update later, just re-run `./install.sh`. To remove: `uv tool uninstall fix-casting`.
+Use `cast --version` to see the installed branch, revision, verified source
+fingerprint, and AudioTee hash (or to identify an editable/source install). The
+installer rebuilds the local package and publishes that revision only after its
+installed sources match the checkout; an incomplete or mismatched install is
+reported as an unknown revision. To update later, re-run `./install.sh` from
+the revision you want. To remove the command: `uv tool uninstall fix-casting`.
 
 Install ffmpeg if needed:
 
@@ -66,27 +85,36 @@ brew install ffmpeg
 cast "https://streamfree.app/embed/soccer/ecuador-vs-ivory-coast?quality=1080p&category=soccer"
 ```
 
-The CLI discovers Chromecast devices on your network and prompts you to pick one. A Chrome window opens locally showing the page; the TV plays the mirrored stream.
+The CLI discovers Chromecast devices on your network and prompts you to pick one (or pass `--device NAME` to skip the prompt). A Chrome window opens locally showing the page; the TV plays the mirrored stream.
 
-Press `Ctrl+C` to stop.
+If the TV stops playing the stream (someone exits the receiver app, a stream
+error), the watchdog re-casts it automatically within ~10s.
+
+Press `Ctrl+C` to stop; a one-line summary (duration, re-casts, skipped/discarded
+video timeline ticks, guarded A/V re-anchors, ffmpeg restarts) prints on exit.
 
 ### Options
 
 ```
 cast <url> [options]
 
+  --version               Show installed version and source provenance
   --width WIDTH           Viewport width (default: 1920)
   --height HEIGHT         Viewport height (default: 1080)
-  --fps FPS               Encode frame rate (default: 30 buffered, 23–24 unbuffered)
+  --fps FPS               Encode frame rate (default: 30 production, 23–24 with --no-buffered)
   --jpeg-quality Q        Tab-capture JPEG quality 1–100 (default: 92)
-  --video-bitrate MBPS    Override H.264 target bitrate in Mbps (default: by resolution, 15 at 1080p)
+  --video-bitrate MBPS    Override H.264 target bitrate in Mbps, max 1000 (default: by resolution)
   --buffered / --no-buffered
-                          Buffered mode for quality vs latency (default: buffered)
+                          Production 2s/12s HLS profile vs compatible 1s/4s
+                          low-latency profile (default: buffered/production)
   --no-audio              Video only, skip tab audio capture
-  --audio-offset-ms MS    Manual A/V trim; positive delays audio (default: 0)
+  --audio-offset-ms MS    Manual A/V trim 0–3000; positive delays audio (default: 0)
+  --audio-drift-ppm PPM   Correct measured audio-clock drift, -100000…100000 (default: 0)
   --adblock / --no-adblock
                           Block ads/trackers in the captured tab (default: on)
   --headless              Hide the local browser window (may break some players)
+  --device NAME           Cast to this device by name, skip the picker (case-
+                          insensitive; a unique substring works)
   --discovery-timeout SEC Seconds to search for devices (default: 5)
   --stats                 Print pipeline timing stats every 10s (diagnose lag)
   --stats-interval SEC    Seconds between stats reports (default: 10)
@@ -99,7 +127,7 @@ captured via CDP `Page.startScreencast`.
 
 ### Examples
 
-Lower latency (less buffering on the TV):
+Lower latency (shorter segments and rolling playlist, with leaner encode tuning):
 
 ```bash
 cast --no-buffered "https://example.com"
@@ -152,11 +180,11 @@ health dot per segment. Metrics are grouped by pipeline segment:
 - **① Capture** — CDP screencast + AudioTee (incoming): capture FPS,
   Chrome→app frame lag, decode time, audio pipe backlog, audio warnings.
 - **② Encode pipeline** (internal): encode FPS, frame age, queue depth, ffmpeg
-  stdin-write time, repeats/resyncs.
+  stdin-write time, repeats/re-anchors.
 - **③ HLS stream** (outgoing): segment count, newest-segment age, rotation.
 - **④ TV / Chromecast** (playback): state, position, advance-vs-wall-clock,
   micro-stalls, non-playing polls.
-- **⑤ A/V sync**: cumulative audio-lead drift, frames dropped, ffmpeg restarts.
+- **⑤ A/V sync**: CFR timeline guard/re-anchors, lost video ticks, ffmpeg restarts.
 
 The **audio-offset knob** at the bottom adjusts lip-sync live. Use the
 `-100 / -10 / +10 / +100` ms buttons or the keyboard:
@@ -166,11 +194,15 @@ The **audio-offset knob** at the bottom adjusts lip-sync live. Use the
 | `[` / `]` | audio offset −10 / +10 ms |
 | `{` / `}` | audio offset −100 / +100 ms |
 | `r` | reset offset to 0 |
+| `space` | pause / resume the TV (a pause longer than playlist retention resumes as a jump to live) |
+| `,` / `.` | TV volume −5% / +5% |
+| `m` | mute / unmute the TV |
 | `q` | stop the cast and exit |
 
 Changes apply after presses settle (one quick ffmpeg re-sync, so expect a brief
-glitch). Note that the buffered HLS delay means an offset change takes ~the
-buffer length to become visible on the TV — adjust in small steps.
+glitch). The TV applies an offset change only after it reaches the restarted HLS
+generation. That lag depends on the receiver's live holdback, not the full
+playlist-retention window, so adjust in small steps and wait for it to appear.
 
 ### Ad blocking (`--adblock`)
 
@@ -208,12 +240,12 @@ Read the `tv` stats line:
 - **`stall ~Ns`**, **`micro-stalls ~Ns`**, or **`non-playing … (BUFFERING …)`** →
   the network can't keep up at that bitrate; back it off.
 
-Step up (e.g. 6 → 8 → 10 → 12 Mbps) and stay at each setting a few minutes — with
-the default ~45s buffer, an over-high bitrate takes that long to drain the buffer
-before it stalls. For faster feedback use `--no-buffered` (small buffer, fails
-fast), then re-confirm your chosen bitrate in normal buffered mode. The highest
-setting that stays `PLAYING` with no stalls is your ceiling; back off ~20% for
-headroom against network jitter.
+Step up (e.g. 6 → 8 → 10 → 12 Mbps) and stay at each setting a few minutes.
+The receiver controls how much it buffers, so playlist length is not a reliable
+countdown to a stall. For faster feedback use `--no-buffered` (shorter segments
+and a four-second rolling playlist), then re-confirm your chosen bitrate with the
+normal production profile. The highest setting that stays `PLAYING` with no
+stalls is your ceiling; back off ~20% for headroom against network jitter.
 
 ## How it works
 
@@ -228,9 +260,15 @@ URL → Chrome tab → JPEG frames + PCM audio
 ```
 
 - **Video capture** uses CDP `Page.startScreencast`: Chrome pushes JPEG frames as the page paints (up to ~60fps), and every frame is acknowledged with `Page.screencastFrameAck` so the stream never stalls.
-- **Even-paced encoding** samples the latest frame at a constant cadence on one thread and feeds ffmpeg on another, with a bounded queue between them. Even sampling keeps motion smooth (no judder) even when an ffmpeg write stalls on an HLS segment flush, while the constant rate keeps the TV buffer from draining. ffmpeg is restarted automatically if it dies or stays backpressured.
-- **Audio capture** uses a vendored [AudioTee](https://github.com/makeusabrew/audiotee) binary to tap only the cast browser's processes. Your other apps are not routed through a virtual audio device.
-- **Streaming** uses ffmpeg to mux H.264 + AAC into an HLS playlist served from `/tmp/cast-tab-stream/`.
+- **Even-paced encoding** samples the latest frame at a constant cadence on one
+  thread and feeds ffmpeg on another, with a bounded queue between them. Brief
+  write stalls are absorbed without changing either media timeline. If a CFR
+  video tick is lost, the old generation is stopped before any post-gap frame
+  can enter it, then video and PCM are jointly re-anchored in a fresh generation.
+- **Audio capture** uses a vendored [AudioTee](https://github.com/makeusabrew/audiotee) binary to tap only the cast browser's processes. An inaudible Web Audio keepalive keeps that private tap initialized while a page is silent, so media which starts later joins the existing audio stream. Your other apps are not routed through a virtual audio device.
+- **Streaming** uses ffmpeg to mux H.264 + AAC into an HLS playlist served from
+  a per-run temp directory (removed on exit). Restart generations use unique
+  segment identities and standards-correct HLS discontinuity sequencing.
 - **Casting** uses [pychromecast](https://github.com/home-assistant-libs/pychromecast) to load the HLS URL on the default media receiver.
 
 ## Troubleshooting
@@ -239,13 +277,20 @@ URL → Chrome tab → JPEG frames + PCM audio
 Ensure the TV and Mac are on the same network. Try increasing `--discovery-timeout`.
 
 **No audio on TV**  
-Audio requires AudioTee. Re-run `./install.sh` or build manually:
+Audio requires AudioTee. Re-run `./install.sh` (downloads a prebuilt binary or
+builds one and installs it under `~/.local/share/fix-casting`), or build
+manually:
 
 ```bash
 cd vendor/audiotee && swift build -c release
+cd ../.. && ./install.sh    # copies the build to the stable per-user path
 ```
 
-If audio still fails, start playback in the local Chrome window (click Play). The tool retries autoplay automatically.
+The tool keeps an inaudible audio client active before tapping Chrome, so a
+page can remain silent for any length of time and begin playing audio later.
+It also retries autoplay automatically. If a site's player still needs user
+interaction, click Play in the dedicated local Chrome window; AudioTee should
+already be attached and the sound will flow into the existing cast.
 
 **Frozen or choppy video**  
 Try `--no-buffered` to rule out buffer-related delay, or lower resolution with `--width 1280 --height 720`.
@@ -265,7 +310,7 @@ Every 10 seconds you'll see something like:
 ```
 [stats] capture 28.5/30 fps, capture avg 35ms peak 52ms, behind 3x
 [stats] encode  30.0/30 fps to ffmpeg, frame age avg 8ms peak 20ms, stdin write avg 0.5ms
-[stats] hls     12 segments, newest segment 1.2s old
+[stats] hls     6 segments, newest segment 1.2s old
 [stats] tv      PLAYING, playback position 142s
 ```
 
@@ -276,7 +321,7 @@ How to read it:
 - **encode fps drops** but capture is fine → ffmpeg encoding is struggling
 - **frame age rises** → encoder is feeding ffmpeg stale frames (usually means capture slowed down)
 - **newest segment age rises** → ffmpeg/HLS segment generation is falling behind
-- **tv position** creeping further behind real time → TV buffer or network (expected ~45s with `--buffered`)
+- **tv position** creeping further behind real time → receiver buffering or network; the playlist retains 12s by default, but actual TV holdback is client-controlled
 
 ## Project layout
 

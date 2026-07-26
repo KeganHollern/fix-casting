@@ -75,8 +75,8 @@ def _cached_list(url: str) -> str | None:
 
 
 def build_block_patterns(urls: list[str] | None = None) -> list[str]:
-    """Build CDP Network.setBlockedURLs patterns from the default uBO + EasyList
-    domain rules. Returns [] if no list could be loaded."""
+    """Build CDP Network.setBlockedURLs patterns from the uBO network lists +
+    Peter Lowe's server-list domain rules. Returns [] if no list could be loaded."""
     domains: set[str] = set()
     loaded = 0
     for url in urls or DEFAULT_FILTER_URLS:

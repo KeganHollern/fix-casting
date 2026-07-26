@@ -6,3 +6,5 @@ bin/
 vendor/audiotee/.build/
 run.sh
 
+
+build/

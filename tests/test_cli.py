@@ -1,0 +1,488 @@
+"""CLI validation, health monitoring, and signal-shutdown regressions."""
+
+from __future__ import annotations
+
+import signal
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from cast_tab import cli
+
+
+def test_version_identifies_source_checkout(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        cli._parse_args(["--version"])
+    assert exc_info.value.code == 0
+    assert "development checkout" in capsys.readouterr().out
+
+
+def _fake_installed_package(monkeypatch, tmp_path: Path) -> tuple[Path, Path]:
+    package_dir = tmp_path / "site-packages" / "cast_tab"
+    package_dir.mkdir(parents=True)
+    fake_cli = package_dir / "cli.py"
+    fake_cli.write_text("# installed cli\n", encoding="utf-8")
+    (package_dir / "nested.py").write_text("VALUE = 1\n", encoding="utf-8")
+    receipt = tmp_path / "revision"
+    monkeypatch.setattr(cli, "__file__", str(fake_cli))
+    monkeypatch.setattr(cli, "INSTALL_PROVENANCE_PATH", receipt)
+    monkeypatch.setattr(cli, "AUDIOTEE_INSTALL_PATH", tmp_path / "missing-audiotee")
+    return package_dir, receipt
+
+
+def test_version_reports_verified_installed_revision(monkeypatch, tmp_path):
+    package_dir, receipt = _fake_installed_package(monkeypatch, tmp_path)
+    package_fingerprint = cli._package_fingerprint(package_dir)
+    revision = f"fable-refactor@abc123+source.{package_fingerprint[:16]}"
+    receipt.write_text(
+        f"format=1\nrevision={revision}\npackage_fingerprint={package_fingerprint}\n",
+        encoding="utf-8",
+    )
+
+    assert revision in cli._version_text()
+
+
+def test_version_refuses_receipt_for_different_installed_source(monkeypatch, tmp_path):
+    package_dir, receipt = _fake_installed_package(monkeypatch, tmp_path)
+    package_fingerprint = cli._package_fingerprint(package_dir)
+    claimed_revision = f"fable-refactor@wrong-snapshot+source.{package_fingerprint[:16]}"
+    receipt.write_text(
+        f"format=1\nrevision={claimed_revision}\npackage_fingerprint={package_fingerprint}\n",
+        encoding="utf-8",
+    )
+    (package_dir / "nested.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+    version_text = cli._version_text()
+
+    assert claimed_revision not in version_text
+    assert "installed source does not match receipt" in version_text
+
+
+def test_version_refuses_internally_inconsistent_receipt(monkeypatch, tmp_path):
+    package_dir, receipt = _fake_installed_package(monkeypatch, tmp_path)
+    package_fingerprint = cli._package_fingerprint(package_dir)
+    claimed_revision = "fable-refactor@abc123+source.0000000000000000"
+    receipt.write_text(
+        f"format=1\nrevision={claimed_revision}\npackage_fingerprint={package_fingerprint}\n",
+        encoding="utf-8",
+    )
+
+    version_text = cli._version_text()
+
+    assert claimed_revision not in version_text
+    assert "internally inconsistent" in version_text
+
+
+def test_version_refuses_legacy_unverifiable_receipt(monkeypatch, tmp_path):
+    _package_dir, receipt = _fake_installed_package(monkeypatch, tmp_path)
+    claimed_revision = "fable-refactor@unverified+source.0123456789abcdef"
+    receipt.write_text(f"{claimed_revision}\n", encoding="utf-8")
+
+    version_text = cli._version_text()
+
+    assert claimed_revision not in version_text
+    assert "unverified install receipt" in version_text
+
+
+def test_version_handles_non_utf8_receipt(monkeypatch, tmp_path):
+    _package_dir, receipt = _fake_installed_package(monkeypatch, tmp_path)
+    receipt.write_bytes(b"\xff\xfe")
+
+    assert "revision unknown" in cli._version_text()
+
+
+def test_hls_profile_cli_defaults_and_compatibility_flag():
+    assert cli._parse_args(["https://example.test"]).buffered is True
+    assert cli._parse_args(["https://example.test", "--buffered"]).buffered is True
+    assert cli._parse_args(["https://example.test", "--no-buffered"]).buffered is False
+
+
+def test_hls_profile_help_uses_playlist_not_tv_buffer_terminology(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        cli._parse_args(["--help"])
+
+    assert exc_info.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "2s HLS segments" in help_text
+    assert "12s rolling playlist" in help_text
+    assert "actual TV delay is receiver-controlled" in help_text
+    assert "Buffer ~48s on the TV" not in help_text
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--width", "0"),
+        ("--width", "1919"),
+        ("--height", "-1"),
+        ("--height", "1079"),
+        ("--fps", "0"),
+        ("--jpeg-quality", "0"),
+        ("--jpeg-quality", "101"),
+        ("--video-bitrate", "0"),
+        ("--video-bitrate", "nan"),
+        ("--video-bitrate", "inf"),
+        ("--video-bitrate", "1e308"),
+        ("--discovery-timeout", "-1"),
+        ("--discovery-timeout", "nan"),
+        ("--stats-interval", "0"),
+        ("--stats-interval", "inf"),
+        ("--tv-poll-interval", "-1"),
+        ("--tv-poll-interval", "nan"),
+        ("--audio-offset-ms", "-1"),
+        ("--audio-offset-ms", "3001"),
+        ("--audio-drift-ppm", "nan"),
+        ("--audio-drift-ppm", "inf"),
+        ("--audio-drift-ppm", "-1000000"),
+        ("--audio-drift-ppm", "1e308"),
+    ],
+)
+def test_invalid_numeric_options_are_rejected(option, value):
+    with pytest.raises(SystemExit) as exc_info:
+        cli._parse_args(["https://example.test", option, value])
+    assert exc_info.value.code == 2
+
+
+class _FakeStreamer:
+    audio_offset_ms = 0
+
+    def __init__(self):
+        self.receiver_hosts = []
+        self.playlist_url = "http://192.0.2.1:1234/stream.m3u8"
+
+    def configure_receiver(self, host):
+        self.receiver_hosts.append(host)
+        return self.playlist_url
+
+    def receiver_delivery_observation(self):
+        return (1, True)
+
+
+class _FakeCaster:
+    last_instance = None
+
+    def __init__(self, _device):
+        type(self).last_instance = self
+        self.reconnects = 0
+        self.stopped = False
+        self.played_urls = []
+        self.cancellation_probe = lambda: False
+
+    def set_cancellation_probe(self, probe):
+        self.cancellation_probe = probe
+
+    def connect(self):
+        pass
+
+    def play_hls(self, url):
+        self.played_urls.append(url)
+
+    def set_delivery_probe(self, probe):
+        self.delivery_probe = probe
+
+    def start_watchdog(self, **_kwargs):
+        pass
+
+    def stop(self):
+        self.stopped = True
+
+
+def _patch_cast_runtime(monkeypatch, session_class, signal_handler):
+    device = SimpleNamespace(name="Test TV", host="192.0.2.55")
+    monkeypatch.setattr(cli, "discover_devices", lambda timeout: [device])
+    monkeypatch.setattr(cli, "find_device", lambda devices, query: device)
+    monkeypatch.setattr(cli, "CastSession", session_class)
+    monkeypatch.setattr(cli, "TabCaster", _FakeCaster)
+    monkeypatch.setattr(cli.signal, "signal", signal_handler)
+
+
+def test_default_mode_collects_summary_counters_without_trace_noise(
+    monkeypatch, capsys
+):
+    class Session:
+        last_instance = None
+
+        def __init__(self, _config, *, stats):
+            type(self).last_instance = self
+            self.stats = stats
+            self.streamer = _FakeStreamer()
+            self.audio_active = False
+            self.playlist_url = "http://example.test/live.m3u8"
+
+        def start(self):
+            self.stats.record_queue(depth=1, dropped=4)
+            self.stats.record_ffmpeg_restart()
+
+        def raise_if_failed(self):
+            raise RuntimeError("background encoder failed")
+
+        def stop(self):
+            pass
+
+    _patch_cast_runtime(monkeypatch, Session, lambda _signum, _handler: None)
+
+    result = cli.main(
+        [
+            "https://example.test",
+            "--device",
+            "Test TV",
+            "--no-adblock",
+            "--no-audio",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert "4 video timeline ticks discarded/skipped during A/V re-anchors" in captured.out
+    assert "1 ffmpeg restarts" in captured.out
+    assert "[trace]" not in captured.out
+    assert "background encoder failed" in captured.err
+    assert Session.last_instance.streamer.receiver_hosts == ["192.0.2.55"]
+    assert _FakeCaster.last_instance.played_urls == [
+        Session.last_instance.streamer.playlist_url
+    ]
+
+
+def test_second_signal_does_not_interrupt_first_shutdown(monkeypatch):
+    handlers = {}
+
+    class Session:
+        last_instance = None
+
+        def __init__(self, _config, *, stats):
+            type(self).last_instance = self
+            self.streamer = _FakeStreamer()
+            self.audio_active = False
+            self.playlist_url = "http://example.test/live.m3u8"
+            self.stop_completed = False
+
+        def start(self):
+            pass
+
+        def raise_if_failed(self):
+            handlers[signal.SIGINT]()
+
+        def stop(self):
+            # Simulate an impatient second Ctrl+C while the original handler
+            # is still tearing down the session.
+            handlers[signal.SIGINT]()
+            self.stop_completed = True
+
+    def save_handler(signum, handler):
+        handlers[signum] = handler
+
+    _patch_cast_runtime(monkeypatch, Session, save_handler)
+
+    assert (
+        cli.main(
+            [
+                "https://example.test",
+                "--device",
+                "Test TV",
+                "--no-adblock",
+                "--no-audio",
+            ]
+        )
+        == 0
+    )
+    assert Session.last_instance.stop_completed
+    assert _FakeCaster.last_instance.stopped
+
+
+def test_signal_during_factory_handoff_does_not_orphan_returned_resource(
+    monkeypatch,
+):
+    handlers = {}
+
+    class OwnedResource:
+        def __init__(self):
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    class Session:
+        last_instance = None
+
+        def __init__(self, _config, *, stats):
+            del stats
+            type(self).last_instance = self
+            self.resource = None
+            self.cancellation_probe = lambda: False
+            self.cancellation_seen = False
+            self.streamer = None
+            self.audio_active = False
+
+        def set_cancellation_probe(self, probe):
+            self.cancellation_probe = probe
+
+        def request_stop(self):
+            raise AssertionError("OS signal handler must not call Event-based stop")
+
+        def start(self):
+            def resource_factory():
+                resource = OwnedResource()
+                # This models an OS signal after a child-producing CALL has
+                # completed but before its result reaches STORE_ATTR.
+                handlers[signal.SIGINT]()
+                handlers[signal.SIGINT]()
+                return resource
+
+            self.resource = resource_factory()
+
+        def stop(self):
+            self.cancellation_seen = self.cancellation_probe()
+            if self.resource is not None:
+                self.resource.stop()
+
+    def save_handler(signum, handler):
+        handlers[signum] = handler
+
+    _patch_cast_runtime(monkeypatch, Session, save_handler)
+
+    assert (
+        cli.main(
+            [
+                "https://example.test",
+                "--device",
+                "Test TV",
+                "--no-adblock",
+                "--no-audio",
+            ]
+        )
+        == 0
+    )
+
+    session = Session.last_instance
+    assert session.cancellation_seen is True
+    assert session.resource is not None and session.resource.stopped is True
+    assert _FakeCaster.last_instance.cancellation_probe() is True
+    assert _FakeCaster.last_instance.stopped is True
+
+
+def test_shutdown_stops_receiver_before_hls_session(monkeypatch):
+    stop_order = []
+
+    class Session:
+        def __init__(self, _config, *, stats):
+            self.streamer = _FakeStreamer()
+            self.audio_active = False
+            self.playlist_url = "http://example.test/live.m3u8"
+
+        def start(self):
+            pass
+
+        def raise_if_failed(self):
+            raise RuntimeError("finish test")
+
+        def stop(self):
+            stop_order.append("session")
+
+    class Caster(_FakeCaster):
+        def stop(self):
+            stop_order.append("caster")
+            super().stop()
+
+    _patch_cast_runtime(monkeypatch, Session, lambda _signum, _handler: None)
+    monkeypatch.setattr(cli, "TabCaster", Caster)
+
+    assert (
+        cli.main(
+            [
+                "https://example.test",
+                "--device",
+                "Test TV",
+                "--no-adblock",
+                "--no-audio",
+            ]
+        )
+        == 1
+    )
+
+    assert stop_order == ["caster", "session"]
+
+
+def test_shutdown_retries_only_transiently_failed_owner(monkeypatch, capsys):
+    class Session:
+        last_instance = None
+
+        def __init__(self, _config, *, stats):
+            del stats
+            type(self).last_instance = self
+            self.streamer = _FakeStreamer()
+            self.audio_active = False
+            self.stop_calls = 0
+
+        def start(self):
+            pass
+
+        def raise_if_failed(self):
+            raise RuntimeError("finish test")
+
+        def stop(self):
+            self.stop_calls += 1
+            if self.stop_calls == 1:
+                raise TimeoutError("Chrome still exiting")
+
+    _patch_cast_runtime(monkeypatch, Session, lambda _signum, _handler: None)
+
+    assert (
+        cli.main(
+            [
+                "https://example.test",
+                "--device",
+                "Test TV",
+                "--no-adblock",
+                "--no-audio",
+            ]
+        )
+        == 1
+    )
+
+    assert Session.last_instance.stop_calls == 2
+    assert _FakeCaster.last_instance.stopped is True
+    assert "Warning: failed to stop session" not in capsys.readouterr().err
+
+
+def test_shutdown_reports_owner_that_fails_both_bounded_attempts(
+    monkeypatch, capsys
+):
+    class Session:
+        last_instance = None
+
+        def __init__(self, _config, *, stats):
+            del stats
+            type(self).last_instance = self
+            self.streamer = _FakeStreamer()
+            self.audio_active = False
+            self.stop_calls = 0
+
+        def start(self):
+            pass
+
+        def raise_if_failed(self):
+            raise RuntimeError("finish test")
+
+        def stop(self):
+            self.stop_calls += 1
+            raise TimeoutError(f"cleanup attempt {self.stop_calls} timed out")
+
+    _patch_cast_runtime(monkeypatch, Session, lambda _signum, _handler: None)
+
+    assert (
+        cli.main(
+            [
+                "https://example.test",
+                "--device",
+                "Test TV",
+                "--no-adblock",
+                "--no-audio",
+            ]
+        )
+        == 1
+    )
+
+    assert Session.last_instance.stop_calls == 2
+    error = capsys.readouterr().err
+    assert "Warning: failed to stop session: cleanup attempt 2 timed out" in error

@@ -71,7 +71,12 @@ public class AudioRecorder {
     outputHandler.handleMetadata(metadata)
     outputHandler.handleStreamStart()
 
-    try setupAndStartIOProc()
+    do {
+      try setupAndStartIOProc()
+    } catch {
+      outputHandler.handleStreamStop()
+      throw error
+    }
 
     AudioTeeLogging.logger.info("Audio device started successfully")
   }
@@ -110,7 +115,6 @@ public class AudioRecorder {
     let firstBuffer = bufferList.mBuffers
 
     guard let sourcePointer = firstBuffer.mData, firstBuffer.mDataByteSize > 0 else {
-      AudioTeeLogging.logger.error("Received empty audio buffer")
       return noErr
     }
 
@@ -118,7 +122,12 @@ public class AudioRecorder {
     // This avoids creating an intermediate Data object (heap alloc + memcpy)
     // on every IO callback (~10ms). The pointer is valid for the duration
     // of this callback, so this is safe.
-    audioBuffer?.append(from: sourcePointer, count: Int(firstBuffer.mDataByteSize))
+    guard
+      audioBuffer?.append(from: sourcePointer, count: Int(firstBuffer.mDataByteSize)) == true
+    else {
+      outputHandler.handleAudioDiscontinuity()
+      return noErr
+    }
 
     processAudioBuffer()
 
@@ -126,9 +135,11 @@ public class AudioRecorder {
   }
 
   public func stopRecording() {
+    // The IO proc owns audioBuffer while capture is active. Stop it before
+    // touching or flushing that storage from the control thread.
+    cleanupIOProc()
     processAudioBuffer()
     outputHandler.handleStreamStop()
-    cleanupIOProc()
   }
 
   private func processAudioBuffer() {

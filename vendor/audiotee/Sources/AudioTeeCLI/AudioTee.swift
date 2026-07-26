@@ -43,6 +43,7 @@ struct AudioTee {
       name: "exclude-processes", help: "Process IDs to exclude (space-separated)")
     parser.addFlag(name: "mute", help: "Mute processes being tapped")
     parser.addFlag(name: "stereo", help: "Records in stereo")
+    parser.addFlag(name: "protocol-version", help: "Print the helper protocol version and exit")
     parser.addOption(
       name: "sample-rate",
       help: "Target sample rate (8000, 16000, 22050, 24000, 32000, 44100, 48000)")
@@ -52,6 +53,11 @@ struct AudioTee {
     // Parse arguments
     do {
       try parser.parse()
+
+      if parser.getFlag("protocol-version") {
+        print(AudioStreamMetadata.currentProtocolVersion)
+        return
+      }
 
       var audioTee = AudioTee()
 
@@ -73,14 +79,14 @@ struct AudioTee {
       parser.printHelp()
       exit(0)
     } catch ArgumentParserError.validationFailed(let message) {
-      print("Error: \(message)", to: &standardError)
+      writeStandardError("Error: \(message)")
       exit(1)
     } catch let error as ArgumentParserError {
-      print("Error: \(error.description)", to: &standardError)
+      writeStandardError("Error: \(error.description)")
       parser.printHelp()
       exit(1)
     } catch {
-      print("Error: \(error)", to: &standardError)
+      writeStandardError("Error: \(error)")
       exit(1)
     }
   }
@@ -93,7 +99,8 @@ struct AudioTee {
   }
 
   func run() throws {
-    setupSignalHandlers()
+    let signalSources = setupSignalHandlers()
+    defer { signalSources.forEach { $0.cancel() } }
 
     AudioTeeLogging.logger.info("Starting AudioTee...")
 
@@ -137,11 +144,18 @@ struct AudioTee {
       throw ExitCode.failure
     }
 
-    let outputHandler = BinaryAudioOutputHandler()
+    let outputHandler = BinaryAudioOutputHandler(chunkDuration: chunkDuration) { message in
+      AudioTeeLogging.logger.error(message, context: ["fatal": "true"])
+      CFRunLoopStop(CFRunLoopGetMain())
+    }
     let recorder = try AudioRecorder(
       deviceID: deviceID, outputHandler: outputHandler, convertToSampleRate: sampleRate,
       chunkDuration: chunkDuration)
     try recorder.startRecording()
+    if outputHandler.fatalError != nil {
+      recorder.stopRecording()
+      throw ExitCode.failure
+    }
 
     // Run until the run loop is stopped (by signal handler)
     while true {
@@ -153,16 +167,25 @@ struct AudioTee {
 
     AudioTeeLogging.logger.info("Shutting down...")
     recorder.stopRecording()
+    if outputHandler.fatalError != nil {
+      throw ExitCode.failure
+    }
   }
 
-  private func setupSignalHandlers() {
-    signal(SIGINT) { _ in
-      AudioTeeLogging.logger.info("Received SIGINT, initiating graceful shutdown...")
-      CFRunLoopStop(CFRunLoopGetMain())
-    }
-    signal(SIGTERM) { _ in
-      AudioTeeLogging.logger.info("Received SIGTERM, initiating graceful shutdown...")
-      CFRunLoopStop(CFRunLoopGetMain())
+  private func setupSignalHandlers() -> [DispatchSourceSignal] {
+    signal(SIGPIPE, SIG_IGN)
+    return [SIGINT, SIGTERM].map { signalNumber in
+      signal(signalNumber, SIG_IGN)
+      let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: .main)
+      source.setEventHandler {
+        AudioTeeLogging.logger.info(
+          "Received signal, initiating graceful shutdown...",
+          context: ["signal": String(signalNumber)]
+        )
+        CFRunLoopStop(CFRunLoopGetMain())
+      }
+      source.resume()
+      return source
     }
   }
 
@@ -180,14 +203,8 @@ struct AudioTee {
   }
 }
 
-// Helper for stderr output
-var standardError = FileHandle.standardError
-
-extension FileHandle: TextOutputStream {
-  public func write(_ string: String) {
-    let data = Data(string.utf8)
-    self.write(data)
-  }
+private func writeStandardError(_ message: String) {
+  FileHandle.standardError.write(Data("\(message)\n".utf8))
 }
 
 // Exit code handling

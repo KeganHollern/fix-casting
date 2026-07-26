@@ -4,31 +4,34 @@ import Foundation
 /// CLI-specific output handler that writes raw PCM audio to stdout
 /// and lifecycle messages to stderr via the logger.
 class BinaryAudioOutputHandler: AudioOutputHandler {
-  private let fd = STDOUT_FILENO
+  private let output: NonblockingAudioFileOutput
+
+  init(chunkDuration: Double, onFatalError: @escaping (String) -> Void) {
+    output = NonblockingAudioFileOutput(
+      chunkDuration: chunkDuration,
+      onFatalError: onFatalError
+    )
+  }
+
+  var fatalError: String? { output.fatalError }
 
   func handleAudioData(_ pointer: UnsafeRawPointer, count: Int) {
-    var written = 0
-    while written < count {
-      let result = write(fd, pointer.advanced(by: written), count - written)
-      if result >= 0 {
-        written += result
-      } else if errno == EINTR {
-        continue
-      } else {
-        break  // EPIPE, EIO, etc — consumer gone or real error
-      }
-    }
+    output.handleAudioData(pointer, count: count)
+  }
+
+  func handleAudioDiscontinuity() {
+    output.handleAudioDiscontinuity()
   }
 
   func handleMetadata(_ metadata: AudioStreamMetadata) {
-    AudioTeeLogging.logger.writeMessage(.metadata, data: metadata)
+    output.handleMetadata(metadata)
   }
 
   func handleStreamStart() {
-    AudioTeeLogging.logger.writeMessage(.streamStart, data: Optional<String>.none)
+    output.handleStreamStart()
   }
 
   func handleStreamStop() {
-    AudioTeeLogging.logger.writeMessage(.streamStop, data: Optional<String>.none)
+    output.handleStreamStop()
   }
 }
